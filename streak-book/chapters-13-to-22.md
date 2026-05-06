@@ -59,6 +59,8 @@ mkdir -p src/lib/components
   };
 
   // For now we hardcode the habit. We'll meet $props in Chapter 14 and pass it in.
+  // We also re-declare `Habit` locally here; Chapter 14 moves it to $lib/types so
+  // every component shares one definition.
   const habit: Habit = {
     id: 'demo',
     name: 'Demo habit',
@@ -155,6 +157,26 @@ import EmptyState from '$lib/components/EmptyState.svelte';
 {/if}
 ```
 </details>
+
+---
+
+## Lesson 13.5 — Recurring concepts from earlier chapters
+
+- **`{#each}` keyed** (Ch 9) — the home page still iterates over `habits` by ID.
+- **`{#if cond}{:else}{/if}`** (Ch 6) — the empty-state branch.
+- **Scoped `<style>`** (Ch 5) — the row's CSS doesn't leak.
+- **`type Habit`** (Ch 9) — re-declared locally for now; centralised in Ch 14.
+
+---
+
+## Lesson 13.6 — What you can now read in the wild
+
+After Chapter 13 you can:
+
+- Read **`<Component />`** as a self-contained UI element.
+- Read **`import X from '$lib/components/X.svelte'`** as a component import.
+- Recognise the *PascalCase filename = component* convention.
+- Read a small `.svelte` file with script + markup + scoped style and explain each section.
 
 ---
 
@@ -343,6 +365,26 @@ The variant is a *string union type* — only those three exact strings are allo
 
 ---
 
+## Lesson 14.7 — Recurring concepts from earlier chapters
+
+- **Object destructuring** (Ch 10) — `let { habit } = $props()` is exactly the pattern.
+- **Defaults on destructure** (Ch 10) — `compact = false`.
+- **`type` alias + union types** (Ch 4, 9) — `variant?: 'primary' | 'secondary' | 'danger'`.
+- **`$state` and reactivity** (Ch 1) — props are *reactive*; the parent passes them, the child re-renders when they change.
+
+---
+
+## Lesson 14.8 — What you can now read in the wild
+
+After Chapter 14 you can:
+
+- Read **`let { x, y, z = default } = $props<{ x: T; y: U; z?: V }>()`** as a fully-typed prop declaration. *(Note: in Svelte 5.x, the more idiomatic form is the inline type annotation we used: `let { x, y, z = default }: { x: T; y: U; z?: V } = $props();` — both work; the inline form is preferred.)*
+- Read **`import type { X } from '...'`** as type-only imports.
+- Read **`<Component {prop} />`** as the shorthand for `prop={prop}`.
+- Spot **components defining `type X` locally** as a refactor opportunity (move to a shared `$lib/types.ts`).
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] `Habit` lives in `src/lib/types.ts` and is imported everywhere.
@@ -396,7 +438,13 @@ Add `onDelete` to `HabitRow`:
 </li>
 ```
 
-In `+page.svelte`:
+In `+page.svelte` (and confirm `removeHabit` takes an `id: string`):
+
+```ts
+function removeHabit(id: string): void {
+  habits = habits.filter((h) => h.id !== id);
+}
+```
 
 ```svelte
 {#each habits as habit (habit.id)}
@@ -404,9 +452,9 @@ In `+page.svelte`:
 {/each}
 ```
 
-Read aloud: *"render a HabitRow with this habit; when it asks to delete, call `removeHabit`."*
+Read aloud: *"render a HabitRow with this habit; when it asks to delete, call `removeHabit` with the id."*
 
-Since we wrote `removeHabit` in Chapter 10 to take a `Habit` object (or in the alternative version, an `id`), make sure the signature lines up. If you ended Chapter 10 with `removeHabit({ id }: Habit)`, change to `removeHabit(id: string)` — or change the prop type to `(habit: Habit) => void` and pass `habit` instead. Pick one shape and stick to it.
+We standardise on `removeHabit(id: string): void` for the rest of the book — IDs are the natural identity for habits, and we'll lean on this in Part VI when habits live in a database.
 
 ---
 
@@ -523,6 +571,26 @@ Note the `habits.map` immutable update — for each habit, return a new object i
 
 ---
 
+## Lesson 15.7 — Recurring concepts from earlier chapters
+
+- **Function types** (Ch 9 preview) — `(id: string) => void` is a typed callback.
+- **Arrow functions for parameterised handlers** (Ch 8) — `onclick={() => onDelete(habit.id)}`.
+- **`aria-label`** (Ch 8) — accessibility on icon-only buttons.
+- **The "data down, events up" pattern** — formalised here.
+
+---
+
+## Lesson 15.8 — What you can now read in the wild
+
+After Chapter 15 you can:
+
+- Read **callback props** named `on<Verb>` and explain the data-down events-up flow.
+- Recognise **`createEventDispatcher`** in old code as a refactor target.
+- Read **event bubbling** and **`stopPropagation()`** in modal-like UIs.
+- Read **`window.prompt()`** as a (placeholder) input dialog.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] Delete still works through the callback prop.
@@ -564,14 +632,6 @@ Replace the inline `habits.filter(...)` in markup with a named derived:
 // in +page.svelte script
 let searchQuery: string = $state('');
 
-const visibleHabits: Habit[] = $derived(
-  habits.filter((h) => h.name.toLowerCase().includes(searchQuery.toLowerCase()))
-);
-
-const addedTodayCount: number = $derived(
-  habits.filter((h) => isAddedToday(h.createdAt)).length
-);
-
 function isAddedToday(epochMs: number): boolean {
   const habitDate = new Date(epochMs);
   const today = new Date();
@@ -579,7 +639,17 @@ function isAddedToday(epochMs: number): boolean {
          habitDate.getMonth() === today.getMonth() &&
          habitDate.getFullYear() === today.getFullYear();
 }
+
+const visibleHabits: Habit[] = $derived(
+  habits.filter((h) => h.name.toLowerCase().includes(searchQuery.toLowerCase()))
+);
+
+const addedTodayCount: number = $derived(
+  habits.filter((h) => isAddedToday(h.createdAt)).length
+);
 ```
+
+(Ordering note: helper functions go *above* the `$derived`s that use them. JavaScript hoists function declarations, so the *opposite* order also works — but reading top-to-bottom, it's kinder to the reader to see the helper first.)
 
 In markup:
 
@@ -680,20 +750,15 @@ This *cascading-derived* pattern is one of the things that makes Svelte 5 so ple
 
 ```ts
 const longestRunningHabit: Habit | undefined = $derived.by(() => {
-  if (habits.length === 0) return undefined;
-  return habits.reduce((oldest, h) => h.createdAt < oldest.createdAt ? h : oldest, habits[0]!);
-});
-```
-
-Wait — `habits[0]!` uses the non-null assertion `!`, which is banned. Better:
-
-```ts
-const longestRunningHabit: Habit | undefined = $derived.by(() => {
   const [first, ...rest] = habits;
   if (first === undefined) return undefined;
   return rest.reduce((oldest, h) => h.createdAt < oldest.createdAt ? h : oldest, first);
 });
 ```
+
+Read aloud: *"the longest-running habit is the one with the smallest createdAt. Pull off the first habit; if there isn't one, return undefined; otherwise reduce the rest, keeping whichever is older."*
+
+The destructure `const [first, ...rest] = habits` is critical — it lets us hand `first` to `reduce` as the initial accumulator (a real `Habit`, not `undefined`), which keeps the types clean. We *never* reach for `habits[0]!` (the non-null assertion is banned, Bible rule #3) because there's always a clean alternative.
 
 In markup:
 
@@ -703,6 +768,24 @@ In markup:
 {/if}
 ```
 </details>
+
+---
+
+## Lesson 16.7 — Recurring concepts from earlier chapters
+
+- **`array.filter`, `array.reduce`** (Ch 8, 11) — derived bodies are usually array-method chains.
+- **Destructuring with rest** (Ch 10) — `const [first, ...rest] = habits` for safe head/tail.
+- **`Habit` type** (Ch 14) — derived expressions stay type-safe end-to-end.
+
+---
+
+## Lesson 16.8 — What you can now read in the wild
+
+After Chapter 16 you can:
+
+- Read **`const x = $derived(expr)`** and **`const x = $derived.by(() => { ... })`** confidently.
+- Spot **the `$effect`-to-sync-state antipattern** and rewrite as `$derived`.
+- Read a chain of **cascading derived values** and trace updates from input to output.
 
 ---
 
@@ -811,9 +894,9 @@ $effect(() => {
 });
 ```
 
-`$effect` runs, reassigns `x`, which triggers `$effect` again, which reassigns `x`, ... boom. Svelte will eventually error out, but you've burned your dev server.
+`$effect` runs, reassigns `x`, which triggers `$effect` again, which reassigns `x`, ... Svelte 5 catches this at runtime and throws an `effect_update_depth_exceeded` error after a few iterations, so your dev server doesn't burn — but the page goes red and the lesson is loud.
 
-Rule: **don't write to state inside `$effect` if it depends on that state.** If you find yourself wanting to, you almost certainly want `$derived`.
+Rule: **don't write to state inside `$effect` if the effect depends on that state.** If you find yourself wanting to, you almost certainly want `$derived`.
 
 ---
 
@@ -868,6 +951,25 @@ $effect(() => {
 
 This is a stand-in for analytics or a real search-API call. The early return guards both empty and too-short queries.
 </details>
+
+---
+
+## Lesson 17.9 — Recurring concepts from earlier chapters
+
+- **`$state(...)`** (Ch 1) — `inputElement` is reactive state; the effect re-runs when it appears.
+- **Optional chaining `?.`** (Ch 4) — `inputElement?.focus()` is the safe DOM call.
+- **Early return `return;`** (Ch 2) — guards inside the effect body.
+
+---
+
+## Lesson 17.10 — What you can now read in the wild
+
+After Chapter 17 you can:
+
+- Read **`$effect(() => { ... })`** and tell whether it should be a `$derived` instead.
+- Read **`return () => cleanup;`** as the unmount/re-run cleanup.
+- Spot **deps read inside async callbacks** as the *not-tracked* gotcha.
+- Recognise the **`effect_update_depth_exceeded`** runtime error and trace it to a state-write inside an effect that reads the same state.
 
 ---
 
@@ -993,6 +1095,24 @@ Used as `<NumberStepper bind:value={count} min={0} max={10} />`. What does the p
 
 ---
 
+## Lesson 18.6 — Recurring concepts from earlier chapters
+
+- **Callback props** (Ch 15) — the *default* tool; `$bindable` is the *exception*.
+- **Defaults on destructure** (Ch 10) — `$bindable('')` provides a default.
+- **Guard clauses** (Ch 2) — `NumberStepper`'s `if (value >= max) return;`.
+
+---
+
+## Lesson 18.7 — What you can now read in the wild
+
+After Chapter 18 you can:
+
+- Read **`let { value = $bindable() } = $props()`** in a child.
+- Read **`<TextInput bind:value={x} />`** in a parent.
+- Tell *when* `$bindable` is right (input-shaped two-way) vs callback props (everything else).
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] `TextInput` component exists and is used in two places.
@@ -1100,6 +1220,24 @@ Senior habit: read the error *out loud, slowly*. The TypeScript compiler is a tu
 **The English sentence first:**
 
 > *"Add `$inspect.trace()` inside `visibleHabits`. Type a query — read the trace in the console — explain what dependencies changed."*
+
+---
+
+## Lesson 19.6 — Recurring concepts from earlier chapters
+
+- **Build-break-fix** (Ch 6) — same drill, now with a real debugging tool.
+- **`array.filter`** (Ch 8) — the planted bug is one wrong character in a filter.
+- **TypeScript errors as tutors** — formalised here.
+
+---
+
+## Lesson 19.7 — What you can now read in the wild
+
+After Chapter 19 you can:
+
+- Read **`$inspect(x)`** and **`$inspect.trace()`** as debugging primitives.
+- Open dev tools and tell which tab does what.
+- Decode a TypeScript error message line by line.
 
 ---
 
@@ -1276,6 +1414,25 @@ It's a generic list renderer. Caller passes `items` (any array) and an `item` sn
 
 ---
 
+## Lesson 20.7 — Recurring concepts from earlier chapters
+
+- **Component composition** (Ch 13) — snippets are the *internal* version of components.
+- **Optional props** (Ch 14) — `header?: Snippet`, `footer?: Snippet`.
+- **`{#if cond}{/if}`** (Ch 6) — guard whether to render a snippet block.
+
+---
+
+## Lesson 20.8 — What you can now read in the wild
+
+After Chapter 20 you can:
+
+- Read **`{#snippet name(args)}...{/snippet}`** and **`{@render name(args)}`**.
+- Read **`children: Snippet`** and **`children?: Snippet<[T]>`**.
+- Recognise that **content between component tags becomes the `children` prop** automatically.
+- Spot Svelte 4's **`<slot />`** as a refactor target — replace with snippets.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] You wrote `Card.svelte`.
@@ -1330,15 +1487,18 @@ In `+page.svelte`:
 
 ```ts
 let listEl: HTMLUListElement | undefined = $state();
+let lastCount = 0; // track previous length so we can detect adds vs deletes
 
 $effect(() => {
-  if (listEl === undefined) return;
-  if (habits.length === 0) return;
-  // when habits.length changes, scroll the last child into view
-  const last = listEl.lastElementChild;
-  if (last instanceof HTMLElement) {
-    last.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  const count = habits.length;
+  // scroll only when the list grew (an add); not on deletes/searches
+  if (count > lastCount && listEl !== undefined) {
+    const last = listEl.lastElementChild;
+    if (last instanceof HTMLElement) {
+      last.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
   }
+  lastCount = count;
 });
 ```
 
@@ -1352,7 +1512,9 @@ In markup:
 </ul>
 ```
 
-Save. Add a habit. The page scrolls to it. (You'll need many habits to *see* the scroll; start with three and add a few.)
+Save. Add a habit — the page scrolls smoothly to it. Delete one — *no* scroll. Search-filter — also no scroll. (Start with three habits and add a few to see it; with a short list you don't need to scroll at all.)
+
+The `lastCount` tracking is one of the few legitimate `$effect`-with-state-write patterns: we're storing a *previous-value* so we can detect a *transition* (grew vs shrank). It's reading `habits.length` (a dependency) and writing `lastCount` (which is *not* read again inside the effect's same run), so no infinite loop.
 
 > **`scrollIntoView({ behavior, block })`** — DOM method: scroll the element into view with options.
 >
@@ -1400,9 +1562,30 @@ What's `<dialog>` doing?
 
 ---
 
+## Lesson 21.6 — Recurring concepts from earlier chapters
+
+- **`$state` for refs** (Ch 17 preview) — DOM references are `T | undefined` and stored in `$state`.
+- **Optional chaining `?.`** (Ch 4) — every DOM-ref call goes through `?.`.
+- **`$effect` for legitimate side effects** (Ch 17) — DOM imperative APIs are exactly the right use.
+- **Type narrowing with `instanceof`** — `if (last instanceof HTMLElement)` narrows from `Element | null` to `HTMLElement`.
+
+---
+
+## Lesson 21.7 — What you can now read in the wild
+
+After Chapter 21 you can:
+
+- Read **`bind:this={el}`** and **`el: HTMLXxxElement | undefined = $state()`**.
+- Read **`el?.scrollIntoView(...)`**, **`el?.focus()`**, **`el?.showModal()`**.
+- Recognise the **`<dialog>`** element as the modern modal primitive.
+- Read **`instanceof`** narrowing as a type-safety pattern.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] Adding a habit scrolls smoothly to it.
+- [ ] Deleting a habit does *not* scroll.
 - [ ] You can read `bind:this={el}` and `el?.focus()` aloud.
 
 ---
@@ -1462,6 +1645,13 @@ async function addHabit(): Promise<void> {
   } catch (err) {
     saveState = { status: 'error', message: err instanceof Error ? err.message : 'Unknown' };
   }
+}
+
+// handleSubmit needs to await addHabit now that it's async.
+// We make handleSubmit itself async; the form's onsubmit accepts async handlers.
+async function handleSubmit(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  await addHabit();
 }
 ```
 
@@ -1539,6 +1729,32 @@ Because data only *exists* on success. If you put `data: T | null` on every bran
 > *"Add a 'Retry' button to the error state. When clicked, it re-attempts the save with the most recent name."*
 
 (Hint: store the failed name in `saveState`'s error variant; the retry button calls a function that uses it.)
+
+---
+
+## Lesson 22.7 — Recurring concepts from earlier chapters
+
+Part III's spine, in one place:
+
+- **Components, `$props`, callback props** (Ch 13–15) — `HabitRow`, `TextInput`, `Card`.
+- **`$derived`, `$effect`** (Ch 16, 17) — used for computing visible habits and scroll-on-add.
+- **`$bindable`** (Ch 18) — reusable `TextInput`.
+- **`$inspect`** (Ch 19) — debugging.
+- **Snippets `{#snippet}` / `{@render}`** (Ch 20) — `<Card>` chrome.
+- **`bind:this`** (Ch 21) — DOM refs typed `T | undefined`.
+
+All of Part III is now working together inside one app.
+
+---
+
+## Lesson 22.8 — What you can now read in the wild
+
+After Part III you can:
+
+- Read any modern Svelte 5 component tree with components, runes, snippets, callback props, and bindable values.
+- Write a four-state UI (idle/loading/success/error) using a discriminated union (formal coverage Ch 23).
+- Read `async` / `await` / `try`/`catch` and explain happy-path vs error-path flow.
+- Spot the **CLS landmine** in optimistic UI code.
 
 ---
 
