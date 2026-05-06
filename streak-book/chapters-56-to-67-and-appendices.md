@@ -3926,97 +3926,413 @@ After Chapter 65 you can:
 
 # Chapter 66 — Graduation Part I: the brief
 
-> *Build Streak Freezes. From a one-paragraph brief. Alone.*
+> *Today's job:* build a real new feature in Streak from a one-paragraph brief. Alone. *Visible win:* the feature ships to production behind a feature flag; the runbook is written; the test suite covers it; the audit log records it; the metrics are in place.
+
+This is the chapter where you prove the book worked. Every primitive in the brief below is something you've seen earlier — atomic UPDATEs (Ch 42), `withAudit` (Ch 47), `<ConfirmDialog>` (Ch 53), Prometheus with bounded labels (Ch 63), Vercel cron (Ch 64), feature flags (Ch 57's env-var matrix). Nothing is *new*. The skill the brief tests is **composition**.
+
+---
+
+## Lesson 66.1 — How a senior approaches a brief
+
+Before you write any code, do these in order. Senior engineers do them in their head; you do them on paper.
+
+1. **Read the brief three times.** First for shape, second for constraints, third for traps.
+2. **List the risks** (the parts most likely to break or take longer than expected). Order by *blast radius if it goes wrong*.
+3. **Sketch the architecture diagram** in Mermaid. Show every new component, every new external call, every new table. If you can't draw it in 20 lines of Mermaid, the design is too complex; cut.
+4. **Write the ADR for the riskiest decision** *first*. The schema choice for Streak Freezes is risky (single column on `users` vs separate consumption-log table); decide and justify before coding.
+5. **Plan the slices** — how you'd ship this in 3 PRs instead of 1. Smaller PRs are reviewable; one giant PR is unreviewable.
+6. **Write the test list** — the unit, integration, e2e, and contract tests you'll write *before* implementation. Test-first thinking, even if you write code-first sometimes.
+7. **Identify the rollback** — *"if this is broken in production at 3am, what do I undo?"*. Feature flag is your friend.
+
+If any of these is hand-wavy, the implementation will be hand-wavy too. The senior pattern: **the work happens before the keyboard**.
+
+---
+
+## Lesson 66.2 — The brief
 
 > **Streak Freezes — Pro feature.**
+>
 > Pro users get one streak freeze per calendar month: a one-day skip that doesn't break their streak. The home screen shows the count of remaining freezes for the current month. Consuming a freeze is a deliberate user action — confirm dialog and audit row. The reset to 1 happens at 00:00 UTC on the first of every month. Safe under concurrent consumption (a user clicking twice cannot consume two freezes). Roll out behind a feature flag. Fully observable.
 
-Required deliverables:
+Estimated effort: 6–10 hours of focused work.
 
-1. Migration: `users.freezes_remaining_month` (integer, default 1, NOT NULL) — or a `freeze_consumption` table; reader's call, defended in ADR.
-2. ADR explaining the schema decision.
-3. `consumeFreeze` form action with atomic conditional `UPDATE`.
-4. `withAudit` wrapper for the action.
-5. Pro-status check at action and UI.
-6. `<ConfirmDialog>` using the existing primitive.
-7. `/api/cron/reset-freezes/+server.ts` — idempotent monthly reset, with `withAudit`.
-8. Unit tests; property-based where applicable.
-9. Integration test: 10 simultaneous consume calls; assert ≤ 1 succeeds.
-10. Playwright e2e: happy path + "no freezes left" path.
-11. Feature flag: `PUBLIC_ENABLE_STREAK_FREEZES`.
-12. Prometheus metric `streak_freezes_consumed_total{plan}` (bounded label).
-13. Runbook at `docs/runbooks/streak-freezes.md`.
-14. PR description citing the Bible rules followed.
-15. Runtime evidence for every claim.
+---
 
-Estimated 6–10 hours of focused work.
+## Lesson 66.3 — Required deliverables
 
-There are no lessons in this chapter. Only the brief.
+These are level-7 deliverables. Every one. No shortcuts.
+
+1. **Migration** for the schema change (column on `users`, or separate `freeze_consumption` table — your call).
+2. **ADR** explaining the schema decision (`docs/adr/0003-freeze-storage.md`).
+3. **`consumeFreezeForUser(userId)`** as a pure-async function returning `Result`, callable from both the form action and the integration test.
+4. **`consumeFreeze` form action** wrapping it.
+5. **Atomic conditional UPDATE** in `consumeFreezeForUser` — Bible rule #11.
+6. **`withAudit` wrapper** for the action — Bible rule (Ch 47).
+7. **Pro-status check** at both the action *and* the UI (defence in depth — Ch 6, 47).
+8. **`<ConfirmDialog>`** for the user-facing confirm step (Ch 53 primitive).
+9. **`/api/cron/reset-freezes/+server.ts`** — auth-gated, idempotent monthly reset, with `withAudit`.
+10. **Unit tests** for any pure helper.
+11. **Property-based test** if you have suitable invariants (e.g. resetting twice in the same month produces the same final state).
+12. **Integration test:** 10 simultaneous `consumeFreezeForUser` calls; assert ≤ 1 succeeds.
+13. **Playwright e2e tests:** the happy path (consume freeze; banner shows "0 left"); the empty path (no freezes left; button disabled); the non-Pro path (free user doesn't see the feature).
+14. **Feature flag** `PUBLIC_ENABLE_STREAK_FREEZES` so you can roll out / roll back instantly.
+15. **Prometheus metric** `streak_freezes_consumed_total{plan}` with `plan` label bounded to `{free, pro}` via `safePlanLabel`.
+16. **Structured log line** per consume + cron run, with request ID and user ID.
+17. **Runbook** `docs/runbooks/streak-freezes.md` explaining what to do if (a) consume rates spike, (b) the monthly cron fails to fire, (c) the database column drifts.
+18. **PR description** citing every Bible rule the change depends on.
+19. **Runtime evidence** for every claim — `EXPLAIN ANALYZE` on the new query, `pnpm test:integration:concurrent-freezes` green, screenshot of the Prometheus metric after a test consumption, Stripe-CLI replay proving the Pro check.
+
+---
+
+## Lesson 66.4 — Rollout sequence
+
+The senior way to ship this:
+
+1. **PR 1 (~2 hours):** migration + schema decision + ADR. *Empty implementation* — column added, default value backfilled, no UI, no actions. Merge, deploy. Verify the migration applied cleanly.
+2. **PR 2 (~3 hours):** `consumeFreezeForUser` pure function + integration tests + atomic-concurrent test. *No UI yet*. Feature flag scaffold (`PUBLIC_ENABLE_STREAK_FREEZES=false` everywhere). Merge, deploy.
+3. **PR 3 (~3 hours):** form action + UI + e2e tests + metric + runbook + cron. Flag still off in production. Merge, deploy.
+4. **Manual flag flip** in Vercel: turn `PUBLIC_ENABLE_STREAK_FREEZES=true` for *your own user* via a per-user override (or a beta-list table). Smoke-test in production with no other users at risk.
+5. **Roll out to all Pro users** by flipping the flag to true. Watch the metric and the log volume for 30 minutes. Roll back (flip flag off) at the first sign of trouble.
+
+This is the **gradual rollout** pattern. Senior habit: never go from `0% → 100%` directly.
+
+---
+
+## Lesson 66.5 — When you get stuck
+
+You will. Three escape hatches:
+
+1. **Reread the relevant chapter.** If atomic UPDATE feels uncertain, reread Ch 42 — *not* the brief.
+2. **Sketch the wire flow on paper.** What requests get sent, what responses come back, what writes hit the DB.
+3. **Write the test first.** The act of writing the test name (`it('rejects a second consume in the same month')`) clarifies what the implementation must do.
+
+Don't ask the internet for someone else's `consumeFreeze` code. The point of this chapter is to graduate *your judgment*; copying defeats it.
+
+---
+
+## Lesson 66.6 — Now you do it
+
+Open a feature branch. Set a 6-hour timer. Build it.
 
 When you commit and merge, return for Chapter 67.
 
 ---
 
+## Glossary added in Chapter 66
+
+| Term | Definition |
+|---|---|
+| brief | A one-paragraph feature description from product to engineering. |
+| feature flag | An env var or DB toggle that gates a feature on/off without redeploying. |
+| gradual rollout | Shipping in stages (1% → 10% → 100%) with a rollback at each step. |
+| risk-ordered planning | Working through the riskiest unknowns first. |
+
+---
+
+## End-of-chapter checkpoint
+
+- [ ] You read the brief three times before writing code.
+- [ ] You wrote ADR-003 first.
+- [ ] You shipped in 3 PRs, not 1.
+- [ ] All 19 deliverables exist.
+- [ ] The feature flipped on for your own user before going to all Pros.
+- [ ] You can quote which Bible rules each deliverable enforces.
+
+---
+
 # Chapter 67 — Graduation Part II: the post-mortem
 
-> *Write the post-mortem of your own feature.*
+> *Today's job:* write a structured, blameless post-mortem of the feature you just built. *Visible win:* `docs/post-mortems/streak-freezes.md` lives in the repo — an artifact you could hand to a hiring manager as evidence of principal-engineer thinking.
 
-Format:
+The post-mortem is the *learning artifact*. Code teaches you one lesson at a time; the act of *writing about your own work* teaches you ten at a time. Senior engineers do this for every non-trivial feature, even when nothing went wrong.
+
+---
+
+## Lesson 67.1 — Why blameless
+
+Two reasons:
+
+1. **Blame stops learning.** When the doc reads *"I made a mistake here"*, the next time you face the same shape of problem, your brain replays the *shame*, not the *lesson*. Replace *"I"* with *"the system"*: *"The implementation didn't account for X."* Same fact, different teaching.
+2. **Other readers.** A post-mortem is for future-you and for any engineer who joins the project. Naming yourself as "the bad one" doesn't help them solve the next thing.
+
+The blameless post-mortem describes *decisions made under constraints* and *what those constraints made invisible*. Not heroes and villains. Conditions and outcomes.
+
+> **blameless post-mortem** *(noun)* — a write-up of a decision or incident that focuses on system properties, not individual culpability. Pioneered at Etsy / Google SRE.
+
+---
+
+## Lesson 67.2 — The format
 
 ```markdown
-# Streak Freezes — Post-mortem (YYYY-MM-DD)
+# <Feature> — Post-mortem (YYYY-MM-DD)
 
 ## Context
-Why we shipped this, what the user need was.
+Why we shipped this. What the user need was. What constraints shaped the design.
 
 ## What I built
-3-line summary.
+3–5 line summary. Schema choice, action shape, UI shape, observability surface.
 
 ## Decisions and alternatives
-For each significant decision: what I chose, what I rejected, why.
+For each significant decision (≥3 of them):
+- What I chose.
+- What I rejected.
+- Why, in one sentence.
 
-## Surprises
-What I didn't expect — both helpful and harmful.
+## What surprised me
+Both helpful surprises (something was easier than expected) and harmful (something
+was harder, or broke in a way I didn't predict). 3–8 bullets.
 
 ## What I'd do differently
-Honest reflection.
+Honest reflection. Specific. *"I'd write the integration test before the action."*
 
 ## What's still scary
-The tail risks I haven't covered.
+The tail risks I haven't covered. Things I'd watch in production for 2 weeks.
 
 ## Bible rules cited
-List of rules followed (and any deliberately bent, with rationale).
+- ✅ Rules followed (with line refs).
+- ⚠️ Rules bent deliberately, with rationale.
 
 ## What I'd plant for the next learner
-If I were teaching this feature, where would I put a deliberate bug for them to find?
+If I were teaching this feature, where would I put a deliberate bug for them
+to find? (This is a fluency exercise: it forces you to identify the most
+educational *failure modes* of your own work.)
 ```
 
-Then:
+---
 
-1. Reread the 21 non-negotiables at the front of the book. Circle the ones that hit hardest in retrospect.
-2. Inventory what's still scary. That's your next learning agenda.
+## Lesson 67.3 — A worked example
+
+Here's a partial post-mortem for Streak Freezes, written as if you finished it. Use this shape; substitute your own decisions and surprises.
+
+```markdown
+# Streak Freezes — Post-mortem (2026-05-12)
+
+## Context
+Pro users requested a "skip a day without breaking the streak" feature.
+Constraints: Pro-only, monthly reset, single-machine concurrent-safe,
+observable, rollback-able. The existing audit-log infra and atomic-UPDATE
+pattern from Ch 42 / 47 were prerequisites.
+
+## What I built
+- New column `users.freezes_remaining_month INTEGER NOT NULL DEFAULT 1`.
+- Pure async `consumeFreezeForUser(userId): Promise<Result<void, 'no-freeze' | 'not-pro'>>` using atomic conditional UPDATE.
+- Form action `consumeFreeze` wrapping it via `withAudit`.
+- `<ConfirmDialog>` integration in dashboard.
+- Monthly cron at `0 0 1 * *` resetting via `UPDATE users SET freezes_remaining_month = 1`.
+- Counter `streak_freezes_consumed_total{plan}` with bounded label.
+- Feature flag `PUBLIC_ENABLE_STREAK_FREEZES`.
+
+## Decisions and alternatives
+1. **Schema: column on `users` vs. `freeze_consumption` table.**
+   Chose: column. Rejected: table.
+   Why: simpler queries, no JOIN for the common "how many left this month"
+   read. The table would have been right if we wanted to *retain history*
+   of consumption, which we don't (yet). Documented as ADR-003.
+
+2. **Reset mechanism: cron job vs. on-read computation.**
+   Chose: cron. Rejected: compute from `consumed_at` on every read.
+   Why: simpler `consumeFreezeForUser` (no awareness of period boundaries);
+   slight risk if cron fails (mitigation: alert on missed cron + the field
+   is bounded so worst case is "user can't consume" not "user double-consumes").
+
+3. **Concurrency: atomic UPDATE vs SELECT-then-UPDATE.**
+   Chose: atomic. Rejected: SELECT-then-UPDATE (Bible rule #11; not even close).
+
+## What surprised me
+- The `<ConfirmDialog>` integration was 4 lines — simpler than expected.
+- Property-based testing for the cron's idempotency (running it twice in a
+  month should be a no-op for already-reset users) was harder to express
+  than I thought. Wrote it conventional-test instead and added a TODO.
+- The Pro-status check needed to live in *three* places — UI button gate,
+  action gate, e2e seed data. Forgetting the e2e seed initially gave me
+  a flaky test that I almost wrote off as a Playwright bug.
+
+## What I'd do differently
+- Write the integration test for the atomic UPDATE *first*, before the
+  action wrapper. The shape of the test would have clarified the function
+  signature.
+- Ship PR 1 (migration only) earlier in the day. Migrations on Vercel
+  serverless need the unpooled URL and a few minutes to settle.
+- Add a non-Pro e2e test from the start, not as an afterthought.
+
+## What's still scary
+- The cron is auth-gated by a shared secret. If that secret leaks, anyone
+  can hit the endpoint and trigger a global reset. Mitigation in place
+  (rate-limit per IP), but rotating the secret remains a manual step.
+- The migration column has `DEFAULT 1`, so existing users get one freeze
+  retroactively for the current month. Whether that's correct depends on
+  product intent; I assumed yes.
+- I haven't tested the rollback (flag off after on); should rehearse this
+  before next month's reset.
+
+## Bible rules cited
+- ✅ #11 (atomic UPDATE) — `consumeFreezeForUser` line 12.
+- ✅ #12 (idempotency on external) — cron handler dedupe via reset key.
+- ✅ #14 (bounded labels) — `safePlanLabel`.
+- ✅ #15 (no PII logged) — log lines have user IDs only, no emails.
+- ✅ #18 (forward-only migrations) — column added, never dropped.
+- ⚠️ #20 (visible win) — bent: PR 1 had no visible win, just the migration.
+  Justified because PR 1 was infra-only; visible win came in PR 3.
+
+## What I'd plant for the next learner
+Three deliberate bugs:
+1. **Replace atomic UPDATE with SELECT-then-UPDATE.** Reader writes the
+   integration test in Ch 42 style, watches concurrent calls succeed both,
+   and learns Bible #11 viscerally.
+2. **Use `email` as the metric label.** Reader watches Prometheus memory
+   grow during e2e seeding and learns Bible #14 viscerally.
+3. **Forget the Pro-status check in the action body** (only in the UI).
+   Reader uses dev tools to inspect-then-submit and bypasses the gate;
+   learns defence-in-depth from Ch 6 viscerally.
+```
+
+This is the artifact. Write yours after you ship.
+
+---
+
+## Lesson 67.4 — Reread the Bible
+
+Open the front of the book — the 21 non-negotiables. Read each one *with the freeze feature fresh in mind*. For each, ask:
+
+- **Did this rule earn its keep in the freeze feature?** Mark a tick.
+- **Did I bend this rule? Was the bend justified?** Mark a question mark.
+- **Was there a rule that *should* exist but doesn't?** Note it.
+
+The third question is the most valuable. The Bible is the May 5 2026 version; the next edition incorporates what you (and other readers) found missing.
+
+---
+
+## Lesson 67.5 — Inventory what's still scary
+
+After every major project, write a short list — three to ten items — of *"things I shipped but don't fully understand."* For most engineers most of the time, this list includes things like:
+
+- Postgres MVCC behaviour under heavy concurrent writes.
+- TLS certificate renewal at 3am if Vercel's automation fails.
+- Worker-thread crash recovery if Argon2 segfaults.
+- Stripe webhook signing-secret rotation choreography.
+- The exact failure mode of an exhausted DB connection pool.
+
+This is **your next learning agenda.** Knock items off it deliberately. Senior engineers do this for life — the list never reaches zero, because the field keeps moving.
+
+---
+
+## Lesson 67.6 — The closing rule
+
+You came in not knowing what a terminal was. You leave with a deployed, paid, observable, audited product, an integration test suite that proves Bible rule #11 at runtime, an ADR portfolio, a security-review document, an incident-response runbook, a post-mortem of a feature you shipped alone.
+
+You can do this work anywhere on Earth where someone needs Svelte 5 + SvelteKit + TypeScript + Postgres + Stripe in production. You're not finishing a course — you're finishing a *training cycle*. The cycle continues for life.
+
+---
 
 **You are now a Svelte 5 + SvelteKit + TypeScript + Postgres + Stripe principal engineer as of May 5, 2026.**
+
+Welcome to the trade.
+
+---
+
+## Glossary added in Chapter 67
+
+| Term | Definition |
+|---|---|
+| post-mortem | Structured retrospective of a feature, decision, or incident. |
+| blameless | Framed around system properties, not individual culpability. |
+| learning agenda | The running list of "what I shipped but don't fully understand." |
+| training cycle | The continuous practice loop a senior engineer never finishes. |
+
+---
+
+## End-of-chapter checkpoint
+
+- [ ] `docs/post-mortems/streak-freezes.md` exists.
+- [ ] You reread all 21 Bible rules with the freeze feature in mind.
+- [ ] Your "still scary" list has at least three items.
+- [ ] You closed the book.
 
 ---
 
 # Appendix A — Remote Functions, the experimental future
 
-`$app/server` exports `query`, `query.batch`, `query.live`, `form`, `command`. Experimental as of May 2026.
+> *Optional chapter. Experimental as of May 5, 2026 — APIs may change. Don't bet a production app on it yet, but know it exists.*
+
+The book's spine — `+page.server.ts` + `load` + `actions` + `+server.ts` — is the stable, idiomatic story every senior engineer in May 2026 already knows. **Remote Functions** are where SvelteKit is heading: a unified, type-safe primitive for client→server calls that collapses load + action + REST into one shape.
+
+This appendix gives you enough to *recognise* remote functions in the wild and rewrite *one* feature using them, so you understand the trade-off if you adopt them in your own app a year from now.
+
+---
+
+## A.1 — Enabling remote functions
+
+In `svelte.config.ts`:
 
 ```ts
-// src/routes/(app)/habits.remote.ts
-import { query, form } from '$app/server';
+const config: Config = {
+  kit: {
+    experimental: {
+      remoteFunctions: true,
+    },
+  },
+  compilerOptions: {
+    experimental: {
+      async: true,
+    },
+  },
+};
+```
+
+The flag pair is required because remote functions use top-level `await` in markup, which depends on the experimental async-Svelte compiler mode.
+
+---
+
+## A.2 — The five primitives
+
+`$app/server` exports:
+
+- **`query(schema?, fn)`** — read-only server function. Cached per argument, deduplicated within a render. Has `.refresh()`, `.set(data)` for client-side cache invalidation.
+- **`query.batch(schema, fn)`** — solves the N+1 problem. Server receives an array of args; returns a function mapping each to a result. Calls within a macrotask are batched.
+- **`query.live(schema, fn)`** — async generator returning a stream. Auto-reconnects on disconnect. Use for real-time features.
+- **`form(schema, fn)`** — replaces a form action. Returns a spreadable object you put on `<form {...myForm}>` plus typed `fields` accessors for `<input {...myForm.fields.name.as('text')}>`.
+- **`command(schema, fn)`** — imperative mutation, called from event handlers. No automatic page revalidation; you trigger refreshes manually.
+
+---
+
+## A.3 — A worked rewrite
+
+Take Streak's home-page habit list (currently `+page.server.ts` `load` + form action) and rewrite via remote functions:
+
+```ts
+// src/routes/(app)/dashboard/habits.remote.ts
+import { query, form, getRequestEvent } from '$app/server';
 import * as v from 'valibot';
 import { db } from '$lib/db/client';
 import { habits } from '$lib/db/schema';
+import { and, eq } from 'drizzle-orm';
+import { addHabitForUser } from '$lib/habits-server';
 
-export const getHabits = query(async () => db.select().from(habits));
+export const getHabits = query(async () => {
+  const event = getRequestEvent();
+  const user = event.locals.user;
+  if (!user) return [];
+  return db.select().from(habits).where(eq(habits.userId, user.id));
+});
 
 export const addHabit = form(
-  v.object({ name: v.pipe(v.string(), v.minLength(1)) }),
+  v.object({ name: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(100)) }),
   async ({ name }) => {
-    await db.insert(habits).values({ userId: 'demo', name });
+    const event = getRequestEvent();
+    const user = event.locals.user;
+    if (!user) throw new Error('not authed');
+    await addHabitForUser(user.id, name);
+    void getHabits().refresh();
+  },
+);
+
+export const deleteHabit = form(
+  v.object({ id: v.string() }),
+  async ({ id }) => {
+    const event = getRequestEvent();
+    const user = event.locals.user;
+    if (!user) throw new Error('not authed');
+    await db.delete(habits).where(and(eq(habits.id, id), eq(habits.userId, user.id)));
     void getHabits().refresh();
   },
 );
@@ -4026,55 +4342,153 @@ In the page:
 
 ```svelte
 <script lang="ts">
-  import { getHabits, addHabit } from './habits.remote';
+  import { getHabits, addHabit, deleteHabit } from './habits.remote';
 </script>
 
+<h1>Today</h1>
+
 <form {...addHabit}>
-  <input {...addHabit.fields.name.as('text')} />
-  <button>Add</button>
+  <input {...addHabit.fields.name.as('text')} placeholder="Add a habit..." />
+  <button type="submit">Add</button>
 </form>
 
-{#each await getHabits() as h}<li>{h.name}</li>{/each}
+<ul>
+  {#each await getHabits() as habit (habit.id)}
+    <li>
+      {habit.name}
+      <form {...deleteHabit}>
+        <input {...deleteHabit.fields.id.as('hidden')} value={habit.id} />
+        <button type="submit" aria-label="Remove {habit.name}">×</button>
+      </form>
+    </li>
+  {/each}
+</ul>
 ```
 
-Experimental. Don't bet a production app on it yet, but know it exists. The book taught you the stable `+page.server.ts` + `actions` story; remote functions are where it's heading.
+Compared to the stable story, you save:
+- The separate `+page.server.ts`.
+- The `actions` boilerplate.
+- The `use:enhance` import.
+- The `data` prop pattern.
+
+You gain:
+- A clearer *unit of work* per server function.
+- Built-in deduplication of repeated `getHabits()` calls.
+- Type-safe `.refresh()` / `.set()` cache primitives.
+
+You lose:
+- The progressive-enhancement *guarantee* (forms still work, but the implementation is different and the maturity story is younger).
+- The ability to pin to specific Stripe / API versions in your team's existing review patterns.
+- A year of stability — APIs may shift in 5.x and 6.x.
 
 ---
 
-# Appendix B — Reading list
+## A.4 — When to adopt
 
-- **Svelte docs** — `https://svelte.dev/docs` (primary). Section anchors: runes, snippets, transitions, motion.
-- **SvelteKit docs** — `https://kit.svelte.dev/docs`. Section anchors: routing, load, form actions, hooks, adapters.
-- **Markus Winand — *Use The Index, Luke!*** Free online. Read it once; reread the EXPLAIN chapters yearly.
-- **Addy Osmani — *Image Optimization*.** The CLS chapter especially.
-- **OWASP Cheat Sheets** — Authentication, Session Management, Input Validation, Logging, REST Security.
-- **Google SRE Workbook** — chapters on alerting, error budgets, post-mortems.
-- **Stripe docs** — Idempotency, Webhook signing, Best practices.
-- **Conventional Commits** — `https://conventionalcommits.org`.
-- **Vercel docs** — Adapters, ISR, Edge Functions.
-- **Cloudflare R2 docs** — presigned URLs, multipart uploads.
+**Adopt now** for: side projects; greenfield apps you control end-to-end; teams comfortable with experimental APIs and willing to refactor on minor releases.
+
+**Wait** for: production apps with paying users; teams without dedicated time to track API changes; codebases where the boring story is well-understood and shipping is the priority.
+
+The senior judgment call: spend an *innovation token* (Ch 65) on remote functions only if it solves a problem the stable story can't. For most teams in 2026, the stable story is enough.
+
+---
+
+## A.5 — Further reading
+
+- Official SvelteKit Remote Functions docs (live, evolving).
+- Rich Harris's RFC threads on GitHub.
+- The migration guide once it stabilises.
+
+---
+
+# Appendix B — The reading list
+
+> *Curated. The minimum set to keep going beyond the book. One sentence per entry on why it earns the spot.*
+
+## Svelte 5 / SvelteKit
+
+- **[svelte.dev/docs](https://svelte.dev/docs)** — primary source for runes, snippets, transitions, motion. Reread when the spec changes.
+- **[kit.svelte.dev/docs](https://kit.svelte.dev/docs)** — primary source for routing, load, form actions, hooks, adapters.
+- **Rich Harris on YouTube** — the framework's lead designer; his talks on reactivity and the SvelteKit philosophy are the best mental model you can install.
+
+## TypeScript
+
+- **[Matt Pocock — Total TypeScript](https://www.totaltypescript.com)** — beyond-the-basics typing patterns. Especially the `Type-Level Programming` chapter.
+- **TypeScript handbook** — `https://typescriptlang.org/docs/handbook/2/everyday-types.html`. Surprisingly readable cover-to-cover.
+
+## Postgres and SQL
+
+- **Markus Winand — *Use The Index, Luke!*** — free online. Read once; reread the EXPLAIN chapters yearly. The single best resource on database performance.
+- **[Crunchy Data blog](https://www.crunchydata.com/blog)** — high signal Postgres internals.
+- **The Postgres docs themselves** — short, precise, and cite the source.
+
+## Web performance and accessibility
+
+- **Addy Osmani — *Image Optimization*** (free PDF). The CLS chapter is what the book's Bible rule #16 distills.
+- **[web.dev](https://web.dev)** — Google's curated guides on Core Web Vitals.
+- **[deque.com/axe](https://www.deque.com/axe/)** — the test framework your test suite uses; their docs explain *why* each WCAG rule matters.
+
+## Security
+
+- **OWASP Cheat Sheets** — `https://cheatsheetseries.owasp.org`. Authentication, Session Management, Input Validation, Logging, REST Security. The threat model in Chapter 44 is the OWASP Auth cheatsheet condensed.
+- **[OWASP Top 10](https://owasp.org/www-project-top-ten/)** — the Bible's Bible for web security.
+
+## SRE and operations
+
+- **Google — *The Site Reliability Workbook*** (free online). Chapters 5 (Alerting) and 17 (Post-mortems) most relevant.
+- **Will Larson — *An Elegant Puzzle*** — engineering management seen by a principal-shaped lens.
+
+## Stripe / payments
+
+- **[Stripe Docs — Idempotency](https://stripe.com/docs/api/idempotent_requests)** and **Webhook Signing** are required reading before going live.
+- **Stripe's blog** — surprisingly good engineering writing on payments edge cases.
+
+## Tooling
+
+- **Conventional Commits** — `https://www.conventionalcommits.org`. Five minutes; pays back forever.
+- **Vercel docs** — Adapters, ISR, Edge Functions, Cron.
+- **Cloudflare R2 docs** — presigned URLs, multipart uploads, lifecycle policies.
+- **[Drizzle docs](https://orm.drizzle.team)** — your ORM; the migration story is especially good.
+- **[Valibot docs](https://valibot.dev)** — the boundary parser; lightweight, tree-shakeable.
+
+## Books worth owning
+
+- **John Ousterhout — *A Philosophy of Software Design*** — short, dense, the book on naming and complexity.
+- **Brian Goetz et al — *Effective Java*** (the language doesn't matter; the principles transfer).
+- **Donald Norman — *The Design of Everyday Things*** — UX you'll feel in every form you ever wire up.
+
+## What not to read
+
+- Books promising "10 patterns to architect anything." There aren't ten patterns; there are taste and trade-offs.
+- LinkedIn-influencer takes on engineering. Almost all signal-free.
+- Anything claiming the One True Way. The boring-tech doctrine (Ch 65) is closer to the truth.
+
+---
+
+> The list is finite. Read the boring stuff first; it ages slower.
 
 ---
 
 # Appendix C — The Bible card
 
-Print this. Stick it above your monitor.
+> *Print this on a single sheet. Stick it above your monitor. Reread it whenever a code-review feels harder than it should.*
 
 ```
 THE STREAK BIBLE — May 5, 2026
 
 TOOLING
-1. pnpm only.
-2. .svelte and .ts only — never .js.
-3. TypeScript strict from line one. No any. No !. No @ts-ignore.
-4. Svelte 5 runes only — no export let, no $:, no on:click, no <slot>.
+ 1. pnpm only.
+ 2. .svelte and .ts only — never .js.
+ 3. TypeScript strict from line one. No any. No !. No @ts-ignore.
+ 4. Svelte 5 runes only — no export let, no $:, no on:click, no <slot>.
 
 IDIOMS
-5. += not = x + 1. === not ==. const by default. ??not ||. ?. over manual null checks.
-6. Engineer-English read-aloud on every snippet.
-7. Every example is load-bearing.
-8. English sentence first, code second.
-9. No comment lies.
+ 5. += not = x + 1. === not ==. const by default. ?? not ||.
+    ?. over manual null checks. Early returns. type="button" always.
+ 6. Engineer-English read-aloud on every snippet.
+ 7. Every example is load-bearing.
+ 8. English sentence first, code second.
+ 9. No comment lies.
 
 CORRECTNESS
 10. Money is integer cents end-to-end. No floats.
@@ -4090,8 +4504,20 @@ CORRECTNESS
 20. Every chapter delivers a visible win.
 
 EVIDENCE
-21. Compilation and tests are necessary, not sufficient. Demand runtime evidence.
+21. Compilation and tests are necessary, not sufficient.
+    Demand runtime evidence.
 ```
+
+---
+
+## How to use the card
+
+- **In code review.** When you reject a PR, cite the rule by number. *"BLOCKING: violates rule #11 (line 42 is SELECT-then-UPDATE)."* The number is more authoritative than your opinion.
+- **In an interview.** When asked *"how would you ship X safely?"*, the rules are the answer's spine.
+- **In your own debugging.** When something's broken and you can't see why, walk the rules and ask *"did I follow each one?"*. About 60% of the time, the bug is in a violation.
+- **In your runbook.** When the production incident is *"the metrics dashboard is empty"*, rule #14 is your first hypothesis.
+
+The card is not law. It's *prior art on a single page*. The next edition will have new rules; some current ones will retire. But these 21, on May 5 2026, are the floor for the stack.
 
 ---
 
