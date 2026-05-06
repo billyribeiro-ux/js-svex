@@ -129,7 +129,7 @@ export const actions: Actions = {
       maxAge: 60 * 60 * 24 * 30,
     });
 
-    redirect(303, '/app');
+    redirect(303, '/dashboard');
   },
 };
 ```
@@ -171,6 +171,27 @@ The `dummyHash` line: by always running `verifyPassword`, we avoid a timing leak
 | CSRF | SvelteKit's `csrf.checkOrigin` (default on); `sameSite: strict` cookies. |
 | XSS → token theft | `httpOnly` cookies. Tokens never readable by JS. |
 | Replay | Short session lifetimes; "fresh" flag for sensitive actions. |
+
+---
+
+## Lesson 44.7 — Recurring concepts from earlier chapters
+
+- **`+page.server.ts` actions** (Ch 41) — login is just another named (or default) action.
+- **Atomic INSERT** (Ch 42) — `createSession` is single-row insert; safe.
+- **`drizzle-orm`** (Ch 39) — `.where(eq(users.email, email))`.
+- **`fail(400, ...)`** (Ch 41) — generic error response; never enumerate.
+
+---
+
+## Lesson 44.8 — What you can now read in the wild
+
+After Chapter 44 you can:
+
+- Read the **session schema** (token, expiresAt, fresh).
+- Read **secure cookie flags** (`httpOnly`, `secure`, `sameSite`, `path`, `maxAge`) and explain each.
+- Read **`crypto.timingSafeEqual`** as the constant-time-comparison primitive.
+- Spot **account-enumeration** as a vulnerability and identify the `dummyHash`+generic-error mitigation.
+- Recite the threat model out loud.
 
 ---
 
@@ -300,6 +321,26 @@ In the layout:
 
 ---
 
+## Lesson 45.5 — Recurring concepts from earlier chapters
+
+- **`+hooks.server.ts`** — runs on every request before any `load`/`action`.
+- **`+layout.server.ts`** (Ch 32) — central gate via `requireUser`.
+- **`redirect()` returns `never`** — narrows the type after the guard.
+
+---
+
+## Lesson 45.6 — What you can now read in the wild
+
+After Chapter 45 you can:
+
+- Read **`handle({ event, resolve })`** and explain the request lifecycle.
+- Read **`event.locals`** as the per-request context bag.
+- Read **`sequence(handleA, handleB, ...)`** for chaining hooks.
+- Read **`requireUser` / `requireRole`** as gating helpers.
+- Spot pages that should be in `(app)/` but aren't, as auth gaps.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] Visiting `/app/*` while logged out redirects to login with `?next=...`.
@@ -358,22 +399,35 @@ parentPort!.on('message', async (msg: { id: string; op: 'hash' | 'verify'; data:
 // src/lib/passwords/index.ts
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
 
-const POOL_SIZE = Math.max(1, (require('node:os').cpus().length) - 1);
+type WorkerMessage = { id: string; ok: true; result: string | boolean } | { id: string; ok: false; error: string };
+type DispatchOp = 'hash' | 'verify';
+type DispatchData = string | { plain: string; hash: string };
+
+interface PendingCall {
+  id: string;
+  resolve: (v: string | boolean) => void;
+  reject: (e: Error) => void;
+}
+
+const POOL_SIZE = Math.max(1, os.cpus().length - 1);
 
 const pool: Worker[] = [];
-const queue: Array<{ id: string; resolve: (v: any) => void; reject: (e: any) => void }> = [];
+const queue: PendingCall[] = [];
 
 function ensurePool(): void {
   if (pool.length > 0) return;
   for (let i = 0; i < POOL_SIZE; i += 1) {
     const w = new Worker(fileURLToPath(import.meta.resolve('./worker.ts')));
-    w.on('message', (msg) => {
+    w.on('message', (msg: WorkerMessage) => {
       const idx = queue.findIndex((q) => q.id === msg.id);
       if (idx === -1) return;
-      const { resolve, reject } = queue[idx];
+      const pending = queue[idx];
+      if (pending === undefined) return;
       queue.splice(idx, 1);
-      msg.ok ? resolve(msg.result) : reject(new Error(msg.error));
+      if (msg.ok) pending.resolve(msg.result);
+      else pending.reject(new Error(msg.error));
     });
     pool.push(w);
   }
@@ -381,12 +435,21 @@ function ensurePool(): void {
 
 let nextWorker = 0;
 
-function dispatch<T>(op: 'hash' | 'verify', data: any): Promise<T> {
+function dispatch<T extends string | boolean>(op: DispatchOp, data: DispatchData): Promise<T> {
   ensurePool();
-  return new Promise((resolve, reject) => {
+  return new Promise<T>((resolve, reject) => {
     const id = crypto.randomUUID();
-    queue.push({ id, resolve, reject });
-    pool[nextWorker]!.postMessage({ id, op, data });
+    queue.push({
+      id,
+      resolve: (v) => resolve(v as T),
+      reject,
+    });
+    const worker = pool[nextWorker];
+    if (worker === undefined) {
+      reject(new Error('worker pool empty'));
+      return;
+    }
+    worker.postMessage({ id, op, data });
     nextWorker = (nextWorker + 1) % pool.length;
   });
 }
@@ -400,7 +463,7 @@ export function verifyPassword(plain: string, hash: string): Promise<boolean> {
 }
 ```
 
-The actual production version would handle worker crashes, queue timeouts, and graceful shutdown. The Bible's `connect_timeout` rule applied: queued requests should time out if no worker responds in N seconds.
+The actual production version would handle worker crashes, queue timeouts (the Bible's `connect_timeout` rule applied: queued requests should time out if no worker responds in N seconds), graceful shutdown, and a max queue depth so a worker-pool stampede can't OOM the process. We're showing the core mechanism; the production-hardening version goes in `src/lib/passwords/index.ts` once the security review (Ch 48) flags it.
 
 ---
 
@@ -474,6 +537,25 @@ describe('passwords', () => {
 
 ---
 
+## Lesson 46.5 — Recurring concepts from earlier chapters
+
+- **Worker threads** as the JS analogue of Rust's `spawn_blocking`.
+- **Boundary parser idiom** (Ch 26) — email/password validation at the action edge.
+- **`returning()`** (Ch 39) — `db.insert(users).values(...).returning()` for the new ID.
+
+---
+
+## Lesson 46.6 — What you can now read in the wild
+
+After Chapter 46 you can:
+
+- Read **Argon2id config** (`memoryCost`, `timeCost`, `parallelism`) and explain trade-offs.
+- Read a **worker-pool** implementation and trace a request from `hashPassword` to a worker thread and back.
+- Recognise **password length over complexity** (NIST 800-63B, no max, no character classes) as the modern recommendation.
+- Spot a **password hash on the request thread** as a tail-latency disaster.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] Signup creates a user, logs the verify link.
@@ -506,14 +588,22 @@ export const auditLog = pgTable('audit_log', {
 
 ## Lesson 47.2 — `withAudit`
 
+The transaction type is the parameter type of `db.transaction`'s callback:
+
 ```ts
 // src/lib/auth.ts
+import { db } from '$lib/db/client';
+import { auditLog } from '$lib/db/schema';
+import type { RequestEvent } from '@sveltejs/kit';
+
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 export async function withAudit<T>(
   event: RequestEvent,
   action: string,
   targetType: string | null,
   targetId: string | null,
-  fn: (tx: typeof db) => Promise<T>,
+  fn: (tx: Tx) => Promise<T>,
 ): Promise<T> {
   return db.transaction(async (tx) => {
     const result = await fn(tx);
@@ -563,9 +653,92 @@ Forget once, gate forever. Every page under `(app)/admin/` is protected.
 
 ## Lesson 47.4 — Impersonation safely
 
-`/admin/users/[id]/impersonate` issues a *fresh, short-lived* session for the impersonator-as-target, with `impersonator_id` set, and a banner shown in the layout. Ending impersonation deletes only that session.
+Schema additions:
 
-We won't ship the full code here for brevity — the principle is *fresh session + visible banner + audit row*.
+```ts
+// in schema.ts: extend sessions
+export const sessions = pgTable('sessions', {
+  // ... existing fields ...
+  impersonatorId: uuid('impersonator_id').references(() => users.id, { onDelete: 'set null' }),
+});
+```
+
+Action:
+
+```ts
+// src/routes/(app)/admin/users/[id]/impersonate/+page.server.ts
+import type { Actions } from './$types';
+import { redirect } from '@sveltejs/kit';
+import { db } from '$lib/db/client';
+import { sessions, users } from '$lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { requireRole, withAudit } from '$lib/auth';
+import { newSessionToken } from '$lib/sessions';
+
+const IMPERSONATION_LIFETIME_MS = 15 * 60 * 1000; // 15 minutes — short-lived
+
+export const actions: Actions = {
+  default: async (event) => {
+    const admin = requireRole(event, 'admin');
+    const targetId = event.params.id;
+    const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+    if (target === undefined) redirect(303, '/admin/users');
+
+    const token = newSessionToken();
+    await withAudit(event, 'user.impersonate.start', 'user', target.id, async (tx) => {
+      await tx.insert(sessions).values({
+        userId: target.id,
+        impersonatorId: admin.id,
+        token,
+        expiresAt: new Date(Date.now() + IMPERSONATION_LIFETIME_MS),
+        fresh: false,
+      });
+    });
+
+    event.cookies.set('session', token, {
+      httpOnly: true, secure: true, sameSite: 'strict', path: '/',
+      maxAge: Math.floor(IMPERSONATION_LIFETIME_MS / 1000),
+    });
+    redirect(303, '/dashboard');
+  },
+};
+```
+
+In the layout, show a banner when impersonating:
+
+```svelte
+{#if data.user.impersonatorId}
+  <div class="impersonation-banner">
+    Impersonating {data.user.email}.
+    <form method="POST" action="/admin/end-impersonation">
+      <button type="submit">End impersonation</button>
+    </form>
+  </div>
+{/if}
+```
+
+The end-impersonation action deletes only this session (not the admin's original session) and clears the cookie.
+
+The principle is *fresh short-lived session + visible banner + audit row at start and end*. Without all three, impersonation becomes a backdoor.
+
+---
+
+## Lesson 47.5 — Recurring concepts from earlier chapters
+
+- **`db.transaction`** (Ch 42) — `withAudit` enforces atomicity.
+- **`Result` typing** (Ch 27) — every method that can fail uses it (still applies inside `withAudit`'s `fn`).
+- **`+layout.server.ts` central gate** (Ch 32, 45) — `requireRole` lives at the layout level.
+
+---
+
+## Lesson 47.6 — What you can now read in the wild
+
+After Chapter 47 you can:
+
+- Read an **`audit_log`** schema and trace what gets written when.
+- Read **`withAudit(event, action, target, fn)`** as the single-call atomicity helper.
+- Read a **fresh-session impersonation** flow and identify the three pieces (session, banner, audit).
+- Spot a **role-check inside a handler** (instead of in the layout) as a refactor target.
 
 ---
 
@@ -573,6 +746,7 @@ We won't ship the full code here for brevity — the principle is *fresh session
 
 - [ ] `(app)/admin/*` is admin-only.
 - [ ] `audit_log` fills on every action that uses `withAudit`.
+- [ ] Impersonation flow logs at start and end.
 
 ---
 
@@ -685,20 +859,38 @@ Every value justified in the security-review doc. CSP starts strict; loosen only
 
 ## Lesson 48.5 — `pnpm security:headers`
 
-A small Vitest test that boots the server, hits `/`, asserts every required header is present.
+A small Vitest test against the running preview server. Run `pnpm preview` in one terminal, then run the test in another (or use Playwright's `webServer` config — Ch 60).
 
 ```ts
 // tests/security/headers.test.ts
 import { describe, it, expect } from 'vitest';
+
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:4173';
+
 describe('security headers', () => {
   it('sets HSTS, CSP, etc.', async () => {
-    const r = await fetch('http://localhost:5173/');
+    const r = await fetch(`${BASE}/`);
     expect(r.headers.get('strict-transport-security')).toContain('max-age=');
     expect(r.headers.get('content-security-policy')).toContain("default-src 'self'");
     expect(r.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(r.headers.get('x-frame-options')).toBe('DENY');
+    expect(r.headers.get('referrer-policy')).toBeTruthy();
+    expect(r.headers.get('permissions-policy')).toBeTruthy();
   });
 });
 ```
+
+Add to `package.json`:
+
+```json
+{
+  "scripts": {
+    "security:headers": "vitest run tests/security/headers.test.ts"
+  }
+}
+```
+
+In CI, this runs against the deployed preview URL via `TEST_BASE_URL`.
 
 ---
 
@@ -726,6 +918,32 @@ Auth system: signup, login, logout, sessions, RBAC, audit log.
 **Issue:** Original implementation rate-limited by IP; an attacker behind a CDN could bypass.
 **Fix:** Per-IP and per-email both buckets must allow.
 ```
+
+---
+
+## Lesson 48.7 — Recurring concepts from earlier chapters
+
+Part VII's spine, in one place:
+
+- **Sessions, secure cookies, threat model** (Ch 44).
+- **`+hooks.server.ts`, `event.locals`, `requireUser`** (Ch 45).
+- **Argon2id on a worker thread** (Ch 46).
+- **RBAC + `withAudit` + impersonation** (Ch 47).
+- **Rate-limiting + CSP/HSTS + security review document** (Ch 48).
+
+Together, that's a real auth system the reader could defend in a code review.
+
+---
+
+## Lesson 48.8 — What you can now read in the wild
+
+After Part VII you can:
+
+- Articulate STRIDE for a web auth system out loud, with the Streak-specific mitigation for each category.
+- Write an OWASP-Top-10 self-audit grep script for your own codebase.
+- Read **CSP**, **HSTS preload**, **X-Frame-Options**, **Referrer-Policy**, **Permissions-Policy** and explain what each defends against.
+- Recognise an in-memory rate-limiter as a single-instance limit and know to swap for Redis at scale.
+- Write a **security review document** with named findings and fixes.
 
 ---
 
