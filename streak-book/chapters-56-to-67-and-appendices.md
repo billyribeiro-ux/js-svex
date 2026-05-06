@@ -992,64 +992,431 @@ After Chapter 58 you can:
 
 ---
 
-# Chapter 59 — Component, contract, integration tests
+# Chapter 59 — Component, contract, and integration tests
 
-## Lesson 59.1 — `@testing-library/svelte`
+> *Today's job:* `pnpm test:component` renders `<HabitRow>` and asserts it calls `onDelete` with the right ID; `pnpm test:integration` runs `addHabitForUser` against a real Postgres with truncate-before-each isolation; `pnpm test:contract` verifies `/api/v1/habits` matches `docs/openapi.yaml`. *Visible win:* three suites, three speeds, three layers of protection.
+
+The unit tests from Chapter 58 cover *pure* functions. The chapters above also need:
+- **Component tests** — render a Svelte 5 component in jsdom; assert the rendered DOM and the callback wiring.
+- **Integration tests** — exercise database mutations against a real Postgres.
+- **Contract tests** — verify the public REST API matches its hand-written OpenAPI spec.
+
+Together with the unit tests, these are the four bottom-rungs of the test pyramid.
+
+---
+
+## Lesson 59.1 — `@testing-library/svelte` setup
 
 ```bash
-pnpm add -D @testing-library/svelte @testing-library/user-event jsdom
+pnpm add -D @testing-library/svelte @testing-library/user-event @testing-library/jest-dom jsdom
 ```
+
+Add a separate Vitest project for component tests (so the DOM environment is only active where needed):
+
+```ts
+// vitest.config.ts (extended)
+import { defineConfig } from 'vitest/config';
+import { sveltekit } from '@sveltejs/kit/vite';
+
+export default defineConfig({
+  plugins: [sveltekit()],
+  test: {
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'unit',
+          environment: 'node',
+          include: ['tests/unit/**/*.test.ts', 'src/**/*.test.ts'],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'component',
+          environment: 'jsdom',
+          include: ['tests/component/**/*.svelte.test.ts'],
+          setupFiles: ['./tests/setup-component.ts'],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'integration',
+          environment: 'node',
+          include: ['tests/integration/**/*.test.ts'],
+          setupFiles: ['./tests/setup-integration.ts'],
+        },
+      },
+    ],
+  },
+});
+```
+
+`tests/setup-component.ts`:
+
+```ts
+import '@testing-library/jest-dom/vitest';
+```
+
+This adds matchers like `toBeInTheDocument()` to `expect`.
+
+> **`@testing-library/svelte`** — render Svelte components in jsdom and query the resulting DOM by accessibility role / text / label.
+>
+> **jsdom** — a JavaScript implementation of the DOM. Lets us run `render(MyComponent)` in Node without spinning up a real browser.
+
+---
+
+## Lesson 59.2 — A component test, properly
 
 ```ts
 // tests/component/HabitRow.svelte.test.ts
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import HabitRow from '$lib/components/HabitRow.svelte';
+import { habitId } from '$lib/types';
 
 describe('HabitRow', () => {
-  it('renders name and calls onDelete', async () => {
-    let deleted = '';
+  it('renders the habit name', () => {
     render(HabitRow, {
-      habit: { id: 'h1' as any, name: 'Read', createdAt: Date.now() },
-      onDelete: (id) => { deleted = id; },
+      habit: { id: habitId('h1'), name: 'Read 20 minutes', createdAt: Date.now() },
+      onDelete: () => {},
     });
-    expect(screen.getByText('Read')).toBeInTheDocument();
-    await userEvent.click(screen.getByLabelText('Remove Read'));
-    expect(deleted).toBe('h1');
+    expect(screen.getByText('Read 20 minutes')).toBeInTheDocument();
+  });
+
+  it('calls onDelete with the habit id when X is clicked', async () => {
+    const onDelete = vi.fn();
+    render(HabitRow, {
+      habit: { id: habitId('h1'), name: 'Read', createdAt: Date.now() },
+      onDelete,
+    });
+
+    const button = screen.getByRole('button', { name: /remove read/i });
+    await userEvent.click(button);
+
+    expect(onDelete).toHaveBeenCalledOnce();
+    expect(onDelete).toHaveBeenCalledWith(habitId('h1'));
+  });
+
+  it('hides timestamp in compact mode', () => {
+    render(HabitRow, {
+      habit: { id: habitId('h1'), name: 'Read', createdAt: Date.now() },
+      onDelete: () => {},
+      compact: true,
+    });
+    expect(screen.queryByText(/ago/)).not.toBeInTheDocument();
   });
 });
 ```
 
+Read aloud:
+
+| Line | Read aloud as |
+|---|---|
+| `render(HabitRow, { habit, onDelete })` | *"Mount HabitRow with these props in jsdom."* |
+| `screen.getByText('Read 20 minutes')` | *"Find the element whose text reads 'Read 20 minutes'."* |
+| `screen.getByRole('button', { name: /remove read/i })` | *"Find the button accessible-named 'Remove Read' (case-insensitive)."* |
+| `await userEvent.click(button)` | *"Simulate a real click — including focus, mouseup, etc."* |
+| `expect(onDelete).toHaveBeenCalledWith(habitId('h1'))` | *"The onDelete callback was invoked exactly once with the right argument."* |
+
+Senior habit: **prefer `getByRole`** over `getByTestId`. Querying by role mirrors how a screen-reader user navigates; if your test needs a `data-testid`, your component might not be accessible.
+
 ---
 
-## Lesson 59.2 — Integration: real Postgres, truncate-before-each
+## Lesson 59.3 — Tests that use runes (`.svelte.test.ts`)
+
+When the component-under-test uses runes, the test file must end in `.svelte.test.ts` (the Svelte plugin recognises this and enables the compiler):
 
 ```ts
-import { beforeEach } from 'vitest';
-import { db } from '$lib/db/client';
-import { sql } from 'drizzle-orm';
+// tests/component/Counter.svelte.test.ts
+import { test, expect } from 'vitest';
+import { flushSync } from 'svelte';
 
-beforeEach(async () => {
-  await db.execute(sql`TRUNCATE users, habits, sessions, audit_log RESTART IDENTITY CASCADE`);
+test('Counter rune', () => {
+  let value = $state(0);
+  // … exercise reactive logic …
+  value += 1;
+  flushSync(); // force pending reactivity to settle synchronously
+  expect(value).toBe(1);
 });
 ```
 
+> **`flushSync()`** — Svelte primitive that runs all pending effects synchronously. Required in tests when you need to *observe* the consequence of a state change immediately.
+>
+> **`$effect.root(() => { ... })`** — wraps test code in an effect scope outside a component. Use when you're testing helpers that own `$state` and `$effect` directly.
+
 ---
 
-## Lesson 59.3 — Contract tests
+## Lesson 59.4 — Integration tests against a real Postgres
 
-`docs/openapi.yaml` is hand-written; tests assert the live API matches.
+Bible rule #5: *don't mock the database.* The integration suite spins up a real `streak_test` database, truncates before each test, and runs the actual Drizzle queries against it.
+
+`tests/setup-integration.ts`:
+
+```ts
+import { beforeAll, beforeEach, afterAll } from 'vitest';
+import { execSync } from 'node:child_process';
+import { db, closeDb } from '$lib/db/client';
+import { sql } from 'drizzle-orm';
+
+beforeAll(() => {
+  // Apply migrations to the test DB
+  execSync('pnpm drizzle-kit migrate', {
+    env: { ...process.env, DATABASE_URL: process.env.TEST_DATABASE_URL },
+    stdio: 'inherit',
+  });
+});
+
+beforeEach(async () => {
+  await db.execute(sql`
+    TRUNCATE webhook_events, audit_log, sessions, subscriptions, habits, users
+    RESTART IDENTITY CASCADE
+  `);
+});
+
+afterAll(async () => {
+  await closeDb();
+});
+```
+
+Add to `src/lib/db/client.ts`:
+
+```ts
+import postgres from 'postgres';
+import { drizzle } from 'drizzle-orm/postgres-js';
+import { DATABASE_URL } from '$env/static/private';
+
+const url = process.env.TEST_DATABASE_URL ?? DATABASE_URL;
+const client = postgres(url, { max: 5, idle_timeout: 20, connect_timeout: 10 });
+export const db = drizzle(client);
+export const closeDb = (): Promise<void> => client.end();
+```
+
+Run with:
+
+```bash
+TEST_DATABASE_URL=postgres://postgres:dev@localhost:5432/streak_test \
+  pnpm vitest run --project integration
+```
+
+Or wire a `pnpm test:integration` script that exports the env var.
+
+> **truncate-before-each** — wipe all rows between tests for fast, full isolation. Faster than `BEGIN`/`ROLLBACK` because of how Postgres handles statement-level rollbacks; works because each test's data is independent.
+
+---
+
+## Lesson 59.5 — A real integration test
+
+```ts
+// tests/integration/addHabitForUser.test.ts
+import { describe, it, expect, beforeEach } from 'vitest';
+import { db } from '$lib/db/client';
+import { users, habits } from '$lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { addHabitForUser } from '$lib/habits-server';
+
+const TEST_USER = '00000000-0000-0000-0000-000000000099';
+
+beforeEach(async () => {
+  await db.insert(users).values({
+    id: TEST_USER,
+    email: 'test@example.com',
+    passwordHash: 'fake',
+  });
+});
+
+describe('addHabitForUser', () => {
+  it('inserts a habit and increments the user counter', async () => {
+    const result = await addHabitForUser(TEST_USER, 'Read');
+    expect(result.ok).toBe(true);
+
+    const rows = await db.select().from(habits).where(eq(habits.userId, TEST_USER));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.name).toBe('Read');
+
+    const [user] = await db.select().from(users).where(eq(users.id, TEST_USER));
+    expect(user?.habitsCount).toBe(1);
+  });
+
+  it('rejects when the cap is reached', async () => {
+    await db.update(users).set({ habitsCount: 50 }).where(eq(users.id, TEST_USER));
+    const result = await addHabitForUser(TEST_USER, 'Read');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBe('limit-reached');
+  });
+
+  it('is atomic under concurrency at the limit', async () => {
+    await db.update(users).set({ habitsCount: 49 }).where(eq(users.id, TEST_USER));
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => addHabitForUser(TEST_USER, 'concurrent')),
+    );
+
+    const successes = results.filter((r) => r.ok);
+    expect(successes).toHaveLength(1);
+  });
+});
+```
+
+The third test is the **runtime evidence** for Bible rule #11. Ten concurrent calls; exactly one succeeds; the atomic conditional UPDATE prevents the other nine.
+
+---
+
+## Lesson 59.6 — Contract tests against OpenAPI
+
+When you publish a REST API (Ch 64), you write `docs/openapi.yaml` by hand. The contract test asserts the live API matches:
+
+```bash
+pnpm add -D @stoplight/spectral-core @stoplight/spectral-rulesets ajv ajv-formats
+```
+
+```ts
+// tests/contract/api-v1-habits.test.ts
+import { describe, it, expect } from 'vitest';
+import yaml from 'yaml';
+import fs from 'node:fs/promises';
+import Ajv from 'ajv';
+import addFormats from 'ajv-formats';
+
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:4173';
+
+describe('GET /api/v1/habits matches the OpenAPI spec', () => {
+  it('list response conforms to schema', async () => {
+    const specRaw = await fs.readFile('docs/openapi.yaml', 'utf-8');
+    const spec = yaml.parse(specRaw) as { components: { schemas: { HabitList: object } } };
+
+    const r = await fetch(`${BASE}/api/v1/habits`, {
+      headers: { authorization: `Bearer ${process.env.TEST_PAT}` },
+    });
+    expect(r.status).toBe(200);
+    const body: unknown = await r.json();
+
+    const ajv = new Ajv({ strict: false });
+    addFormats(ajv);
+    const validate = ajv.compile(spec.components.schemas.HabitList);
+    const valid = validate(body);
+
+    expect(valid).toBe(true);
+    if (!valid) console.error(validate.errors);
+  });
+
+  it('returns 401 without a token', async () => {
+    const r = await fetch(`${BASE}/api/v1/habits`);
+    expect(r.status).toBe(401);
+  });
+});
+```
+
+The test loads the spec, fetches the live endpoint, and validates the response against the schema. If the API drifts from the spec — by accident or on purpose — the test fails *and points at exactly the field that doesn't match*.
+
+> **contract test** *(noun)* — a test that verifies an API conforms to its declared shape. Catches drift between docs and reality.
+
+---
+
+## Lesson 59.7 — Read this code
+
+```ts
+const result = await myAction({ name: 'Read' }, mockEvent());
+expect(result.success).toBe(true);
+```
+
+Why does a senior reviewer push back?
+
+<details>
+<summary>Answer</summary>
+
+Several reasons:
+
+1. **`mockEvent()` lies about reality.** SvelteKit's `RequestEvent` carries cookies, locals, headers, URL, and a special `fetch`. A mock can't replicate them all. The test passes; the real handler crashes on `event.cookies.get('session')` because the mock didn't include cookies.
+2. **`result.success` checks a field that doesn't exist on `fail()`** — actions return `ActionResult` shapes that aren't directly assertable like that.
+3. **The right place for this test is integration.** Spin up a real preview server, post a real form, assert the rendered response.
+
+The senior pattern: test pure logic with unit tests (the validation, the parsing); test handlers via integration (a real HTTP request hits a real server hits a real DB).
+</details>
+
+---
+
+## Lesson 59.8 — Now you write it
+
+**The English sentence first:**
+
+> *"Write a component test for `<EmptyState>` (Chapter 13). It should render the heading 'No habits yet' and the prompt 'Add your first one above.'"*
+
+<details>
+<summary>Worked answer</summary>
+
+```ts
+// tests/component/EmptyState.svelte.test.ts
+import { describe, it, expect } from 'vitest';
+import { render, screen } from '@testing-library/svelte';
+import EmptyState from '$lib/components/EmptyState.svelte';
+
+describe('EmptyState', () => {
+  it('renders the heading and prompt', () => {
+    render(EmptyState);
+    expect(screen.getByRole('heading', { name: /no habits yet/i })).toBeInTheDocument();
+    expect(screen.getByText(/add your first one above/i)).toBeInTheDocument();
+  });
+});
+```
+
+Tiny but real. The test will fail the day someone changes the wording — which is a good thing if the wording is part of the user contract.
+</details>
+
+---
+
+## Lesson 59.9 — Recurring concepts from earlier chapters
+
+- **`addHabitForUser`** (Ch 42) — extracted as a pure-async function specifically *so* it could be integration-tested.
+- **Atomic conditional UPDATE** (Ch 42) — the integration test is the runtime evidence for Bible rule #11.
+- **`Result<T, E>`** (Ch 27) — every integration test asserts on `.ok` and narrows.
+- **OpenAPI** — preview now; written formally in Ch 64.
+
+---
+
+## Lesson 59.10 — What you can now read in the wild
+
+After Chapter 59 you can:
+
+- Read **`render(Component, props)` + `screen.getByRole(...)` + `userEvent.click(...)`** as the component-test shape.
+- Read **`flushSync()`** and **`$effect.root()`** in tests that exercise runes.
+- Read **`beforeEach(() => db.execute(\`TRUNCATE ...\`))`** as the test-isolation pattern.
+- Read an **OpenAPI-spec-validation** test and explain how it catches drift.
+- Spot **mocked `RequestEvent`** as a code-review reject.
+
+---
+
+## Glossary added in Chapter 59
+
+| Term | Definition |
+|---|---|
+| `@testing-library/svelte` | Render + query Svelte components in jsdom. |
+| jsdom | Node-side DOM implementation for tests. |
+| `flushSync` | Force pending Svelte reactivity to settle synchronously. |
+| `$effect.root` | Effect scope for tests outside a component. |
+| truncate-before-each | Test isolation by wiping all tables between tests. |
+| contract test | Verifies an API matches its declared spec. |
 
 ---
 
 ## End-of-chapter checkpoint
 
-- [ ] Component, contract, integration suites all green.
+- [ ] Component test for `HabitRow` and `EmptyState` is green.
+- [ ] Integration test for `addHabitForUser` exists and runs against a real Postgres.
+- [ ] Concurrent-insert test proves Bible rule #11 at runtime.
+- [ ] (Optional) contract test against OpenAPI spec exists.
 
 ---
 
-# Chapter 60 — Playwright e2e, a11y, visual regression
+# Chapter 60 — Playwright e2e, accessibility, visual regression
+
+> *Today's job:* `pnpm test:e2e` opens a real Chromium browser, signs up a fresh user, logs three habits, upgrades to Pro on a Stripe test card, signs out, signs in again, sees the habits and the Pro badge — every step asserted. `pnpm test:a11y` runs `@axe-core/playwright` against every key page and reports zero violations. `pnpm test:visual` flags layout regressions via screenshot diffs. *Visible win:* removing `aria-label` from a button breaks the a11y suite immediately, before any user notices.
+
+E2e tests are the **runtime-evidence layer** Bible rule #21 demands. Compilation green and unit/integration green prove the parts work; e2e proves the *parts compose*.
+
+---
 
 ## Lesson 60.1 — Playwright config
 
@@ -1058,75 +1425,372 @@ beforeEach(async () => {
 import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
-  webServer: { command: 'pnpm build && pnpm preview', port: 4173 },
-  use: { baseURL: 'http://localhost:4173' },
+  testDir: 'tests/e2e',
+  fullyParallel: true,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: process.env.CI ? 'github' : 'list',
+
+  use: {
+    baseURL: process.env.TEST_BASE_URL ?? 'http://localhost:4173',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+  },
+
+  webServer: process.env.TEST_BASE_URL
+    ? undefined // CI: external URL, no local server
+    : {
+        command: 'pnpm build && pnpm preview',
+        port: 4173,
+        reuseExistingServer: !process.env.CI,
+        timeout: 120_000,
+      },
+
   projects: [
     { name: 'chromium', use: devices['Desktop Chrome'] },
     { name: 'firefox', use: devices['Desktop Firefox'] },
+    { name: 'webkit', use: devices['Desktop Safari'] },
   ],
 });
 ```
 
+Read aloud:
+
+| Field | Read aloud as |
+|---|---|
+| `fullyParallel: true` | *"Run tests in parallel by default."* |
+| `retries: process.env.CI ? 2 : 0` | *"Retry twice on CI, never locally."* — masks transient flakiness in CI without hiding it locally. |
+| `trace: 'on-first-retry'` | *"On first retry, save a full trace I can replay in the Playwright Inspector."* |
+| `webServer` | *"Boot `pnpm preview` automatically; in CI, hit the real preview URL instead."* |
+| `projects: [chromium, firefox, webkit]` | *"Run every test against Chrome, Firefox, and Safari engines."* |
+
+> **trace** *(noun)* — a recording Playwright keeps of every action, network request, and DOM mutation during a test. Open with `pnpm exec playwright show-trace`. The single best e2e debugging tool.
+
 ---
 
-## Lesson 60.2 — Full-flow test
+## Lesson 60.2 — Page Object Model
+
+For tests that touch the same UI repeatedly, extract page-objects. Keeps tests readable and isolates selectors.
+
+```ts
+// tests/e2e/pages/SignupPage.ts
+import type { Page } from '@playwright/test';
+
+export class SignupPage {
+  constructor(private page: Page) {}
+
+  async goto(): Promise<void> {
+    await this.page.goto('/signup');
+  }
+
+  async fill(email: string, password: string): Promise<void> {
+    await this.page.getByLabel(/email/i).fill(email);
+    await this.page.getByLabel(/password/i).fill(password);
+  }
+
+  async submit(): Promise<void> {
+    await this.page.getByRole('button', { name: /sign up/i }).click();
+  }
+
+  async signup(email: string, password: string): Promise<void> {
+    await this.goto();
+    await this.fill(email, password);
+    await this.submit();
+  }
+}
+```
+
+Equivalent for `LoginPage`, `DashboardPage`, etc. Tests then read like English:
+
+```ts
+const signup = new SignupPage(page);
+await signup.signup(email, password);
+```
+
+> **Page Object Model (POM)** *(noun)* — a senior pattern for organising e2e tests: one class per page, methods that match user verbs. Hides selector details behind a domain API.
+
+---
+
+## Lesson 60.3 — A full-flow e2e test
 
 ```ts
 // tests/e2e/full-flow.spec.ts
 import { test, expect } from '@playwright/test';
+import { SignupPage } from './pages/SignupPage';
+import { LoginPage } from './pages/LoginPage';
+import { DashboardPage } from './pages/DashboardPage';
 
-test('signup → log → upgrade → logout → login → see habits', async ({ page }) => {
-  await page.goto('/signup');
-  await page.fill('input[name=email]', `user+${Date.now()}@example.com`);
-  await page.fill('input[name=password]', 'correct horse battery staple');
-  await page.click('button[type=submit]');
+test('signup → log habits → logout → login → see habits', async ({ page }) => {
+  const email = `user+${Date.now()}@example.com`;
+  const password = 'correct horse battery staple';
 
-  // ... rest of flow ...
+  // 1. Sign up
+  const signup = new SignupPage(page);
+  await signup.signup(email, password);
+
+  // 2. Verify email (in dev, the link goes to console; we read from the test DB instead)
+  // For e2e we set a feature flag that skips email verification in test mode.
+  // — see Lesson 60.5
+
+  // 3. Land on dashboard
+  const dashboard = new DashboardPage(page);
+  await expect(page).toHaveURL(/\/dashboard$/);
+
+  // 4. Log three habits
+  await dashboard.addHabit('Read 20 minutes');
+  await dashboard.addHabit('Walk 8000 steps');
+  await dashboard.addHabit('Drink water');
+  await expect(dashboard.habits()).toHaveCount(3);
+
+  // 5. Logout
+  await dashboard.logout();
+  await expect(page).toHaveURL(/\/$|\/login/);
+
+  // 6. Login
+  const login = new LoginPage(page);
+  await login.login(email, password);
+
+  // 7. Habits survive
+  await expect(dashboard.habits()).toHaveCount(3);
+  await expect(page.getByText('Read 20 minutes')).toBeVisible();
 });
 ```
 
 ---
 
-## Lesson 60.3 — A11y with axe
+## Lesson 60.4 — Test data and fixtures
+
+E2e tests share state if you're not careful. The senior pattern is *one fresh user per test*, and a `beforeEach` that resets the test DB:
+
+```ts
+// tests/e2e/fixtures.ts
+import { test as base } from '@playwright/test';
+import { db } from '$lib/db/client';
+import { sql } from 'drizzle-orm';
+
+export const test = base.extend({
+  page: async ({ page }, use) => {
+    // Reset before each test — only safe against the test DB
+    await db.execute(sql`TRUNCATE habits, sessions, users RESTART IDENTITY CASCADE`);
+    await use(page);
+  },
+});
+
+export { expect } from '@playwright/test';
+```
+
+Tests import `test` and `expect` from this fixture instead of `@playwright/test` directly. Every test starts from a clean slate.
+
+---
+
+## Lesson 60.5 — Testing flows that hit external services
+
+Stripe and Resend can't run in the test DB. Two senior patterns:
+
+1. **Stripe test mode** — use real Stripe APIs with `sk_test_*` keys; the `4242 4242 4242 4242` test card always succeeds.
+2. **Test-mode bypass flags** — env vars like `TEST_SKIP_EMAIL_VERIFICATION=1` that the *server* respects only in test environments. Add a check inside the signup action:
+
+```ts
+import { dev } from '$app/environment';
+const skipVerify = dev && process.env.TEST_SKIP_EMAIL_VERIFICATION === '1';
+if (skipVerify) {
+  await db.update(users).set({ emailVerifiedAt: new Date() }).where(eq(users.id, created.id));
+}
+```
+
+Wired only in `dev` builds; never on production.
+
+---
+
+## Lesson 60.6 — Accessibility tests with axe
 
 ```bash
 pnpm add -D @axe-core/playwright
 ```
 
 ```ts
+// tests/e2e/a11y.spec.ts
+import { test, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
-test('home is accessible', async ({ page }) => {
-  await page.goto('/');
-  const results = await new AxeBuilder({ page }).analyze();
-  expect(results.violations).toEqual([]);
-});
+
+const ROUTES = ['/', '/about', '/pricing', '/login', '/signup'];
+
+for (const route of ROUTES) {
+  test(`${route} has no a11y violations`, async ({ page }) => {
+    await page.goto(route);
+    const results = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa'])
+      .analyze();
+    expect(results.violations).toEqual([]);
+  });
+}
 ```
+
+Read aloud: *"For each marketing route, navigate, run axe with WCAG 2.0 A and AA tags, expect zero violations."*
+
+When axe reports a violation, it includes the *exact element* and a link to the rule. Senior debugging: open the trace, find the highlighted element, fix it.
+
+> **WCAG 2.0 A / AA / AAA** — the three conformance levels of the Web Content Accessibility Guidelines. AA is the senior bar (legally required in many jurisdictions for public-facing apps).
+
+axe is *automated* a11y testing — it catches about 30% of WCAG violations. The other 70% require keyboard testing and screen-reader testing by hand. Senior habit: **also tab through the app** at least once per release.
 
 ---
 
-## Lesson 60.4 — Visual regression
+## Lesson 60.7 — Visual regression
 
 ```ts
+// tests/e2e/visual.spec.ts
+import { test, expect } from '@playwright/test';
+
 test('home matches snapshot', async ({ page }) => {
   await page.goto('/');
-  await expect(page).toHaveScreenshot();
+  await expect(page).toHaveScreenshot('home.png', {
+    maxDiffPixelRatio: 0.01, // tolerate up to 1% pixel diff (anti-aliasing, etc.)
+    fullPage: true,
+  });
+});
+
+test('pricing matches snapshot', async ({ page }) => {
+  await page.goto('/pricing');
+  await expect(page).toHaveScreenshot('pricing.png', { maxDiffPixelRatio: 0.01, fullPage: true });
 });
 ```
 
-First run creates the baseline; subsequent runs compare.
+First run with `pnpm exec playwright test --update-snapshots` creates the baseline images. Subsequent runs compare. When a CSS change shifts the layout, the test fails *and* writes a diff image to `test-results/` you can inspect.
+
+> **visual regression** — automated detection of pixel-level layout/color changes between runs.
+
+---
+
+## Lesson 60.8 — Read this code
+
+```ts
+test('add habit', async ({ page }) => {
+  await page.goto('/dashboard');
+  await page.click('.habit-form button');
+  await page.waitForTimeout(1000);
+  expect(await page.locator('.habit').count()).toBe(1);
+});
+```
+
+Three issues. Find them.
+
+<details>
+<summary>Answer</summary>
+
+1. **`page.click('.habit-form button')` selects by class.** Brittle: rename the CSS class and the test breaks. Use **`getByRole`** (e.g. `page.getByRole('button', { name: /add/i })`).
+2. **`page.waitForTimeout(1000)` is a hardcoded sleep.** Flaky and slow. Replace with **`expect(...).toBeVisible()`** or **`expect(...).toHaveCount(1)`** — Playwright auto-retries until the assertion passes or the test times out.
+3. **Doesn't fill the input.** The test "adds a habit" by clicking add with no name. The form's validation will reject. Add `await page.getByLabel(/habit name/i).fill('Read');` before the click.
+
+The senior version:
+
+```ts
+test('add habit', async ({ page }) => {
+  await page.goto('/dashboard');
+  await page.getByLabel(/habit name/i).fill('Read');
+  await page.getByRole('button', { name: /add/i }).click();
+  await expect(page.getByText('Read')).toBeVisible();
+  await expect(page.getByRole('listitem')).toHaveCount(1);
+});
+```
+</details>
+
+---
+
+## Lesson 60.9 — Now you write it
+
+**The English sentence first:**
+
+> *"Write a Playwright test for the optimistic-delete behaviour from Chapter 43: navigate to the dashboard, add a habit, throttle the network to Slow 3G, click delete, assert the row vanishes immediately (before the network request completes)."*
+
+<details>
+<summary>Worked answer</summary>
+
+```ts
+// tests/e2e/optimistic-delete.spec.ts
+import { test, expect } from './fixtures';
+
+test('delete is optimistic on slow network', async ({ page, context }) => {
+  await page.goto('/dashboard');
+  await page.getByLabel(/habit name/i).fill('Doomed');
+  await page.getByRole('button', { name: /add/i }).click();
+  await expect(page.getByText('Doomed')).toBeVisible();
+
+  // Throttle to "Slow 3G"
+  const cdp = await context.newCDPSession(page);
+  await cdp.send('Network.enable');
+  await cdp.send('Network.emulateNetworkConditions', {
+    offline: false,
+    latency: 400,
+    downloadThroughput: (50 * 1024) / 8,
+    uploadThroughput: (50 * 1024) / 8,
+  });
+
+  // Click delete; assert the row vanishes inside 200 ms (well before the throttled network resolves)
+  const deleted = page.getByText('Doomed');
+  await page.getByRole('button', { name: /remove doomed/i }).click();
+  await expect(deleted).not.toBeVisible({ timeout: 200 });
+});
+```
+
+The 200 ms timeout is the proof: at 400 ms latency the request hasn't returned yet, but the row has already vanished. That's the optimistic update doing its job.
+</details>
+
+---
+
+## Lesson 60.10 — Recurring concepts from earlier chapters
+
+- **Optimistic UI** (Ch 43) — e2e is the runtime evidence.
+- **ARIA roles** (Ch 53) — `getByRole` is the natural query because we wired ARIA correctly.
+- **`use:enhance`** (Ch 41) — works with JS off (test it!) and feels instant with JS on (test that too!).
+
+---
+
+## Lesson 60.11 — What you can now read in the wild
+
+After Chapter 60 you can:
+
+- Read **`playwright.config.ts`** with `webServer`, `projects`, `trace`, `retries`.
+- Read **`page.getByRole(...)` / `getByLabel(...)` / `getByText(...)`** as the accessibility-aligned queries.
+- Read a **Page Object Model** test class and tell it from a brittle selector-based test.
+- Read **`AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa']).analyze()`** as the a11y check.
+- Read **`expect(page).toHaveScreenshot(...)`** as the visual-regression check.
+- Spot **`page.waitForTimeout(...)` and `.css-class` selectors** as code-review rejects.
+
+---
+
+## Glossary added in Chapter 60
+
+| Term | Definition |
+|---|---|
+| trace | Playwright's recording of every action; replayable in the Inspector. |
+| Page Object Model | One class per page; methods that match user verbs. |
+| WCAG AA | The senior accessibility bar; legally required in many jurisdictions. |
+| visual regression | Screenshot-diff test that catches layout/color changes. |
+| `getByRole` | The accessibility-aligned query; preferred over CSS selectors. |
 
 ---
 
 ## End-of-chapter checkpoint
 
-- [ ] e2e green for the full flow.
-- [ ] a11y has zero violations.
+- [ ] Full-flow e2e test passes against three browser engines (Chromium, Firefox, WebKit).
+- [ ] `tests/e2e/a11y.spec.ts` reports zero WCAG-AA violations on every marketing page.
+- [ ] Visual snapshots exist for `/`, `/about`, `/pricing`.
+- [ ] Optimistic-delete test passes under throttled network.
+- [ ] You tabbed through the entire app keyboard-only at least once.
 
 ---
 
 # Chapter 61 — CI/CD with GitHub Actions
 
-## Lesson 61.1 — The workflow
+> *Today's job:* every PR runs lint + type-check + unit + integration + e2e + build before it can merge. `main` is protected against force pushes. Failing checks block the merge button. *Visible win:* push a PR with a deliberate type error; watch CI go red; the merge button is greyed out; fix it; CI goes green; merge.
+
+CI/CD — Continuous Integration / Continuous Deployment — is the *automation layer* that catches what code review misses. The senior pattern: **every change runs every test before any human approves.**
+
+---
+
+## Lesson 61.1 — The CI workflow
 
 ```yaml
 # .github/workflows/ci.yml
@@ -1136,8 +1800,35 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  NODE_VERSION: 22
+  PNPM_VERSION: 9
+
 jobs:
-  test:
+  lint-and-type:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm exec eslint src/
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:unit
+
+  integration:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -1148,7 +1839,13 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://postgres:dev@localhost:5432/streak_test
+      DATABASE_URL: postgres://postgres:dev@localhost:5432/streak_test
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v3
@@ -1156,29 +1853,265 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm check
-      - run: pnpm test:unit
       - run: pnpm db:migrate
-        env: { DATABASE_URL: postgres://postgres:dev@localhost:5432/streak_test }
       - run: pnpm test:integration
-        env: { DATABASE_URL: postgres://postgres:dev@localhost:5432/streak_test }
-      - run: pnpm exec playwright install --with-deps
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: dev, POSTGRES_DB: streak_test }
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:dev@localhost:5432/streak_test
+      STRIPE_SECRET_KEY: sk_test_dummy
+      STRIPE_WEBHOOK_SECRET: whsec_dummy
+      RESEND_API_KEY: re_dummy
+      R2_ACCOUNT_ID: dummy
+      R2_ACCESS_KEY_ID: dummy
+      R2_SECRET_ACCESS_KEY: dummy
+      R2_BUCKET: dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:migrate
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium firefox
       - run: pnpm test:e2e
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
       - run: pnpm build
+        env:
+          DATABASE_URL: postgres://dummy
+          STRIPE_SECRET_KEY: sk_test_dummy
+          STRIPE_WEBHOOK_SECRET: whsec_dummy
+          RESEND_API_KEY: re_dummy
+          R2_ACCOUNT_ID: dummy
+          R2_ACCESS_KEY_ID: dummy
+          R2_SECRET_ACCESS_KEY: dummy
+          R2_BUCKET: dummy
 ```
+
+Five parallel jobs (`lint-and-type`, `unit`, `integration`, `e2e`, `build`); `e2e` depends on `unit` and `integration`. The Playwright report uploads as an artifact so you can download and replay the trace when something fails on CI but passes locally.
 
 ---
 
 ## Lesson 61.2 — Branch protection
 
-In GitHub: Settings → Branches → main: require all status checks; require linear history; no force push.
+In GitHub: **Settings → Branches → Branch protection rules → main**:
+
+- ✅ **Require a pull request before merging** (1 review for solo dev, 2 for teams).
+- ✅ **Require status checks to pass** — pick `lint-and-type`, `unit`, `integration`, `e2e`, `build`.
+- ✅ **Require branches to be up to date before merging.**
+- ✅ **Require linear history** (rebase or squash, no merge commits).
+- ✅ **Do not allow bypassing the above settings** (yes, even for admins).
+- ❌ **Allow force pushes**.
+- ❌ **Allow deletions**.
+
+The Bible's `--no-verify` rule is the inverse of branch protection. Branch protection prevents the *server side* from accepting a no-verify push that bypassed pre-commit hooks.
+
+---
+
+## Lesson 61.3 — Conventional commits and `release-please`
+
+```bash
+pnpm add -D @commitlint/cli @commitlint/config-conventional
+```
+
+`commitlint.config.cjs`:
+
+```js
+module.exports = { extends: ['@commitlint/config-conventional'] };
+```
+
+A pre-commit hook (via Husky) runs `commitlint` on every commit message; rejects messages that aren't `<type>(<scope>): <message>`. Examples:
+
+- `feat(billing): add streak freezes`
+- `fix(auth): rotate session on password change`
+- `refactor(money): extract Cents type`
+
+Pair with [`release-please`](https://github.com/googleapis/release-please) (a GitHub Action) — it parses your commit history and opens a PR every time `main` advances, with a generated CHANGELOG and a version bump.
+
+> **Conventional Commits** — a commit-message format that machines can parse for changelog generation. `<type>(<scope>): <description>`.
+>
+> **`release-please`** — a tool that turns conventional commits into auto-generated CHANGELOGs and version bumps.
+
+---
+
+## Lesson 61.4 — Vercel preview deployments
+
+Connect your GitHub repo to Vercel (Lesson 62.2). Vercel automatically deploys every PR to a preview URL like `streak-pr-123.vercel.app`. Senior pattern:
+
+1. Set every required env var in Vercel under **Preview** environment.
+2. Configure a separate **Preview** Postgres DB (e.g. a Neon branch per PR).
+3. Run e2e tests against the preview URL via `TEST_BASE_URL`.
+
+The preview-deploy workflow:
+
+```yaml
+# .github/workflows/preview-e2e.yml
+name: Preview e2e
+on:
+  deployment_status:
+
+jobs:
+  e2e-preview:
+    if: github.event.deployment_status.state == 'success' && github.event.deployment.environment == 'Preview'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+        env:
+          TEST_BASE_URL: ${{ github.event.deployment_status.target_url }}
+```
+
+---
+
+## Lesson 61.5 — Caching `pnpm`, Playwright, build artifacts
+
+`pnpm/action-setup` + `actions/setup-node` with `cache: pnpm` already caches `~/.pnpm-store` between runs. For Playwright browsers, add:
+
+```yaml
+- name: Cache Playwright browsers
+  uses: actions/cache@v4
+  with:
+    path: ~/.cache/ms-playwright
+    key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+- run: pnpm exec playwright install --with-deps chromium firefox
+```
+
+Saves ~2 minutes per CI run.
+
+---
+
+## Lesson 61.6 — The "no `--no-verify`" rule, applied
+
+Every senior team has it as policy: **`git commit --no-verify` and `git push --no-verify` are banned for production code.** Bible rule echo: skipping hooks is bypassing the very tests CI exists to enforce. The hook rejects bad commits *before* CI; bypassing it just makes CI find them later. Don't.
+
+If a hook fails, **fix the underlying issue, then commit again.** Never `--no-verify` to "ship the urgent thing"; the urgent thing is rarely as urgent as the broken thing you'll ship.
+
+---
+
+## Lesson 61.7 — Read this code
+
+```yaml
+- run: pnpm test:e2e
+  continue-on-error: true
+```
+
+Why's this dangerous?
+
+<details>
+<summary>Answer</summary>
+
+`continue-on-error: true` means *"if this fails, the job still passes."* Now your e2e suite can be entirely broken and the merge button stays green. Bible rule violation: *"compilation and tests are necessary, not sufficient — demand runtime evidence."* Removing the gate inverts the contract.
+
+The right pattern: if a test is genuinely flaky and you can't fix it today, mark *that test* as `.skip` with a TODO, not the entire job as continue-on-error.
+</details>
+
+---
+
+## Lesson 61.8 — Now you write it
+
+**The English sentence first:**
+
+> *"Add a job to the workflow that runs `pnpm security:headers` against the preview deploy. It should fail the PR if any required header is missing."*
+
+<details>
+<summary>Worked answer (sketch)</summary>
+
+```yaml
+security-headers:
+  runs-on: ubuntu-latest
+  needs: [build]
+  if: github.event_name == 'pull_request'
+  steps:
+    - uses: actions/checkout@v4
+    - uses: pnpm/action-setup@v3
+      with: { version: 9 }
+    - uses: actions/setup-node@v4
+      with: { node-version: 22, cache: pnpm }
+    - run: pnpm install --frozen-lockfile
+    # Wait for the Vercel preview deploy via a polling action, then:
+    - run: pnpm security:headers
+      env:
+        TEST_BASE_URL: ${{ steps.vercel-url.outputs.url }}
+```
+
+Add `security-headers` to the required status checks for `main`. Now a PR can't merge if security headers regress.
+</details>
+
+---
+
+## Lesson 61.9 — Recurring concepts from earlier chapters
+
+- **`pnpm install --frozen-lockfile`** — Bible rule #1 enforced in CI.
+- **Boot validator** (Ch 57) — every CI job exports the env vars the validator demands.
+- **`security:headers` test** (Ch 48) — wired into CI here.
+- **The "no skipping hooks" rule** — Bible foundation, applied at the merge gate.
+
+---
+
+## Lesson 61.10 — What you can now read in the wild
+
+After Chapter 61 you can:
+
+- Read **`.github/workflows/*.yml`** with parallel jobs, services, secrets, artifacts.
+- Read **branch-protection settings** and tell strict from permissive.
+- Read **conventional-commit messages** and `release-please` outputs.
+- Spot **`continue-on-error: true`** as a CI bypass.
+- Spot **missing test caching** as a CI-runtime regression.
+
+---
+
+## Glossary added in Chapter 61
+
+| Term | Definition |
+|---|---|
+| GitHub Actions | GitHub's CI/CD runner. |
+| services (in CI) | Sidecar containers (e.g. Postgres) the job uses. |
+| branch protection | Server-side rules preventing force-push and bypassing checks. |
+| Conventional Commits | `<type>(<scope>): <message>` format. |
+| `release-please` | Tool that auto-generates CHANGELOGs from conventional commits. |
+| preview deploy | Per-PR auto-deployed URL for testing the change in production-shape infra. |
 
 ---
 
 ## End-of-chapter checkpoint
 
-- [ ] PRs run CI.
-- [ ] `main` is protected.
+- [ ] PRs trigger CI; failing checks block merge.
+- [ ] `main` is protected (required checks, no force-push, linear history).
+- [ ] Playwright report uploads as artifact when e2e fails.
+- [ ] Conventional commits enforced via commitlint.
+- [ ] Preview deploy URL hits the same e2e suite.
 
 ---
 
