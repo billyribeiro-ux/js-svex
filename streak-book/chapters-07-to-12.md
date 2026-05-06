@@ -40,7 +40,7 @@ Now we have to fix everything that referenced `habitsLoggedToday`. The count is 
 <!-- src/routes/+page.svelte -->
 <script lang="ts">
   let habits: string[] = $state(['Drink water', 'Read 20 minutes', 'Walk 8000 steps']);
-  let userName: string | null = $state(null);
+  let userName = $state('');
 
   const days: string[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
@@ -53,7 +53,7 @@ Now we have to fix everything that referenced `habitsLoggedToday`. The count is 
   const todayIndex: number = getMondayBasedDayIndex();
 </script>
 
-<h1>Welcome back, {userName ?? 'friend'}.</h1>
+<h1>Welcome back, {userName.trim() === '' ? 'friend' : userName}.</h1>
 
 <label>
   Your name
@@ -99,7 +99,7 @@ Now we have to fix everything that referenced `habitsLoggedToday`. The count is 
 </style>
 ```
 
-Save. You'll see three habits listed.
+Save (`Cmd+S` / `Ctrl+S`). You'll see three habits listed.
 
 I removed the *Log a habit*, *Undo*, *Reset* buttons in this chapter — they don't fit the new model, and we're going to put back something better in Chapter 8 (a real *add* and *delete*). Don't worry; we're not losing functionality, we're upgrading it.
 
@@ -215,7 +215,44 @@ What does the page show?
 
 > *"Add a fourth and a fifth habit to the initial list — your two real habits. Watch the count and the list both update on hot reload, with no extra work."*
 
-That's it. One-line edit in the script. The point is to *feel* hot reload do its thing, and to confirm the markup re-renders correctly with a different list.
+One-line edit in the script. The point is to *feel* hot reload re-render and confirm the markup adapts to a different list.
+
+<details>
+<summary>Worked answer</summary>
+
+```ts
+let habits: string[] = $state([
+  'Drink water',
+  'Read 20 minutes',
+  'Walk 8000 steps',
+  'Stretch',           // your two
+  'Journal one line',
+]);
+```
+
+Save. The header now says *"You're tracking 5 habits"* and the list has five items. Watch the `5` text update letter-by-letter when you change the count via `{habits.length}`. That's `$state` + reactivity doing its job.
+</details>
+
+---
+
+## Lesson 7.6 — Recurring concepts from earlier chapters
+
+- **`$state(...)`** (Ch 1) — `habits` is reactive, so the count and list both update.
+- **`{#if ... }{:else}{/if}`** (Ch 6) — empty-state branch.
+- **`{#each ... as ... }`** (Ch 5) — rendering the list.
+- **Plural-aware text** (Ch 1) — `habits.length === 1 ? 'habit' : 'habits'`.
+- **`type="button"`, scoped `<style>`, the `userName` greeting** — all still working.
+
+---
+
+## Lesson 7.7 — What you can now read in the wild
+
+After Chapter 7 you can:
+
+- Read **`let xs: T[] = $state([...])`** as a typed reactive array.
+- Read **`xs.length`**, **`xs[i]`** (and know it's `T | undefined` in strict mode).
+- Read **`xs.at(i)`** — safe alternative to indexing.
+- Spot when a snippet is using a *keyed* `{#each}` vs an unkeyed one and explain why.
 
 ---
 
@@ -322,7 +359,7 @@ Update `+page.svelte`. The script gains a `newHabit` field, an `addHabit` functi
 <script lang="ts">
   let habits: string[] = $state(['Drink water', 'Read 20 minutes', 'Walk 8000 steps']);
   let newHabit: string = $state('');
-  let userName: string | null = $state(null);
+  let userName = $state('');
 
   const days: string[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
@@ -354,7 +391,7 @@ Update `+page.svelte`. The script gains a `newHabit` field, an `addHabit` functi
   }
 </script>
 
-<h1>Welcome back, {userName ?? 'friend'}.</h1>
+<h1>Welcome back, {userName.trim() === '' ? 'friend' : userName}.</h1>
 
 <label>
   Your name
@@ -411,7 +448,7 @@ Update `+page.svelte`. The script gains a `newHabit` field, an `addHabit` functi
 </style>
 ```
 
-Save. Type a habit, hit Enter (or click *Add*); it appears. Click the × on any row; it disappears.
+Save (`Cmd+S` / `Ctrl+S`). Type a habit, hit Enter (or click *Add*); it appears. Click the × on any row; it disappears.
 
 ---
 
@@ -472,6 +509,29 @@ function clearAllHabits(): void {
 
 We wrap the button in `{#if habits.length > 0}` so it doesn't render at all when there's nothing to clear (instead of using `disabled`). Either is reasonable; `{#if}` is cleaner for "the action is meaningless right now, don't even show it."
 </details>
+
+---
+
+## Lesson 8.8 — Recurring concepts from earlier chapters
+
+- **Guard clause** (Ch 2) — `if (trimmed === '') return;` in `addHabit`.
+- **`.trim()`** (Ch 4) — same trick we used for `userName`.
+- **`array.filter`** (Ch 7 preview) — formal use here.
+- **`disabled={cond}`** (Ch 3) — *Add* button greys when the input is empty.
+- **Defence in depth** (Ch 6) — UI guard *and* function guard, working together.
+- **`type="button"`** (Ch 1) — every new button has it.
+
+---
+
+## Lesson 8.9 — What you can now read in the wild
+
+After Chapter 8 you can:
+
+- Read **`xs = [...xs, item]`** as the immutable append.
+- Read **`xs = xs.filter((x) => x !== target)`** as the immutable remove.
+- Read **`<form onsubmit={handler}>`** with `event.preventDefault()` and explain the page-reload prevention.
+- Read **`onclick={() => fn(arg)}`** as a parameterised handler.
+- Read **`aria-label="..."`** as accessible text for icon-only buttons.
 
 ---
 
@@ -579,7 +639,7 @@ function makeHabit(name: string): Habit {
 
 `crypto.randomUUID()` and `Date.now()` are about to become regulars.
 
-> **`crypto.randomUUID()`** — a built-in function that returns a unique 36-character string like `'a3b1...'`. Globally unique enough for practical purposes; perfect for IDs.
+> **`crypto.randomUUID()`** — a built-in function that returns a unique 36-character string like `'a3b1...'`. Globally unique enough for practical purposes; perfect for IDs. Available in modern browsers and in Node 19+. Requires a *secure context* — works on `localhost` and on any `https://` site, but fails on plain `http://` outside localhost. We won't deploy outside HTTPS, so this is fine.
 >
 > **`Date.now()`** — milliseconds since the Unix epoch (Jan 1, 1970 UTC). A `number`.
 
@@ -660,7 +720,7 @@ Update `src/routes/+page.svelte`:
     makeHabit('Walk 8000 steps'),
   ]);
   let newHabit: string = $state('');
-  let userName: string | null = $state(null);
+  let userName = $state('');
 
   // ... days, getMondayBasedDayIndex, todayIndex unchanged ...
 
@@ -697,7 +757,7 @@ Update `src/routes/+page.svelte`:
 </ul>
 ```
 
-Save. Add a new habit. Notice it shows *"just now"*. Add the same name twice — both rows survive deletion of the other, because they have different IDs.
+Save (`Cmd+S` / `Ctrl+S`). Add a new habit. Notice it shows *"just now"*. Add the same name twice — both rows survive deletion of the other, because they have different IDs.
 
 The `(habit.id)` in `{#each habits as habit (habit.id)}` is the **keyed each** Chapter 7 previewed. Now it has a real key.
 
@@ -822,6 +882,30 @@ The `description: trimmedDesc === '' ? undefined : trimmedDesc` line is a small 
 
 ---
 
+## Lesson 9.7 — Recurring concepts from earlier chapters
+
+- **Guard clauses** (Ch 2) — `formatRelativeTime` is one big chain of them.
+- **Plural-aware text** (Ch 1) — *"1 minute ago"* vs *"2 minutes ago"*.
+- **`{#if cond}...{/if}`** (Ch 6) — render description when present.
+- **Spread + filter** (Ch 8) — still how we add and remove habits.
+- **`type="button"` + `aria-label`** (Ch 1, 8) — every new button has them.
+- **The "input model vs data model"** rule (Ch 4) — `description` is `string` in the input, `string | undefined` in the data.
+
+---
+
+## Lesson 9.8 — What you can now read in the wild
+
+After Chapter 9 you can:
+
+- Read **`type X = { ... }`** declarations and explain each field.
+- Read **`field?: T`** as optional.
+- Read **`crypto.randomUUID()`** and **`Date.now()`** as ID and timestamp generators.
+- Read **`obj.field`** vs **`obj['field']`** — and know when each is used.
+- Read **`import { fn } from '$lib/...'`** as a path-stable internal import.
+- Read a small helper function with multiple early-return guards and explain its branches.
+
+---
+
 ## Glossary added in Chapter 9
 
 | Term | Definition |
@@ -832,10 +916,11 @@ The `description: trimmedDesc === '' ? undefined : trimmedDesc` line is a small 
 | `type` | TypeScript keyword for a named type. |
 | `interface` | Similar to `type`; we prefer `type`. |
 | optional property `?` | A property that may or may not be present. |
-| `crypto.randomUUID()` | Generates a unique-enough string ID. |
+| `crypto.randomUUID()` | Generates a unique-enough string ID (secure context). |
 | `Date.now()` | Milliseconds since 1970 UTC. |
 | `Math.floor` | Round down to integer. |
 | `$lib` | Import alias for `src/lib/`. |
+| secure context | A page served over HTTPS or `localhost`. Required for `crypto.randomUUID()`. |
 
 ---
 
@@ -1010,38 +1095,53 @@ Version 2, almost always. The call site is self-documenting. Reading the positio
 
 **The English sentence first:**
 
-> *"Refactor the `removeHabit` function to take a `Habit` and destructure its `id`, instead of taking a bare `id` string. The call site changes too: `removeHabit(habit)` instead of `removeHabit(habit.id)`."*
+> *"Refactor `summariseHabit({ name, createdAt }: Habit): string` (from Lesson 10.3) to also accept the optional `description` and include it when present, like 'Read 20 minutes — Take time for a real book (added 5 minutes ago)'."*
+
+You'll need to destructure with a default and use a ternary inside a template literal.
 
 <details>
 <summary>Worked answer</summary>
 
 ```ts
-function removeHabit({ id }: Habit): void {
-  habits = habits.filter((h) => h.id !== id);
+function summariseHabit({ name, description, createdAt }: Habit): string {
+  const descPart: string = description !== undefined ? ` — ${description}` : '';
+  return `${name}${descPart} (added ${formatRelativeTime(createdAt)})`;
 }
 ```
 
-```svelte
-<button type="button" onclick={() => removeHabit(habit)} aria-label="Remove {habit.name}">×</button>
+Or with a destructure default (slightly less readable but valid):
+
+```ts
+function summariseHabit({ name, description = '', createdAt }: Habit): string {
+  const descPart: string = description !== '' ? ` — ${description}` : '';
+  return `${name}${descPart} (added ${formatRelativeTime(createdAt)})`;
+}
 ```
 
-Wait — but in the `{#each ... as { id, name, description, createdAt }}` block, we destructured the habit into local variables. So `habit` no longer exists in that scope. We need to either (a) keep the original `as habit (habit.id)` form and destructure inside, or (b) have both:
+Either works. The first version is clearer about *"description is optional"*; the second uses destructuring's default-value feature.
 
-```svelte
-{#each habits as habit (habit.id)}
-  <li>
-    <div>
-      <strong>{habit.name}</strong>
-      {#if habit.description}<p class="habit-desc">{habit.description}</p>{/if}
-      <small>{formatRelativeTime(habit.createdAt)}</small>
-    </div>
-    <button type="button" onclick={() => removeHabit(habit)} aria-label="Remove {habit.name}">×</button>
-  </li>
-{/each}
-```
-
-Senior habit: pick *one* idiom per scope. Don't mix destructured and non-destructured access in the same block. Either go full destructure or not at all.
+Senior habit: when destructuring optional fields, decide whether `undefined` is meaningfully different from the default. If yes (rare): keep `?`, no destructure default. If no: use a destructure default.
 </details>
+
+---
+
+## Lesson 10.6 — Recurring concepts from earlier chapters
+
+- **Object types** (Ch 9) — destructuring is a way to read those types.
+- **Optional properties `?`** (Ch 9) — destructure defaults handle them.
+- **Senior habit: "more than three params? take an options object"** — formalised here.
+
+---
+
+## Lesson 10.7 — What you can now read in the wild
+
+After Chapter 10 you can:
+
+- Read **`const { x, y, z } = obj`** as multi-property extraction.
+- Read **`const { x: localName } = obj`** as renaming.
+- Read **`const { x = default } = obj`** as fallback.
+- Read **`const { x, ...rest } = obj`** as splitting one out.
+- Read **`function f({ x, y }: { x: T; y: U })`** — the standard senior shape.
 
 ---
 
@@ -1171,9 +1271,11 @@ And in markup, replace the `{#each}` loop's source:
 
 Read aloud: *"filter habits to those whose name (lowercase) contains the query (lowercase)."*
 
-Save. Type *"read"* — only the *Read 20 minutes* habit appears. Clear the search — all habits return.
+Save (`Cmd+S` / `Ctrl+S`). Type *"read"* — only the *Read 20 minutes* habit appears. Clear the search — all habits return.
 
 > **`.toLowerCase()`** — string method returning a lowercase copy. We compare both sides lowercase so search is case-insensitive — a senior UX habit.
+>
+> **`<input type="search">`** — an input meant for search queries. Browsers render an X-to-clear button and apply slightly different styling. Behaves the same as `type="text"` for binding.
 
 This inline filter expression in `{#each}` is fine for now; in Chapter 16 we'll move it to a `$derived` so it's named and testable.
 
@@ -1245,6 +1347,29 @@ In markup:
 
 ---
 
+## Lesson 11.9 — Recurring concepts from earlier chapters
+
+- **`bind:value`** (Ch 8) — used on the search input.
+- **Predicate functions** (Ch 8 preview) — `filter`, `find`, `some`, `every` all take them.
+- **`{#if cond}...{/if}`** (Ch 6) — wrapping the "Showing X of Y" indicator.
+- **`.trim() === ''`** (Ch 4) — checking the search query is non-empty.
+- **`Habit` type** (Ch 9) — `habits.filter(...)` returns `Habit[]`, fully typed.
+
+---
+
+## Lesson 11.10 — What you can now read in the wild
+
+After Chapter 11 you can:
+
+- Read **`xs.map((x) => fn(x))`** — transform.
+- Read **`xs.filter((x) => pred(x))`** — keep matching.
+- Read **`xs.find((x) => pred(x))`** — first match or undefined; remember to narrow.
+- Read **`xs.some(pred)`** / **`xs.every(pred)`** — boolean reductions.
+- Read **`xs.filter(...).map(...)`** chains and trace data flow.
+- Read **`{@const x = expr}`** as a local constant in markup.
+
+---
+
 ## Glossary added in Chapter 11
 
 | Term | Definition |
@@ -1259,6 +1384,7 @@ In markup:
 | `.toLowerCase()` | Lowercase copy of a string. |
 | `%` | Modulo (remainder) operator. |
 | `{@const}` | Svelte's local constant in markup. |
+| `<input type="search">` | Search-styled text input with built-in clear button. |
 
 ---
 
@@ -1314,7 +1440,7 @@ svelte-check found 0 errors and 0 warnings
 
 If you see warnings, read them. Fix them. The "no warnings" state is the senior baseline — we don't ship code with type warnings, ever.
 
-If `pnpm check` isn't a script in your `package.json`, add it:
+(The `sv` scaffolder ships the `check` script in `package.json` already. If for some reason yours doesn't, add it manually:
 
 ```json
 {
@@ -1323,6 +1449,7 @@ If `pnpm check` isn't a script in your `package.json`, add it:
   }
 }
 ```
+)
 
 ---
 
@@ -1377,6 +1504,32 @@ If you're confident, you've completed Part II. Streak is now: a list of typed ha
 > *"Look at every variable in `+page.svelte`. Convert to `const` everywhere `let` isn't strictly required. Run `pnpm check`. Commit the cleanup."*
 
 (We don't formally introduce git/commits until Chapter 61, but if you already use git, this is a fine first commit.)
+
+---
+
+## Lesson 12.6 — Recurring concepts from earlier chapters
+
+Part II's spine, in one place:
+
+- **`$state`** (Ch 1) — only for values that genuinely change.
+- **Type annotations** (Ch 4, 9) — `string[]`, `Habit[]`, custom types.
+- **Immutable updates** (Ch 8) — spread for add, filter for remove.
+- **Helper functions in `$lib/`** (Ch 9) — `formatRelativeTime` is a textbook example.
+- **The `const` rule** — formalised here.
+
+---
+
+## Lesson 12.7 — What you can now read in the wild
+
+After Part II you can:
+
+- Read any modern Svelte 5 component that uses one or two `$state` arrays of typed records and explain it line by line.
+- Spot when a `let` should be a `const`.
+- Spot when an immutable update is needed vs an in-place mutation.
+- Recognise the *helper-in-`$lib/`* pattern and its testability benefit.
+- Read most TypeScript object-shape declarations and explain optional vs required fields.
+
+You're ready to break the page into components.
 
 ---
 
