@@ -100,7 +100,7 @@ export const actions: Actions = {
     if (session.url === null) {
       throw new Error('Stripe Checkout did not return a redirect URL');
     }
-    redirect(303, session.url);
+    throw redirect(303, session.url);
   },
 };
 ```
@@ -195,14 +195,14 @@ function periodEndOf(sub: Stripe.Subscription): Date {
 
 export const POST: RequestHandler = async ({ request }) => {
   const sig = request.headers.get('stripe-signature');
-  if (sig === null) error(400, 'No signature');
+  if (sig === null) throw error(400, 'No signature');
 
   const raw = await request.text();
   let event: Stripe.Event;
   try {
     event = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET);
   } catch {
-    error(400, 'Invalid signature');
+    throw error(400, 'Invalid signature');
   }
 
   // dedupe

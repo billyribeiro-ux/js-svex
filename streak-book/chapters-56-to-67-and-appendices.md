@@ -1462,7 +1462,7 @@ Read aloud:
 | Field | Read aloud as |
 |---|---|
 | `fullyParallel: true` | *"Run tests in parallel by default."* |
-| `retries: process.env.CI ? 2 : 0` | *"Retry twice on CI, never locally."* — masks transient flakiness in CI without hiding it locally. |
+| `retries: 0` | *"Never retry."* — every test is deterministic; flakes get fixed, not retried. |
 | `trace: 'on-first-retry'` | *"On first retry, save a full trace I can replay in the Playwright Inspector."* |
 | `webServer` | *"Boot `pnpm preview` automatically; in CI, hit the real preview URL instead."* |
 | `projects: [chromium, firefox, webkit]` | *"Run every test against Chrome, Firefox, and Safari engines."* |
@@ -3073,7 +3073,7 @@ import { json } from '@sveltejs/kit';
 import * as v from 'valibot';
 import { db } from '$lib/db/client';
 import { habits } from '$lib/db/schema';
-import { eq, desc, lt, and } from 'drizzle-orm';
+import { and, eq, desc, sql } from 'drizzle-orm';
 import { findUserByPat } from '$lib/pat';
 import { problem } from '$lib/api/errors';
 import { addHabitForUser } from '$lib/habits-server';
@@ -3174,11 +3174,13 @@ Three senior touches in the cursor logic:
 2. **Scope check on the PAT** — `'habits:read'` for GET, `'habits:write'` for POST. Without this, every PAT is admin.
 3. **`isNull(expiresAt) OR expiresAt > now`** in `findUserByPat` — expired tokens are rejected, not just lurking in the table.
 
-Add `or` and `isNull` to your Drizzle imports:
+For `findUserByPat` (which uses `or` and `isNull` for the expiry check), the imports look like:
 
 ```ts
-import { and, eq, gt, lt, desc, isNull, or, sql } from 'drizzle-orm';
+import { and, eq, gt, isNull, or } from 'drizzle-orm';
 ```
+
+Together, the two files (`+server.ts` for the API and `pat.ts` for the auth helper) have everything they need. No mid-snippet import surprises.
 
 Read aloud:
 

@@ -693,7 +693,8 @@ Six new things in two lines. Let's name them.
 
 A few rules we'll keep for the entire book:
 
-- **Always use the braces, even for one-line bodies.** Some languages (and some old JavaScript style guides) let you write `if (x > 0) doThing();` with no braces. We don't. The braces make adding a second line later impossible to get wrong.
+- **Use braces for any `if` whose body has more than one statement, ever.** Some languages let you write `if (x > 0) doThing(); doOtherThing();` with the second line silently *not* part of the `if`. We never write that ambiguous form.
+- **For pure guard-clause `return` / `throw` / `break`, single-line is acceptable.** `if (trimmed === '') return;` is idiomatic and used throughout this book's helper functions. The rule of thumb: single-line is fine *only* when the body is one short statement that exits the function (or breaks the loop). Anything with state mutation, side effects, or multiple statements gets braces.
 - **The condition has parentheses.** Always. This isn't optional.
 - **The opening brace is on the same line as `if`.** This is just a convention; consistency matters more than which side you pick. We pick same-line.
 

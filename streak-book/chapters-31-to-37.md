@@ -243,35 +243,19 @@ export const load: PageLoad = async ({ parent }) => {
 
 The senior pattern for per-user/per-request stores: `setContext`/`getContext` in the layout. This *replaces* the per-page `const store = new HabitStore()` we wrote in Chapter 31.
 
-```svelte
-<!-- +layout.svelte -->
-<script lang="ts">
-  import { setContext } from 'svelte';
-  import { HabitStore } from '$lib/habits.svelte';
-
-  const store = new HabitStore();
-  setContext('habit-store', store);
-</script>
-```
-
-```svelte
-<!-- any descendant page (e.g. +page.svelte) -->
-<script lang="ts">
-  import { getContext } from 'svelte';
-  import type { HabitStore } from '$lib/habits.svelte';
-
-  const store = getContext('habit-store') as HabitStore;
-</script>
-```
-
-Each user navigating their own browser tab has their own component tree, hence their own `HabitStore`. No SSR-singleton landmine.
-
 > **`setContext(key, value)` / `getContext(key)`** — Svelte primitives for sharing values down a component tree without prop-drilling. The key can be a string or (preferred for big apps) a `Symbol`.
 
-A small typing note: `getContext` is typed `<T>(key) => T`, but it doesn't actually verify the key was set with that type. The `as HabitStore` cast above is a *trust* — if the consumer's key doesn't match what was set, you get a runtime undefined. For type safety in a real app, wrap context calls in a typed helper:
+The naive shape uses a string key with an `as` cast at the consumer:
 
 ```ts
-// src/lib/contexts.ts
+// ❌ The naive shape — Bible rule #3 violation (`as` lies to the type system).
+const store = getContext('habit-store') as HabitStore;
+```
+
+If the consumer's key doesn't match what was set, you get `undefined` at runtime that the type system doesn't catch. Don't write this. Wrap with a typed helper instead:
+
+```ts
+// ✅ src/lib/contexts.ts
 import { setContext, getContext } from 'svelte';
 import type { HabitStore } from '$lib/habits.svelte';
 
@@ -280,14 +264,36 @@ const HABIT_STORE_KEY = Symbol('habit-store');
 export function setHabitStore(store: HabitStore): void {
   setContext(HABIT_STORE_KEY, store);
 }
+
 export function getHabitStore(): HabitStore {
   const store = getContext<HabitStore | undefined>(HABIT_STORE_KEY);
-  if (store === undefined) throw new Error('HabitStore not in context');
+  if (store === undefined) throw new Error('HabitStore not in context — did you call setHabitStore?');
   return store;
 }
 ```
 
-Use `setHabitStore(store)` in the layout, `const store = getHabitStore()` in pages. The `Symbol` makes the key globally unique; the wrapper enforces presence.
+Then use the helpers, never the raw primitives:
+
+```svelte
+<!-- +layout.svelte -->
+<script lang="ts">
+  import { HabitStore } from '$lib/habits.svelte';
+  import { setHabitStore } from '$lib/contexts';
+
+  const store = new HabitStore();
+  setHabitStore(store);
+</script>
+```
+
+```svelte
+<!-- any descendant page (e.g. +page.svelte) -->
+<script lang="ts">
+  import { getHabitStore } from '$lib/contexts';
+  const store = getHabitStore();
+</script>
+```
+
+Each user navigating their own browser tab has their own component tree, hence their own `HabitStore`. The `Symbol` makes the key globally unique; the wrapper enforces presence at the type level. No `as` cast anywhere. No SSR-singleton landmine.
 
 ---
 

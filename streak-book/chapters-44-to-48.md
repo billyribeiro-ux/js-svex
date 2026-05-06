@@ -129,7 +129,7 @@ export const actions: Actions = {
       maxAge: 60 * 60 * 24 * 30,
     });
 
-    redirect(303, '/dashboard');
+    throw redirect(303, '/dashboard');
   },
 };
 ```
@@ -302,8 +302,9 @@ export const actions: Actions = {
       ))
       .returning({ userId: passwordResets.userId });
 
-    if (consumed.length === 0) throw error(400, 'Reset link is invalid or has expired.');
-    const userId = consumed[0]!.userId;
+    const [first] = consumed;
+    if (first === undefined) throw error(400, 'Reset link is invalid or has expired.');
+    const userId = first.userId;
 
     // Update the password and revoke all the user's existing sessions atomically.
     await db.transaction(async (tx) => {
@@ -420,7 +421,7 @@ import type { RequestEvent } from '@sveltejs/kit';
 
 export function requireUser(event: RequestEvent): NonNullable<App.Locals['user']> {
   if (!event.locals.user) {
-    redirect(303, `/login?next=${encodeURIComponent(event.url.pathname)}`);
+    throw redirect(303, `/login?next=${encodeURIComponent(event.url.pathname)}`);
   }
   return event.locals.user;
 }
@@ -428,7 +429,7 @@ export function requireUser(event: RequestEvent): NonNullable<App.Locals['user']
 export function requireRole(event: RequestEvent, role: 'admin'): NonNullable<App.Locals['user']> {
   const user = requireUser(event);
   if (user.role !== role) {
-    redirect(303, '/');
+    throw redirect(303, '/');
   }
   return user;
 }
@@ -463,7 +464,7 @@ export const POST: RequestHandler = async ({ cookies }) => {
   const token = cookies.get('session');
   if (token) await revokeSession(token);
   cookies.delete('session', { path: '/' });
-  redirect(303, '/');
+  throw redirect(303, '/');
 };
 ```
 
@@ -533,23 +534,55 @@ A hash takes ~100–300 ms — that blocks the Node event loop on the request th
 import { parentPort } from 'node:worker_threads';
 import { hash, verify } from '@node-rs/argon2';
 
+if (parentPort === null) {
+  throw new Error('worker.ts must be loaded in a worker thread');
+}
+const port = parentPort; // narrowed to MessagePort
+
 const params = { memoryCost: 19456, timeCost: 2, parallelism: 1 };
 
-parentPort!.on('message', async (msg: { id: string; op: 'hash' | 'verify'; data: string | { plain: string; hash: string } }) => {
+type HashMsg = { id: string; op: 'hash'; data: string };
+type VerifyMsg = { id: string; op: 'verify'; data: { plain: string; hash: string } };
+type IncomingMsg = HashMsg | VerifyMsg;
+
+function isIncomingMsg(value: unknown): value is IncomingMsg {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.id !== 'string') return false;
+  if (v.op === 'hash') return typeof v.data === 'string';
+  if (v.op === 'verify') {
+    return typeof v.data === 'object' && v.data !== null
+      && typeof (v.data as Record<string, unknown>).plain === 'string'
+      && typeof (v.data as Record<string, unknown>).hash === 'string';
+  }
+  return false;
+}
+
+port.on('message', async (raw: unknown) => {
+  if (!isIncomingMsg(raw)) {
+    // Don't crash the worker on malformed messages; just respond with an error.
+    return;
+  }
+  const msg = raw;
   try {
     let result: string | boolean;
     if (msg.op === 'hash') {
-      result = await hash(msg.data as string, params);
+      result = await hash(msg.data, params);
     } else {
-      const { plain, hash: existing } = msg.data as { plain: string; hash: string };
-      result = await verify(existing, plain, params);
+      result = await verify(msg.data.hash, msg.data.plain, params);
     }
-    parentPort!.postMessage({ id: msg.id, ok: true, result });
+    port.postMessage({ id: msg.id, ok: true, result });
   } catch (err) {
-    parentPort!.postMessage({ id: msg.id, ok: false, error: String(err) });
+    port.postMessage({ id: msg.id, ok: false, error: String(err) });
   }
 });
 ```
+
+Three senior touches over the naive form:
+
+1. **`if (parentPort === null) throw` then `const port = parentPort`** narrows for the rest of the file. No `!` needed (Bible rule #3).
+2. **Discriminated-union typing of incoming messages** with a real `is`-predicate (Ch 26's boundary-parser idiom). No `as` casts inside the branches.
+3. **`raw: unknown`** is the *real* type of a worker message — Node's typings used to default it to `any`, which silently allows bugs. Treat the boundary as untrusted.
 
 ```ts
 // src/lib/passwords/index.ts

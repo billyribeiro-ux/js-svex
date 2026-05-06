@@ -906,8 +906,11 @@ After Chapter 27 you can:
 
 ## Lesson 28.1 — Class basics
 
+A reactive class with `$state` fields *only compiles inside a `.svelte.ts` file*. The Svelte compiler treats that extension as runes-aware; in a plain `.ts` file, `$state` is undefined. Put this file at `src/lib/counter.svelte.ts`:
+
 ```ts
-class Counter {
+// src/lib/counter.svelte.ts
+export class Counter {
   value = $state(0);
 
   increment(): void {
@@ -918,9 +921,19 @@ class Counter {
     this.value = 0;
   }
 }
+```
 
-const c = new Counter();
-c.increment(); // c.value is 1
+In any `.svelte` file:
+
+```svelte
+<script lang="ts">
+  import { Counter } from '$lib/counter.svelte';
+  const c = new Counter();
+  c.increment(); // c.value is 1
+</script>
+
+<p>{c.value}</p>
+<button type="button" onclick={() => c.increment()}>+</button>
 ```
 
 `$state` fields on classes are reactive — reading them in markup tracks them. Senior pattern: *a class with `$state` fields is a reactive store you can pass around.*
@@ -1204,15 +1217,30 @@ For percentages we use *basis points* — 100 bps = 1%, 10000 bps = 100%. Intege
 
 ```ts
 export function applyBps(amount: Cents, bps: number): Cents {
-  const result = Math.round((amount as number) * bps / 10000);
-  return result as Cents;
+  // Cents extends number — arithmetic works without an `as number` cast.
+  // Math.round forces an integer; cents(...) re-validates and re-brands.
+  const result = Math.round((amount * bps) / 10000);
+  return cents(result);
 }
 
 // 8% tax on $12.99
 const tax = applyBps(cents(1299), 800); // 104 cents = $1.04
 ```
 
-The *intermediate* `(amount * bps)` could overflow `Number.MAX_SAFE_INTEGER` for huge values; we'll use `BigInt` if Streak ever bills enterprise customers. For consumer pricing, plain numbers are fine.
+Two senior choices in `applyBps`:
+
+1. **`cents(result)` round-trips through the validator** — if a future bug causes `result` to be non-integer, we throw at the boundary, not silently propagate a corrupt `Cents`.
+2. **No `as number` casts on `amount * bps`** — `Cents` *is* a `number` at runtime, so arithmetic compiles. The brand is type-only.
+
+The intermediate `amount * bps` can overflow `Number.MAX_SAFE_INTEGER` (~9.0×10¹⁵) at extreme values. For consumer pricing (max ~$1B in cents = 10¹¹), this is safe. For enterprise tiers we'd promote to `BigInt`:
+
+```ts
+export function applyBpsBig(amount: Cents, bps: number): Cents {
+  const product = BigInt(amount) * BigInt(bps);
+  const rounded = (product + 5_000n) / 10_000n; // banker-style round
+  return cents(Number(rounded));
+}
+```
 
 ---
 
@@ -1221,8 +1249,9 @@ The *intermediate* `(amount * bps)` could overflow `Number.MAX_SAFE_INTEGER` for
 ```ts
 export function splitCents(total: Cents, n: number): Cents[] {
   if (n <= 0) throw new Error('n must be positive');
-  const base = Math.floor((total as number) / n);
-  const remainder = (total as number) - base * n;
+  // Cents extends number — arithmetic compiles without `as number`.
+  const base = Math.floor(total / n);
+  const remainder = total - base * n;
   const out: Cents[] = [];
   for (let i = 0; i < n; i += 1) {
     out.push(cents(i < remainder ? base + 1 : base));

@@ -119,29 +119,33 @@ const first: string = habits[0]; // ❌ Type error in strict mode
 
 Why? Because TypeScript, in strict mode with `noUncheckedIndexedAccess: true` (which our scaffold turned on), doesn't trust that the array is non-empty. `habits[0]` could be `undefined` if `habits` is empty. The compiler is forcing you to acknowledge that.
 
-You have three ways to handle it:
+You have two correct ways to handle it:
 
 ```ts
-const first1: string | undefined = habits[0];   // accept the union type
-const first2: string = habits[0] ?? 'fallback'; // provide a default
-if (habits.length > 0) {
-  const first3: string = habits[0]!;             // ❌ NEVER — `!` is banned
-}
+// Option 1 — accept the union type and narrow before use.
+const first1: string | undefined = habits[0];
+if (first1 === undefined) return;
+// from here on, TypeScript knows first1 is string.
+
+// Option 2 — provide a default with `??`.
+const first2: string = habits[0] ?? 'fallback';
 ```
 
-The third option uses `!` (the non-null assertion). It's banned in this book — Bible rule #3. We'd handle it like this instead:
+Or, equivalently, destructure-and-narrow:
 
 ```ts
 const [first] = habits;
 if (first === undefined) return;
-// from here on, TypeScript knows `first` is `string`
+// from here on, TypeScript knows first is string.
 ```
 
-Or with `find`/`at`:
+Or with `array.at(...)` (formal coverage Ch 11):
 
 ```ts
-const first = habits.at(0); // string | undefined
+const first = habits.at(0); // string | undefined — same shape, narrow as above
 ```
+
+There's a third syntax in the wild — `habits[0]!` with a `!` non-null assertion that *lies* to TypeScript and says "trust me, this isn't undefined." **It's banned in this book — Bible rule #3.** We never write it; the two patterns above cover every real case.
 
 For now we'll loop with `{#each}` and avoid raw indexing. We'll meet `at()` and `find()` properly in Chapter 11.
 
@@ -1266,25 +1270,36 @@ The first argument to `reduce` is the **accumulator function** `(acc, item) => n
 Three useful shapes:
 
 ```ts
-// 1. Sum of cents — typed accumulator different from element type would still work because both are number.
-const totalCents = habits.reduce((sum, _h) => sum + 1, 0); // count, but you'd use .length for this
-
-// 2. Find the oldest habit.
-const oldest = habits.reduce(
-  (oldest, h) => (h.createdAt < oldest.createdAt ? h : oldest),
-  habits[0]!, // ❌ banned — see Ch 7. Use a destructure default instead, or `if (habits.length === 0)` early-return.
+// 1. Sum the lengths of every habit name.
+const totalNameLength: number = habits.reduce(
+  (sum, h) => sum + h.name.length,
+  0,
 );
 
-// 3. Group by category — accumulator is an object, very different shape from elements.
-const byCategory = habits.reduce<Record<string, Habit[]>>((acc, habit) => {
-  const key = habit.category ?? 'uncategorised';
-  acc[key] ??= [];
-  acc[key].push(habit);
-  return acc;
-}, {});
+// 2. Find the oldest habit (smallest createdAt). Destructure-and-narrow,
+//    Bible rule #3: never habits[0]!.
+const [first, ...rest] = habits;
+const oldest: Habit | undefined = first === undefined
+  ? undefined
+  : rest.reduce(
+      (oldest, h) => (h.createdAt < oldest.createdAt ? h : oldest),
+      first,
+    );
+
+// 3. Group by name's first letter — accumulator is an object, very
+//    different shape from elements. Immutable update inside the reducer.
+const byInitial: Record<string, Habit[]> = habits.reduce<Record<string, Habit[]>>(
+  (acc, habit) => ({
+    ...acc,
+    [habit.name[0] ?? '?']: [...(acc[habit.name[0] ?? '?'] ?? []), habit],
+  }),
+  {},
+);
 ```
 
 The `reduce<Record<string, Habit[]>>(...)` form is *generic call notation* — we pin the accumulator's type because TS can't infer it from `{}` alone. You'll see this in the wild; remember it.
+
+(Mutating `acc` inside the reducer with `acc[key].push(...)` would also work, and is faster for huge arrays. We use the immutable form because it composes with `$derived` predictably and matches the Ch 8 spread-rule. For 50 habits the perf difference is unmeasurable.)
 
 We meet `reduce` in real use in Ch 16 (computing totals from `$derived`) and Ch 30 (`splitCents` for refunds).
 

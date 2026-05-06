@@ -130,7 +130,7 @@ After Chapter 38 you can:
 
 - Read **`localStorage.getItem` / `setItem` / `removeItem` / `clear`**.
 - Read **`JSON.stringify` / `JSON.parse`** and know the round-trip data-loss class.
-- Read **`typeof localStorage === 'undefined'`** as the SSR-safety guard.
+- Read **`import { browser } from '$app/environment'`** as the SvelteKit SSR-safety primitive (and recognise `typeof localStorage === 'undefined'` as the older equivalent).
 - Spot **untrusted JSON entering the program** as a parser-shaped boundary.
 
 ---
@@ -442,16 +442,19 @@ After Chapter 40 you can:
 ## Lesson 41.1 — Form actions
 
 ```ts
-// src/routes/(app)/+page.server.ts
+// src/routes/(app)/dashboard/+page.server.ts
 import type { Actions } from './$types';
 import { fail, redirect } from '@sveltejs/kit';
 import { db } from '$lib/db/client';
 import { habits } from '$lib/db/schema';
 import { eq, and } from 'drizzle-orm';
 
+// Same demo UUID we seeded in Ch 40. Real auth replaces this in Part VII.
+const DEMO_USER_ID = '00000000-0000-0000-0000-000000000001';
+
 export const actions: Actions = {
   addHabit: async ({ request, locals }) => {
-    const userId = 'demo-user';
+    const userId = DEMO_USER_ID;
     const data = await request.formData();
     const name = String(data.get('name') ?? '').trim();
     if (name === '') return fail(400, { fieldErrors: { name: 'Name required' } });
@@ -459,7 +462,7 @@ export const actions: Actions = {
     return { success: true };
   },
   deleteHabit: async ({ request, locals }) => {
-    const userId = 'demo-user';
+    const userId = DEMO_USER_ID;
     const data = await request.formData();
     const id = String(data.get('id') ?? '');
     await db.delete(habits).where(and(eq(habits.id, id), eq(habits.userId, userId)));
@@ -651,7 +654,7 @@ import { sql } from 'drizzle-orm';
 const MAX_HABITS = 50;
 
 addHabit: async ({ request, locals }) => {
-  const userId = 'demo-user';
+  const userId = DEMO_USER_ID;
   // ... parse name ...
 
   const updated = await db.update(users)
@@ -844,14 +847,22 @@ After Chapter 42 you can:
   {#each visibleHabits as habit (habit.id)}
     <li>
       {habit.name}
-      <form method="POST" action="?/deleteHabit" use:enhance={({ formData }) => {
-        const id = String(formData.get('id'));
+      <form method="POST" action="?/deleteHabit" use:enhance={({ formData, cancel }) => {
+        const raw = formData.get('id');
+        if (typeof raw !== 'string' || raw === '') {
+          // Defensive: if the hidden input is missing or wrong, bail out.
+          // This shouldn't happen in our markup, but `String(null)` would
+          // produce the literal string "null" and we'd add it to pendingDeletes.
+          cancel();
+          return;
+        }
+        const id = raw;
         pendingDeletes = new Set([...pendingDeletes, id]);
 
         return async ({ result }) => {
           pendingDeletes = new Set([...pendingDeletes].filter((p) => p !== id));
           if (result.type === 'failure' || result.type === 'error') {
-            toast.show('Couldn\'t delete habit. Please try again.', 'error');
+            toast.show("Couldn't delete habit. Please try again.", 'error');
             await applyAction(result);
           } else {
             await invalidate('streak:habits');
@@ -886,7 +897,7 @@ Bible rule #16. Senior eyes spot this in code review immediately.
 // src/lib/toast.svelte.ts
 type Toast = { id: string; message: string; kind: 'info' | 'success' | 'error' };
 
-class ToastStore {
+export class ToastStore {
   toasts = $state<Toast[]>([]);
 
   show(message: string, kind: Toast['kind'] = 'info'): void {
@@ -899,19 +910,54 @@ class ToastStore {
     this.toasts = this.toasts.filter((t) => t.id !== id);
   }
 }
-
-export const toast = new ToastStore(); // OK as a module-scoped client-side singleton (we'll context-ise on a per-user basis once we have auth)
 ```
 
-Render in layout:
+We *don't* `export const toast = new ToastStore()` — that's the SSR-singleton landmine from Ch 29. A module-scope instance lives once per server process; on Vercel that means *all SSR-rendered pages share the same toasts array*. Instead, instantiate per-component-tree via context, like `HabitStore` in Ch 32:
+
+```ts
+// src/lib/contexts.ts (extend)
+const TOAST_KEY = Symbol('toast');
+
+export function setToastStore(store: ToastStore): void {
+  setContext(TOAST_KEY, store);
+}
+
+export function getToastStore(): ToastStore {
+  const store = getContext<ToastStore | undefined>(TOAST_KEY);
+  if (store === undefined) throw new Error('ToastStore not in context');
+  return store;
+}
+```
+
+In the root layout:
 
 ```svelte
+<!-- src/routes/+layout.svelte -->
+<script lang="ts">
+  import { ToastStore } from '$lib/toast.svelte';
+  import { setToastStore } from '$lib/contexts';
+
+  const toasts = new ToastStore();
+  setToastStore(toasts);
+</script>
+
 <div class="toast-stack">
-  {#each toast.toasts as t (t.id)}
+  {#each toasts.toasts as t (t.id)}
     <div class="toast toast-{t.kind}">{t.message}</div>
   {/each}
 </div>
 ```
+
+Anywhere a child needs to push a toast (the optimistic-delete handler above, for instance):
+
+```svelte
+<script lang="ts">
+  import { getToastStore } from '$lib/contexts';
+  const toast = getToastStore();
+</script>
+```
+
+Per-tree instance. Per-request safe.
 
 ---
 

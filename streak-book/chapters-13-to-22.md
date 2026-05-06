@@ -495,8 +495,12 @@ If you see `createEventDispatcher` in old code, replace with a function prop the
 </script>
 
 {#if open}
-  <div class="modal-backdrop" onclick={onClose}>
-    <div class="modal-content" onclick={(e) => e.stopPropagation()}>
+  <!-- For brevity this snippet uses click on a div for the backdrop;
+       a senior implementation uses a real <dialog> + showModal() (Ch 21)
+       and lets the backdrop click be handled via the dialog's `cancel` event,
+       so screen readers and keyboards work without extra wiring. -->
+  <div class="modal-backdrop" onclick={onClose} role="presentation">
+    <div class="modal-content" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
       <button type="button" onclick={onClose} aria-label="Close">×</button>
       <p>Modal content</p>
     </div>
@@ -1135,7 +1139,30 @@ Used as `<NumberStepper bind:value={count} min={0} max={10} />`. What does the p
 
 **The English sentence first:**
 
-> *"Build `NumberStepper` (the snippet above) and wire it to a $state count in the home page. Add it to the page temporarily so you can see it; remove later. The point is to feel two-way binding work in both directions."*
+> *"Build `NumberStepper` (the snippet above), wire it to a `$state` count in the home page, click + and − buttons, watch both the parent's `count` and the child's display update in lockstep."*
+
+<details>
+<summary>Worked answer</summary>
+
+`src/lib/components/NumberStepper.svelte` — exactly the snippet from Lesson 18.4. Save.
+
+In `+page.svelte` (temporarily — remove after the exercise):
+
+```svelte
+<script lang="ts">
+  import NumberStepper from '$lib/components/NumberStepper.svelte';
+  let demoCount = $state(3);
+</script>
+
+<p>Demo count: {demoCount}</p>
+<NumberStepper bind:value={demoCount} min={0} max={10} />
+<button type="button" onclick={() => demoCount = 0}>Reset from parent</button>
+```
+
+The reset button is the test: click it, watch the child's `<span>{value}</span>` snap back to 0. That's two-way binding *both ways* — child writes flow up, parent writes flow down.
+
+Senior takeaway: `$bindable` doesn't mean "the child owns the state." It means "the child and parent share one address." The single source of truth is still the parent's `let demoCount = $state(3)`.
+</details>
 
 ---
 
@@ -1264,6 +1291,34 @@ Senior habit: read the error *out loud, slowly*. The TypeScript compiler is a tu
 **The English sentence first:**
 
 > *"Add `$inspect.trace()` inside `visibleHabits`. Type a query — read the trace in the console — explain what dependencies changed."*
+
+<details>
+<summary>Worked answer</summary>
+
+In `+page.svelte`'s script:
+
+```ts
+const visibleHabits: Habit[] = $derived.by(() => {
+  $inspect.trace();
+  return habits.filter((h) => h.name.toLowerCase().includes(searchQuery.toLowerCase()));
+});
+```
+
+(The `$derived` form-conversion to `$derived.by` is required because `$inspect.trace()` is a statement, not part of the expression.)
+
+Now type "rea" in the search box. Open the console. Each keystroke logs a trace like:
+
+```
+{
+  dependencies: ['searchQuery', 'habits'],
+  changed: ['searchQuery'],
+}
+```
+
+The first line names *every* reactive value the derivation read; the `changed` line names which one(s) just updated. For our case: typing only changes `searchQuery`; `habits` is stable.
+
+Senior takeaway: `$inspect.trace()` is the answer to *"why did this re-fire?"* — the most common debugging question once you have more than three derived values.
+</details>
 
 ---
 
@@ -1454,7 +1509,39 @@ It's a generic list renderer. Caller passes `items` (any array) and an `item` sn
 
 **The English sentence first:**
 
-> *"Wrap the habit list in a `<Card>` with a header snippet showing 'Today's habits'."*
+> *"Wrap the habit list in a `<Card>` with a header snippet showing 'Today's habits' and a footer snippet showing the count added today."*
+
+<details>
+<summary>Worked answer</summary>
+
+```svelte
+<!-- in +page.svelte -->
+<script lang="ts">
+  import Card from '$lib/components/Card.svelte';
+  // ... existing imports + state ...
+</script>
+
+<Card>
+  {#snippet header()}
+    <span>Today's habits</span>
+  {/snippet}
+
+  <ul class="habit-list" bind:this={listEl}>
+    {#each visibleHabits as habit (habit.id)}
+      <HabitRow {habit} onDelete={removeHabit} />
+    {/each}
+  </ul>
+
+  {#snippet footer()}
+    <small>{addedTodayCount} added today</small>
+  {/snippet}
+</Card>
+```
+
+The list is the unnamed default content (becomes the `children` snippet). Header and footer are explicitly named. The component renders `<div class="card-header">...</div><div class="card-body">...</div><div class="card-footer">...</div>` chrome around them.
+
+Senior takeaway: snippets and slot-style composition are *the same conceptual move* — letting a parent inject markup into named holes a child reserves. Snippets are typed and parameterisable; legacy slots weren't.
+</details>
 
 ---
 
@@ -1579,10 +1666,10 @@ The `lastCount` tracking is one of the few legitimate `$effect`-with-state-write
   }
 </script>
 
-<button onclick={openDialog}>Open</button>
+<button type="button" onclick={openDialog}>Open</button>
 <dialog bind:this={dialogEl}>
   <p>Hello</p>
-  <button onclick={() => dialogEl?.close()}>Close</button>
+  <button type="button" onclick={() => dialogEl?.close()}>Close</button>
 </dialog>
 ```
 
@@ -1600,9 +1687,41 @@ What's `<dialog>` doing?
 
 **The English sentence first:**
 
-> *"When the user deletes a habit, scroll the page to the *previous* habit (if any), so the focus doesn't jump to the top."*
+> *"When the user deletes a habit, the page should not scroll-jump. Instead, focus the *previous* habit's delete button (if any) so keyboard users can keep deleting without losing position."*
 
-(Hint: track which habit was just deleted, then in `$effect` scroll to whichever row came before it.)
+<details>
+<summary>Worked answer</summary>
+
+```ts
+// In +page.svelte
+let lastDeletedIndex: number | null = $state(null);
+
+function removeHabit(id: HabitId): void {
+  const idx = habits.findIndex((h) => h.id === id);
+  if (idx >= 0) lastDeletedIndex = idx;
+  habits = habits.filter((h) => h.id !== id);
+}
+
+$effect(() => {
+  if (lastDeletedIndex === null) return;
+  if (listEl === undefined) return;
+
+  // After delete, the *previous* habit now sits at the deleted index − 1
+  // (or 0 if we deleted the first one).
+  const targetIndex = Math.max(0, lastDeletedIndex - 1);
+  const target = listEl.children[targetIndex];
+  if (target instanceof HTMLElement) {
+    const button = target.querySelector('button[aria-label^="Remove"]');
+    if (button instanceof HTMLElement) button.focus();
+  }
+  lastDeletedIndex = null;
+});
+```
+
+Two senior touches: (1) we *don't* scroll — focus management is the better tool for keyboard users; the page scrolls only if the focused element is off-screen, and the browser handles that correctly via `focus({ preventScroll: false })` defaults. (2) the `lastDeletedIndex = null` reset prevents the effect from re-firing on unrelated re-renders.
+
+A more robust real-world implementation would keep a `WeakMap<Habit, HTMLElement>` of row-to-button refs (see Ch 21.1's `bind:this`) — what we wrote works because of DOM ordering, but breaks if the list is reordered.
+</details>
 
 ---
 
@@ -1783,9 +1902,58 @@ Because data only *exists* on success. If you put `data: T | null` on every bran
 
 **The English sentence first:**
 
-> *"Add a 'Retry' button to the error state. When clicked, it re-attempts the save with the most recent name."*
+> *"Add a 'Retry' button to the error state. When clicked, it re-attempts the save with the most recent name. Disable Retry while a save is in flight."*
 
-(Hint: store the failed name in `saveState`'s error variant; the retry button calls a function that uses it.)
+<details>
+<summary>Worked answer</summary>
+
+Extend the discriminator so `error` carries the name we tried:
+
+```ts
+type SaveState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success' }
+  | { status: 'error'; message: string; name: string };
+
+let saveState: SaveState = $state({ status: 'idle' });
+
+async function trySave(name: string): Promise<void> {
+  saveState = { status: 'loading' };
+  try {
+    await fakeSave(name);
+    habits = [...habits, makeHabit(name)];
+    saveState = { status: 'success' };
+  } catch (err) {
+    saveState = {
+      status: 'error',
+      message: err instanceof Error ? err.message : 'Unknown',
+      name, // remember what we tried
+    };
+  }
+}
+
+async function addHabit(): Promise<void> {
+  const trimmed = newHabit.trim();
+  if (trimmed === '') return;
+  await trySave(trimmed);
+  if (saveState.status === 'success') newHabit = '';
+}
+```
+
+In markup, the error block gains a Retry button:
+
+```svelte
+{#if saveState.status === 'error'}
+  <p class="error">{saveState.message}</p>
+  <button type="button" onclick={() => trySave(saveState.name)}>
+    Retry
+  </button>
+{/if}
+```
+
+Senior touches: (1) `trySave` is the *single* save path, called from both the form and the retry button — no duplication. (2) The discriminator carries `name` only on the error variant; if we tried to read `saveState.name` while idle, the compiler refuses. That's the discriminated union doing its job.
+</details>
 
 ---
 
@@ -1817,7 +1985,7 @@ After Part III you can:
 
 ## End-of-chapter checkpoint
 
-- [ ] *Add* shows a spinner; about 1 in 5 fails; the error renders.
+- [ ] *Add* shows a spinner. Untoggled, success; toggle "Force the next save to fail", click *Add*, see the error.
 - [ ] You read the four-state pattern aloud.
 - [ ] You feel why "two booleans" is wrong.
 
