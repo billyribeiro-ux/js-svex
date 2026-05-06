@@ -114,6 +114,14 @@ curl -fsSL https://get.pnpm.io/install.sh | sh -
 iwr https://get.pnpm.io/install.ps1 -useb | iex
 ```
 
+If PowerShell refuses with an *execution policy* error, run this once first, then retry:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+This is a one-time per-user setting; it tells Windows you're allowed to run installer scripts. Senior habit on Windows: do it once on a fresh machine, never think about it again.
+
 After it finishes, **close your terminal completely and open a fresh one.** This is important — the new terminal will know where `pnpm` lives; the old one won't.
 
 Verify it works:
@@ -143,38 +151,38 @@ Read aloud: *"make a directory called projects (and don't error if it already ex
 >
 > **`cd`** — *change directory.* Moves your terminal *into* the named folder. After this, `pwd` will show the new location.
 
-Now scaffold the project:
+Now scaffold the project. The current Svelte CLI is called `sv` (May 2026):
 
 ```bash
-pnpm create svelte@latest streak
+pnpm dlx sv create streak
 ```
 
+> **`pnpm dlx`** — *download and execute.* Like running a one-off package without installing it permanently. We use it for installers and scaffolders.
+>
 > **scaffold** *(verb)* — to generate the empty starting structure of a project. Like a builder framing a house before they put walls on it.
 
-The scaffolder will ask you a few questions. Answer exactly as below — these are the choices for this entire book. (If the questions are slightly worded differently in your version, the *meaning* is what to match, not the exact words.)
+The CLI will ask you a few questions, then show one big screen of optional **add-ons** as checkboxes. Answer exactly as below. (Wording may vary slightly between versions; match the *meaning*.)
 
 | Question | Your answer |
 |---|---|
-| Which Svelte app template? | **Skeleton project** (the empty one) |
-| Add type checking with TypeScript? | **Yes, using TypeScript syntax** |
-| Add ESLint for code linting? | **Yes** |
-| Add Prettier for code formatting? | **Yes** |
-| Add Playwright for browser testing? | **Yes** |
-| Add Vitest for unit testing? | **Yes** |
+| Which template? | **SvelteKit minimal** (the empty one — *not* the demo) |
+| Type checking? | **Yes, TypeScript** |
+| Add-ons (one screen, multi-select with space) | Tick **prettier**, **eslint**, **vitest**, **playwright**. Leave the rest. |
+| Package manager? | **pnpm** |
 
-When it finishes, it will tell you to do this:
+When it finishes, it tells you to do this:
 
 ```bash
 cd streak
 pnpm install
-pnpm run dev
+pnpm dev
 ```
 
 Do exactly that. Read aloud:
 
 - *"change into the streak folder"*,
-- *"install all the dependencies the project needs"* (this will take 10–30 seconds the first time, and create a `node_modules` folder full of those dependencies),
-- *"run the dev script"* (the development server — what makes your project visible in a browser).
+- *"install all the dependencies the project needs"* (this will take 10–30 seconds the first time, and creates a `node_modules` folder full of those dependencies),
+- *"run the dev script"* — short for `pnpm run dev`. `pnpm` lets you drop the `run` for any script declared in `package.json`. We use the short form for the rest of the book.
 
 You should see something like:
 
@@ -186,7 +194,7 @@ You should see something like:
   ➜  press h + enter to show help
 ```
 
-That `http://localhost:5173/` is the address of your project, running on your own computer. **Open it in your browser now.**
+That `http://localhost:5173/` is the address of your project, running on your own computer. **Open it in your browser now.** If your terminal supports it, `Cmd+click` (macOS) or `Ctrl+click` (Windows/Linux) the URL. Otherwise copy-paste it into a fresh browser tab.
 
 > **`localhost`** *(noun)* — the standard nickname for *your own computer*. Visiting `localhost:5173` means "talk to a server running on this very machine." It's only visible to you.
 >
@@ -222,8 +230,12 @@ vite.config.ts
 
 Most of these you can ignore for now. The two you care about today:
 
-- **`package.json`** — the list of every package this project depends on, and the *scripts* you can run. (`pnpm run dev` is one of those scripts.)
+- **`package.json`** — the list of every package this project depends on, and the *scripts* you can run. (`dev` is one of those scripts; that's why `pnpm dev` works.)
 - **`src/`** — your code. Everything you write goes inside `src/`.
+
+> **`.git`** — the scaffolder also created a hidden `.git` folder. `ls` won't show it; `ls -a` will. That's where Git tracks your project history. You don't touch it directly. We'll meet Git formally in Chapter 61.
+>
+> **`.gitignore`** — a hidden file listing things Git should *not* track (like `node_modules/`, which is huge and reproducible from `package.json`). Already filled in for you.
 
 Look inside `src/`:
 
@@ -238,6 +250,13 @@ lib/
 routes/
 ```
 
+What each one is, briefly:
+
+- **`app.html`** — the HTML shell every page is rendered into. Has placeholders like `%sveltekit.head%`. You'll edit it once or twice in the whole book.
+- **`app.d.ts`** — TypeScript declarations for global types (we'll fill it in Chapter 45 when auth needs `App.Locals`).
+- **`lib/`** — your reusable code. Imports use the alias `$lib`.
+- **`routes/`** — every URL of your site.
+
 The one we open today is `src/routes/+page.svelte`.
 
 > **`+page.svelte`** *(noun)* — a special filename SvelteKit recognises. The `+page.svelte` inside `src/routes/` becomes *the home page of your site*. The `+` at the start tells SvelteKit *"this is a routing convention, not just any file."*
@@ -246,9 +265,43 @@ The one we open today is `src/routes/+page.svelte`.
 >
 > **convention** *(noun)* — a rule the framework agrees to follow if you do. SvelteKit's *file conventions* are things like *"a file named `+page.svelte` becomes a page."* They're how the framework reads your folder structure.
 
-Open the project in your code editor. (If you don't have one, install **VS Code** — it's free and the best in class for this stack. From inside the `streak` folder, `code .` opens it.) Find `src/routes/+page.svelte` and click on it.
+Open the project in your code editor. (If you don't have one, install **VS Code** — it's free and the best in class for this stack.) From inside the `streak` folder:
 
-You'll see something tiny and unhelpful — a placeholder welcome message. We're going to replace it.
+```bash
+code .
+```
+
+If `code .` says "command not found", open VS Code by hand, then *File → Open Folder…* and pick `streak`. (To make `code` work next time: in VS Code press `Cmd+Shift+P` → type `Shell Command: Install 'code' command in PATH` → Enter.)
+
+Also install the official **Svelte for VS Code** extension. The Extensions tab is the squares icon in the left sidebar; search for *Svelte*; install the one published by `svelte.dev`. This gives you syntax highlighting, type errors inline, and component autocomplete.
+
+Find `src/routes/+page.svelte` in the file tree and click it. You'll see a tiny placeholder. We'll replace it shortly.
+
+### One small migration: `svelte.config.js` → `svelte.config.ts`
+
+The scaffolder gave you `svelte.config.js`. The Bible rule (#2) is *`.ts` only, never `.js`*. We migrate it now in 30 seconds so the rule holds from line one.
+
+In the editor, **rename** `svelte.config.js` to `svelte.config.ts`. (Right-click → Rename, or `F2`.) Open the renamed file. Replace its contents with this:
+
+```ts
+// svelte.config.ts
+import adapter from '@sveltejs/adapter-auto';
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+import type { Config } from '@sveltejs/kit';
+
+const config: Config = {
+  preprocess: vitePreprocess(),
+  kit: { adapter: adapter() },
+};
+
+export default config;
+```
+
+Read aloud: *"the Svelte config: use the auto adapter, preprocess with Vite, export it."*
+
+The behaviour is identical to the `.js` version; we now have a typed config. Bible rule held.
+
+(There's also `vite.config.ts` and `tsconfig.json`. Both stay as they are — Vite's config is already `.ts`, and `.json` is fine for `tsconfig.json` and `package.json` per Bible rule #2.)
 
 ---
 
@@ -279,13 +332,13 @@ Select everything in `src/routes/+page.svelte` and delete it. Then paste exactly
 </button>
 ```
 
-Save the file. Now look at your browser at `http://localhost:5173/` — **without refreshing it.** You should see the new page appear automatically.
+Save the file with `Cmd+S` (macOS) or `Ctrl+S` (Windows/Linux). Now look at your browser at `http://localhost:5173/` — **without refreshing it.** You should see the new page appear automatically.
 
 > **hot reload** *(noun)* — when the dev server notices you saved a file and updates the browser without you having to refresh. The first time you see it, it feels like magic. After a week, you can't live without it. SvelteKit (via Vite) does this for free.
 
 Click the **Log a habit** button. The number rises. The word switches between *habit* (after the first click) and *habits* (every other count). You've shipped a working, reactive page.
 
-That sentence is worth re-reading: **you've shipped a working, reactive page.** Most beginner books don't get you to the screen until chapter 4. You're at "the screen responds to me" on page eight.
+That sentence is worth re-reading: **you've shipped a working, reactive page.** Reactive state, an event handler, conditional text — three of the things people new to web development find magical, all in one file.
 
 ---
 
@@ -532,7 +585,7 @@ Three of those four are the things people new to web development find magical. Y
 
 ## Glossary added in Chapter 1
 
-A running list. Every chapter adds to it. By chapter 67 you'll have ~250 terms.
+A running list. Every chapter adds to it. By the end of the book you'll have a fluent vocabulary covering the full Svelte 5 + SvelteKit + TypeScript + Postgres + Stripe stack.
 
 | Term | One-sentence definition |
 |---|---|
@@ -666,7 +719,7 @@ Replace your `unlogHabit` function with this:
 </script>
 ```
 
-Save. Click *Undo* once at zero — nothing happens. Click *Log a habit* twice — count is two. Click *Undo* twice — count is zero. Click *Undo* a third time — nothing happens. Click *Undo* forty more times — still zero. Bug fixed.
+Save (`Cmd+S` / `Ctrl+S`). Click *Undo* once at zero — nothing happens. Click *Log a habit* twice — count is two. Click *Undo* twice — count is zero. Click *Undo* a third time — nothing happens. Click *Undo* forty more times — still zero. Bug fixed.
 
 Read the new function aloud:
 
@@ -836,7 +889,7 @@ Read aloud the difference:
 - `if (x <= 0) return;` → *"If x is zero or negative, we're done."*
 - `if (x < 0) return;` → *"If x is already negative, we're done."* — but `0` isn't negative, so we keep going and decrement to `-1`.
 
-This is called an **off-by-one error** — the most common bug class in software. You will write one of these about every two weeks for the rest of your career; learning to *feel* the boundary cases now is part of the work.
+This is called an **off-by-one error** — the most common bug class in *boundary comparison* code. You'll write one of these every couple of weeks for the rest of your career; learning to *feel* the boundary cases now is part of the work.
 
 Change it back to `<=`. Click *Undo* a few times to confirm it's stuck at zero. Done.
 
@@ -909,7 +962,20 @@ Right now, the duplication tells the truth: *"both functions need the same preco
 
 ---
 
-## Lesson 2.7 — What you can now read in the wild
+## Lesson 2.7 — Recurring concepts from earlier chapters
+
+Chapter 2 used these things you already knew from Chapter 1, in new ways:
+
+- **`function … (): void`** (Ch 1) — every new function we wrote keeps the explicit `void` return type.
+- **`-=`** (Ch 1) — the *"decrease by"* operator inside the guard.
+- **`type="button"`** (Ch 1) — every new button still has it.
+- **`onclick={fn}`** (Ch 1) — wiring the new buttons.
+
+Repetition in *new contexts* is how fluency builds. By chapter 6 you'll have used these primitives in a dozen different shapes.
+
+---
+
+## Lesson 2.8 — What you can now read in the wild
 
 After Chapter 2, when you encounter someone else's code, you can:
 
@@ -1154,35 +1220,24 @@ Update your file:
 </button>
 ```
 
-Save. Watch the buttons grey in and out as you click *Log a habit* and *Undo*. That's a real piece of UX you've shipped.
+Save (`Cmd+S` / `Ctrl+S`). Watch the buttons grey in and out as you click *Log a habit* and *Undo*. That's a real piece of UX you've shipped.
 
 ---
 
-## Lesson 3.5 — A small refactor: the named boolean
+## Lesson 3.5 — A pattern we'll name properly later
 
-We have the same condition in two places: `disabled={habitsLoggedToday === 0}` on both *Undo* and *Reset*. Two places isn't a problem yet (rule of three), but there's a cleaner version that reads like prose.
+We have the same condition in two places: `disabled={habitsLoggedToday === 0}` on both *Undo* and *Reset*. Two repetitions isn't a problem (the *Rule of Three* — only extract when you have three users of a piece of logic), but it's worth naming the pattern.
 
-Pull the condition into a named local variable. Inside the `<script>` block, *outside* any function, after the `$state` line:
-
-```svelte
-<script lang="ts">
-  let habitsLoggedToday = $state(0);
-
-  // ...functions unchanged...
-</script>
-```
-
-Wait — we want this variable to **react to changes** in `habitsLoggedToday`. If we just wrote:
+What we *want* is a single name — something like `hasNothingToUndo` — that automatically tracks the count. Plain `const` doesn't reach because `const` is computed once, at component-mount time:
 
 ```ts
+// ❌ doesn't update when habitsLoggedToday changes
 const hasNothingToUndo: boolean = habitsLoggedToday === 0;
 ```
 
-…it would only run *once*, the first time the component renders. It wouldn't update when `habitsLoggedToday` changes.
+The right tool is a **derived value** — a special kind of variable that re-computes whenever its dependencies change. Svelte 5 calls this `$derived`. We meet it formally in **Chapter 16**, when we have a real reason for it (a "habits done today" total computed from a list).
 
-We need a way to say *"this value is computed from other state and should re-compute whenever that state changes."* That's a different rune — `$derived` — which we'll formally meet in Chapter 16. For now, **leave the inline expression in the markup.** It's clear, it works, and we'll improve it later when we have the right tool.
-
-Senior habit: don't reach for an abstraction you don't yet have the right primitive for. Inline is fine. The book teaches `$derived` in its proper place.
+For now, **inline is fine.** Senior habit: don't reach for an abstraction before you have the right primitive. Repetition that tells the truth (*"both buttons share this guard"*) is better than a workaround.
 
 ---
 
@@ -1279,6 +1334,8 @@ The button is disabled when **either**:
 - there are unsaved changes (`hasUnsavedChanges` is `true`).
 
 In other words, the button is *enabled* only when the user is online AND there are no unsaved changes. This is a real-world UX pattern — you can't publish if you're offline, and you can't publish stale data.
+
+**A note on `||` here.** Lesson 3.6 will warn you about the `||` foot-gun — but that's about using `||` to *default a missing value* (`name || 'Anonymous'`). That's the wrong tool there. Using `||` to combine *two booleans* (as in `!isOnline || hasUnsavedChanges`) is exactly the right tool. The line is *type*-shaped: `||` between booleans is great; `||` for missing-value defaults is wrong. By chapter 4 you'll feel the difference.
 </details>
 
 ---
@@ -1323,7 +1380,22 @@ The answer is *no need* — the existing condition `habitsLoggedToday === 0` is 
 
 ---
 
-## Lesson 3.9 — What you can now read in the wild
+## Lesson 3.9 — Recurring concepts from earlier chapters
+
+Chapter 3 leaned on these in new shapes:
+
+- **`===`** (Ch 1) — used inside `disabled={habitsLoggedToday === 0}` for the same strict-equality reason.
+- **Guard clauses** (Ch 2) — every function still uses them; `disabled` on the markup is the *UI-side* twin of the function-side guard. Two layers of defence.
+- **`type="button"`** (Ch 1) — every button still has it.
+- **The 'plural-aware' habit** (Ch 1) — your buttons now also use language carefully (*"Undo"* vs *"Reset"*).
+
+You also added two senior habits:
+- **Defensive coding** — guarding for states that *shouldn't* happen because they sometimes do.
+- **Defence in depth** — the function guard *and* the UI guard, working together.
+
+---
+
+## Lesson 3.10 — What you can now read in the wild
 
 After Chapter 3, you can:
 
@@ -1364,16 +1436,6 @@ You also have a feel for *defensive coding* — writing guards against states th
 
 ---
 
-# End of Part I — first checkpoint (chapters 4–6 follow)
+# End of Part I, Chapters 1–3
 
-This document covered Chapters 1, 2, and 3. The plan-file calls for me to write the first three chapters fully so you can feel the voice and cadence before I commit to the remaining 64 + 3 appendices.
-
-**What I'd like from you, when you read this:**
-
-1. **Voice** — does this read like a senior engineer talking to a real beginner, or does it slip into either condescension or jargon at any point? Mark anywhere it does.
-2. **Density** — is the lesson-to-prose ratio right? Too much explanation? Too little? The book is long; I can afford to be more terse if you'd prefer.
-3. **The "read aloud" tables** — are they the right grain? Should they translate every line, or only the new ones?
-4. **The exercises** — are they paced correctly (one new idea, written before peeking)?
-5. **Tone** — do you want me to keep the small jokes (*"Senior engineers do this constantly"*) or run drier?
-
-When you've read this and given me one round of feedback, I'll write Chapters 4–9 (the rest of Part I plus Part II opening) in the same voice with whatever adjustments you ask for. Then a checkpoint, then the next batch, and so on.
+The rest of Part I (Chapters 4, 5, 6) lives in `chapters-04-to-06.md`. After Chapter 6 you'll have a real reactive page, an undo with a guard, disabled buttons, a name input, a day-of-week strip, and a clean empty state. Open the next file when you're ready.

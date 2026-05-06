@@ -155,13 +155,17 @@ We'll use `?.` reflexively from now on. Without it, you'd be writing `name === n
 
 Today's job in code. We'll add a name field, an input bound to it, and a greeting.
 
+A small TypeScript subtlety first. We *want* to model "the user's name might be missing" as `string | null`. But `<input type="text">` always has a `string` value (an empty input is `''`, never `null`). Binding `string | null` to a text input would fight TypeScript. So we bind a plain `string` and treat the empty string as "not set" *only at the display boundary* (the `{userName.trim() === '' ? 'friend' : userName}` line below).
+
+This is a real-world pattern: **the data model and the input model are sometimes different shapes, and you convert at the edge.** The lessons on `null`, `??`, and `?.` you just learned still apply everywhere else in the book — Chapter 9 onward you'll see them with real `string | null` shapes from the database.
+
 Update `src/routes/+page.svelte`:
 
 ```svelte
 <!-- src/routes/+page.svelte -->
 <script lang="ts">
   let habitsLoggedToday = $state(0);
-  let userName: string | null = $state(null);
+  let userName = $state('');
 
   function logHabit(): void {
     habitsLoggedToday += 1;
@@ -184,7 +188,7 @@ Update `src/routes/+page.svelte`:
   }
 </script>
 
-<h1>Welcome back, {userName ?? 'friend'}.</h1>
+<h1>Welcome back, {userName.trim() === '' ? 'friend' : userName}.</h1>
 
 <label>
   Your name
@@ -208,11 +212,20 @@ Update `src/routes/+page.svelte`:
 </button>
 ```
 
-Save. Open the browser. Type your name in the input — watch the heading update letter by letter. Clear the input — heading reverts to *"Welcome back, friend."*.
+Read aloud the new lines:
 
-That input wiring is `bind:value` — a Svelte feature for two-way input binding. You typed; the variable updated; the heading re-rendered. We'll cover `bind:value` formally in Chapter 8, but it just works. Don't overthink it yet.
+| Line | Read aloud as |
+|---|---|
+| `let userName = $state('');` | *"Let userName be reactive state, starting as an empty string."* |
+| `<h1>Welcome back, {userName.trim() === '' ? 'friend' : userName}.</h1>` | *"If the trimmed name is empty, show 'friend'; otherwise show the name."* |
+| `<input type="text" bind:value={userName} ...>` | *"A text input — its value is bound two-way to userName."* |
+| `placeholder="What should we call you?"` | *"Show this hint inside the input when it's empty."* |
 
-> **`bind:value`** *(preview)* — a Svelte directive that binds an input element's value to a variable. When the user types, the variable updates. When you reassign the variable, the input updates. We'll meet it formally Chapter 8.
+Save (`Cmd+S` / `Ctrl+S`). Open the browser. Type your name — watch the heading update letter by letter. Clear the input — heading reverts to *"Welcome back, friend."*.
+
+That input wiring is `bind:value` — a Svelte feature for two-way input binding. You typed; the variable updated; the heading re-rendered. We'll cover `bind:value` formally in Chapter 8.
+
+> **`bind:value`** *(preview)* — a Svelte directive that binds an input element's value to a variable. When the user types, the variable updates. When code reassigns the variable, the input updates. We'll meet it formally Chapter 8.
 
 ---
 
@@ -220,13 +233,15 @@ That input wiring is `bind:value` — a Svelte feature for two-way input binding
 
 The deliberate choices in today's code:
 
-1. **The type annotation `string | null`.** We could have written `let userName = $state('')` and used the empty string as "no name yet". *We don't.* The empty string is a real, intentional value the user can type ("I want my name displayed as nothing"). `null` cleanly says *"absent."*
+1. **`let userName = $state('')`, with `string` not `string | null`.** Here, the *display* concept of "missing" is "the trimmed input is empty" — and HTML inputs already use `''` for that. We respect the input model. Where the data genuinely *can be null* (database fields, server responses), we'll model with `string | null` and reach for `??`. The two patterns coexist.
 
-2. **`userName ?? 'friend'`, not `userName || 'friend'`.** The Chapter 3 foot-gun, avoided. If a future user *does* type an empty string, we treat it as "they typed an empty string", not "they're missing." (We'll add a real validation step in Part VI; today the wiring is the lesson.)
+2. **`{userName.trim() === '' ? 'friend' : userName}`, not `{userName || 'friend'}`.** Even though both `''` and falsy give the same result here, the explicit `.trim() === ''` says exactly what we mean — *"the user has not entered a non-blank name"* — and survives the day a typo elsewhere makes `userName` something other than a plain string.
 
-3. **`<label>` wrapping the input.** Accessibility 101: every input needs a label. The screen-reader habit. We'll deepen this in Chapter 53.
+3. **`.trim()` before checking.** A user who types just spaces hasn't given us a name; they get *"friend"*, not the literal three-space string. Senior habit: trim before you decide.
 
-4. **`placeholder` for the hint, not the value.** A common beginner mistake is putting the *default* into `placeholder`. Placeholder text *vanishes* when the user types — you can't read it back. It's a hint, not a value.
+4. **`<label>` wrapping the input.** Accessibility 101: every input needs a label. The screen-reader habit. We'll deepen this in Chapter 53.
+
+5. **`placeholder` for the hint, not the value.** A common beginner mistake is putting the *default* into `placeholder`. Placeholder text *vanishes* when the user types — you can't read it back. It's a hint, not a value.
 
 ---
 
@@ -300,13 +315,13 @@ Try before peeking.
 <p>
   You've logged
   <strong>{habitsLoggedToday}</strong>
-  {habitsLoggedToday === 1 ? 'habit' : 'habits'} so far{userName !== null ? `, ${userName}` : ''}.
+  {habitsLoggedToday === 1 ? 'habit' : 'habits'} so far{userName.trim() !== '' ? `, ${userName}` : ''}.
 </p>
 ```
 
 Read aloud: *"so far, comma, name — if there is one — and then a period."*
 
-The `{userName !== null ? \`, ${userName}\` : ''}` part: when there's a name, it inserts `, Billy` (with the leading comma and space). When there isn't, it inserts an empty string. The full sentence reads naturally either way.
+The `{userName.trim() !== '' ? \`, ${userName}\` : ''}` part: when there's a non-blank name, it inserts `, Billy` (with the leading comma and space). When there isn't, it inserts an empty string. The full sentence reads naturally either way.
 
 A second valid answer uses Chapter 6's `{#if}` block (which you haven't met formally yet):
 
@@ -314,12 +329,36 @@ A second valid answer uses Chapter 6's `{#if}` block (which you haven't met form
 <p>
   You've logged <strong>{habitsLoggedToday}</strong>
   {habitsLoggedToday === 1 ? 'habit' : 'habits'} so far
-  {#if userName !== null}, {userName}{/if}.
+  {#if userName.trim() !== ''}, {userName}{/if}.
 </p>
 ```
 
 Both are fine. The second is more idiomatic for longer conditional sections.
 </details>
+
+---
+
+## Lesson 4.11 — Recurring concepts from earlier chapters
+
+Chapter 4 used these:
+
+- **`$state(...)`** (Ch 1) — `userName` is reactive state too; the heading updates live as you type.
+- **`===`** (Ch 1) — strict equality on the trim check.
+- **Ternary `cond ? a : b`** (Ch 1) — picks `'friend'` vs the typed name.
+- **Falsy values** (Ch 3) — we *don't* lean on `''` being falsy here; we check `.trim() === ''` explicitly, so the intent is on the page.
+
+---
+
+## Lesson 4.12 — What you can now read in the wild
+
+After Chapter 4 you can:
+
+- Read **`'single'`**, **`"double"`**, and **`` `template ${value}` ``** strings and pick the right one.
+- Read **`null`** and **`undefined`** and explain the difference.
+- Read **`a ?? b`** (nullish-coalesce) and **`a?.b`** (optional-chain) confidently.
+- Spot **the `||` foot-gun** and rewrite with `??`.
+- Read **union types** like `string | null` — and know that input controls bind to one specific shape, not both.
+- Read **`bind:value={x}`** as two-way input binding, even though we'll formalise it Chapter 8.
 
 ---
 
@@ -339,6 +378,7 @@ Both are fine. The second is more idiomatic for longer conditional sections.
 | union type (`A \| B`) | A type that can be either `A` or `B`. |
 | `<label>` | The HTML element pairing a label with an input. |
 | `placeholder` | Hint text inside an empty input. |
+| `.trim()` | String method removing surrounding whitespace. |
 
 ---
 
@@ -592,15 +632,27 @@ Update `+page.svelte`:
 </style>
 ```
 
-A few new things appeared. Let's name them.
+A few new things appeared. Read each new line aloud:
+
+| Line | Read aloud as |
+|---|---|
+| `const days: string[] = ['Mon', 'Tue', ...];` | *"Let days be a list of strings: Mon through Sun."* |
+| `const todayIndex: number = getMondayBasedDayIndex();` | *"Let todayIndex be the result of getMondayBasedDayIndex, computed once at module load."* |
+| `<div class="day-strip">` | *"A container with the class day-strip."* |
+| `{#each days as day, i}` | *"For each day in days, with i as its index."* |
+| `<span class="day" class:today={i === todayIndex}>` | *"A span with class day, plus class today when i equals today's index."* |
+| `{day}` | *"Insert the day name."* |
+| `{/each}` | *"End of the each block."* |
 
 > **`<style>`** — a `<style>` block inside a `.svelte` file scopes its CSS to *only this component*. The `.day-strip` selector here doesn't leak to other components. This is one of Svelte's killer features.
 >
-> **`class:today={...}`** — Svelte directive: *"add the class `today` to this element when the expression is true."* Read aloud: *"this span has the class 'today' when its index equals todayIndex."*
+> **`class:today={...}`** — Svelte directive: *"add the class `today` to this element when the expression is true."* You'll also see Svelte 5's array-class form: `class={[base, condition && 'today']}`. Both are valid; pick one and stay consistent. We use `class:` for boolean toggles because it reads cleaner.
 >
 > **`{#each days as day, i}`** — the index variant.
 
-Save. Look at the page. You should see a row of seven pill-shaped tags, with today's pill highlighted in blue.
+Save (`Cmd+S` / `Ctrl+S`). Look at the page. You should see a row of seven pill-shaped tags, with today's pill highlighted in blue.
+
+> **A small caveat:** `todayIndex` is computed once when the page loads. If you leave Streak open across midnight, the strip won't refresh until you reload. Real apps fix this with a periodic check or a server `load` (Chapter 40). For now, refresh works.
 
 ---
 
@@ -712,6 +764,28 @@ The result: past days are faded; today is the bright pill; future days stay defa
 
 ---
 
+## Lesson 5.9 — Recurring concepts from earlier chapters
+
+- **Early-return guard** (Ch 2) — `getMondayBasedDayIndex` uses one for the Sunday case.
+- **`===`** (Ch 1) — `i === todayIndex` for the highlight.
+- **`function … (): number`** (Ch 1) — explicit return type.
+- **`const`** (Ch 4) — `days` and `todayIndex` never get reassigned.
+
+---
+
+## Lesson 5.10 — What you can now read in the wild
+
+After Chapter 5 you can:
+
+- Read **`const xs: string[] = [...]`** — array literal with a type annotation.
+- Read **`for (const x of xs) { ... }`** — the modern loop.
+- Read **`for (const [i, x] of xs.entries())`** — when you need the index.
+- Read **`{#each xs as x, i (x.id)}`** — the keyed `each` (Chapter 7 next).
+- Read **`<style>`** as scoped CSS.
+- Read **`class:foo={cond}`** and the array-form `class={[...]}` and explain both.
+
+---
+
 ## Glossary added in Chapter 5
 
 | Term | Definition |
@@ -802,7 +876,20 @@ We want a different page when `habitsLoggedToday === 0`. The simplest version:
 {/if}
 ```
 
-Save. At zero, you see the empty-state card. Click *Log a habit* — the page snaps to the populated layout. Click *Reset* — back to the empty state.
+Read aloud the new wiring:
+
+| Line | Read aloud as |
+|---|---|
+| `{#if habitsLoggedToday === 0}` | *"If today's count is exactly zero..."* |
+| `<div class="empty-state">` | *"...show the empty-state card..."* |
+| `<h2>No habits yet</h2>` | *"...with this heading..."* |
+| `<p>Log your first one!</p>` | *"...this prompt..."* |
+| `<button onclick={logHabit}>Log a habit</button>` | *"...and a single button to start."* |
+| `{:else}` | *"Otherwise..."* |
+| *populated layout* | *"...show the count, the buttons, the controls."* |
+| `{/if}` | *"End of the conditional."* |
+
+Save (`Cmd+S` / `Ctrl+S`). At zero, you see the empty-state card. Click *Log a habit* — the page snaps to the populated layout. Click *Reset* — back to the empty state.
 
 > **empty state** *(noun)* — the UI shown when a list, dashboard, or page has no data yet. Senior engineers always design one. Without it, a brand-new user sees something broken-looking and bounces.
 
@@ -842,9 +929,11 @@ That CSS is mediocre. We'll polish in Part VIII. The lesson here is *that we wro
 
 ## Lesson 6.4 — Build, break, fix
 
-Time for the chapter's deliberate bug.
+Time for the chapter's deliberate bug. We'll do it twice — once to *see* the bug bypass the UI guard, once to confirm the fix.
 
-Open `unlogHabit` and remove the guard:
+**Step 1 — open the dev console.** Press `F12` (or `Cmd+Option+I` on macOS) in your browser. Click the **Console** tab.
+
+**Step 2 — break the function.** Open `unlogHabit` and remove the guard:
 
 ```ts
 function unlogHabit(): void {
@@ -852,17 +941,13 @@ function unlogHabit(): void {
 }
 ```
 
-Save. *Don't* test by clicking — the button is *disabled* at zero, so the bug we just reintroduced is masked by the UI. Senior senses tingle: *"if I rely on the UI to prevent the bug, the bug is still there — and the moment some other path triggers the function, it'll show."*
+Save. The button is still `disabled` at zero, so clicking does nothing visible. The bug is *masked* by the UI.
 
-Now type this in your browser's URL bar to open the dev tools console (or press F12, then go to *Console*). Type:
+**Step 3 — bypass the UI.** In dev tools, go to the **Elements** (or **Inspector**) tab. Find the *Undo* button. Find the `disabled` attribute on it. Right-click → *Edit attribute* → delete `disabled`. Press Enter. The button is now clickable even at count zero.
 
-```js
-window.habitsLoggedToday  // probably undefined at this point
-```
+Click it. The count goes to `-1`. The UI shows `"You've logged -1 habits so far."`. Click again — `-2`. The bug shipped because the UI guard *alone* isn't enough.
 
-We can't easily call our function from outside, so the bug stays hidden today. But the *principle* is: a UI guard is **defence in depth**, not the only line of defence. We have *both* the `disabled` and the early-return guard for a reason.
-
-Restore the guard:
+**Step 4 — restore the function guard:**
 
 ```ts
 function unlogHabit(): void {
@@ -874,7 +959,11 @@ function unlogHabit(): void {
 }
 ```
 
-> **defence in depth** *(noun)* — a senior pattern: don't rely on one layer to prevent a bug; have two or three. UI guard + function guard + (later) database constraint = belt + braces + suspenders. When one layer fails, the others catch the bug.
+Save. Reload the page so the `disabled` attribute is back. Repeat the dev-tools-edit trick. Click the unbound button — *nothing happens*. The function guard caught it.
+
+This is the lesson the whole chapter rests on: **the UI guard is one layer; the function guard is another.** When one fails, the other catches. *That* is defence in depth.
+
+> **defence in depth** *(noun)* — a senior pattern: don't rely on one layer to prevent a bug; have two or three. UI guard + function guard + (later) database constraint + audit log = belt + braces + suspenders. When one layer fails, the others catch the bug.
 
 ---
 
@@ -944,6 +1033,23 @@ You also have the disposition that distinguishes engineers from people who took 
 
 ---
 
+## Lesson 6.8 — Recurring concepts from earlier chapters
+
+Chapter 6 leaned on essentially everything from Part I — that's intentional. Concretely:
+
+- **`$state(...)`** (Ch 1) — `habitsLoggedToday`.
+- **Functions returning `void`** (Ch 1) — `logHabit`, `unlogHabit`, `resetHabits`.
+- **`+=`, `-=`, `===`** (Ch 1).
+- **Early-return guards** (Ch 2) — `if (habitsLoggedToday <= 0) return;`.
+- **`disabled={cond}`** (Ch 3) — UI-side guard.
+- **Boolean operators / falsy** (Ch 3) — short-circuit understanding underlies every `disabled` expression.
+- **`bind:value`, ternary** (Ch 4) — the input wiring.
+- **`{#each}`, `class:`, scoped `<style>`** (Ch 5) — the day strip still renders.
+
+Sit with that. *Every* primitive you've learned is in this single page, working together. That's not coincidence — that's how senior code feels.
+
+---
+
 ## Glossary added in Chapter 6
 
 | Term | Definition |
@@ -952,6 +1058,7 @@ You also have the disposition that distinguishes engineers from people who took 
 | empty state | The UI shown when there's no data. |
 | three-state UI | The empty / populated / error trio. |
 | defence in depth | Multiple independent guards against the same bug. |
+| dev tools | Browser-built debugging panels (Elements, Console, Network, etc.). |
 
 ---
 
@@ -961,6 +1068,7 @@ You also have the disposition that distinguishes engineers from people who took 
 - [ ] Click it; the page transitions to the populated layout.
 - [ ] *Reset* / *Clear all* takes you back to the empty state.
 - [ ] You read your entire `+page.svelte` out loud, no notes, with confidence.
-- [ ] You added an `opacity: 0.5` past-days style in Chapter 5's exercise — and the day strip still looks right.
+- [ ] You did the dev-tools build-break-fix and saw the function guard catch the bypass.
+- [ ] (If you did Chapter 5's exercise) past days are faded; today is the bright pill.
 
 You're ready for Part II, where the counter becomes a *list* of named habits.
