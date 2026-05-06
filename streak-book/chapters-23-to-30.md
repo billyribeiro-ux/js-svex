@@ -32,11 +32,11 @@ function describe(state: RequestState<Habit[]>): string {
   if (state.status === 'error') {
     return `Error: ${state.message}`; // .message is available here
   }
-  return state.status; // 'idle' | 'loading'
+  return state.status; // narrowed to 'idle' | 'loading' — both literal strings, returned as-is
 }
 ```
 
-Read aloud: *"if the status is success, return the habit count. If it's error, return the error message. Otherwise return the status."*
+Read aloud: *"if the status is success, return the habit count. If it's error, return the error message. Otherwise return the status string itself ('idle' or 'loading')."*
 
 > **discriminated union** — a union of object types sharing a common literal field that lets the compiler tell them apart.
 >
@@ -76,7 +76,12 @@ Move the type to `src/lib/types.ts`:
 
 ```ts
 // src/lib/types.ts
-export type Habit = { /* ... */ };
+export type Habit = {
+  id: string;
+  name: string;
+  description?: string;
+  createdAt: number;
+};
 
 export type RequestState<T> =
   | { status: 'idle' }
@@ -171,6 +176,26 @@ export type BillingStatus =
 
 This will appear, unchanged, in Chapter 49.
 </details>
+
+---
+
+## Lesson 23.7 — Recurring concepts from earlier chapters
+
+- **Union types** (Ch 4, 14) — `RequestState` is a *discriminated* union.
+- **The four-state UI rule** (Ch 22) — formalised here as a real type.
+- **`switch` over a discriminator** — natural extension of `if/else if/else`.
+- **Type narrowing** (Ch 19) — what the compiler does when you check the discriminator.
+
+---
+
+## Lesson 23.8 — What you can now read in the wild
+
+After Chapter 23 you can:
+
+- Read **`type X = { kind: 'a' } | { kind: 'b'; ... }`** as a discriminated union.
+- Read **`switch (x.kind) { case 'a': ...; case 'b': ... }`** with full narrowing.
+- Read **`function assertNever(x: never): never`** as the exhaustiveness guard.
+- Spot non-exhaustive switches as compile-time bugs.
 
 ---
 
@@ -299,15 +324,37 @@ export function groupBy<T>(items: T[], getKey: (item: T) => string): Record<stri
   const result: Record<string, T[]> = {};
   for (const item of items) {
     const key = getKey(item);
-    result[key] ??= [];
-    result[key].push(item);
+    const bucket = result[key] ?? [];
+    bucket.push(item);
+    result[key] = bucket;
   }
   return result;
 }
 ```
 
-`Record<string, T[]>` is TypeScript shorthand for "an object whose keys are strings and whose values are `T[]`". The `result[key] ??= []` ensures the bucket exists before pushing.
+`Record<string, T[]>` is TypeScript shorthand for "an object whose keys are strings and whose values are `T[]`". 
+
+Why the explicit `bucket` variable? Because under `noUncheckedIndexedAccess`, `result[key]` has type `T[] | undefined` *every* time you read it — even after `??=` would have ensured it's an array. The compiler doesn't track that. Pulling the bucket into a `const` narrows once and lets us `push` without re-reading.
 </details>
+
+---
+
+## Lesson 24.6 — Recurring concepts from earlier chapters
+
+- **`Snippet<T>`** (Ch 20) — generic snippet types.
+- **Function-parameter destructuring** (Ch 10) — generics work alongside it.
+- **`{#each ... as ... (key)}`** (Ch 9) — the `extends { id: string }` constraint exists *because* of the keyed-each requirement.
+
+---
+
+## Lesson 24.7 — What you can now read in the wild
+
+After Chapter 24 you can:
+
+- Read **`function f<T>(x: T)`** and **`<T extends Foo>`**.
+- Read **`<script lang="ts" generics="T">`** in a Svelte component.
+- Read **`Snippet<[T]>`** and infer T from the call site.
+- Read advanced forms like **`<T, K extends keyof T>`** for type-safe property access.
 
 ---
 
@@ -450,6 +497,24 @@ What's `HTTP_STATUSES.ok`'s type?
 **The English sentence first:**
 
 > *"Define `BILLING_PLANS` as `as const` with `'free' | 'pro' | 'team'` and derive a `BillingPlan` type. Add a `plan: BillingPlan` field to a future `User` type."*
+
+---
+
+## Lesson 25.7 — Recurring concepts from earlier chapters
+
+- **String union types** (Ch 14) — `'primary' | 'secondary'` is the same idea, derived automatically.
+- **Type-shared in `$lib/types`** (Ch 14) — `HABIT_CATEGORIES` and `HabitCategory` live alongside `Habit`.
+
+---
+
+## Lesson 25.8 — What you can now read in the wild
+
+After Chapter 25 you can:
+
+- Read **`as const`** on object/array literals and explain the literal narrowing.
+- Read **`readonly T[]`** in function signatures and know it's a no-mutation guarantee.
+- Read **`obj satisfies Type`** vs **`obj: Type`** and pick correctly.
+- Read **`(typeof X)[number]`** and **`keyof typeof X`** as type-extraction patterns.
 
 ---
 
@@ -623,6 +688,25 @@ export function parseHabits(input: unknown): Habit[] {
 
 ---
 
+## Lesson 26.8 — Recurring concepts from earlier chapters
+
+- **Optional fields `?`** (Ch 9) — described in `parseHabit`'s description and category.
+- **`as const` lookup** (Ch 25) — `HABIT_CATEGORIES.includes(...)` validates against the frozen list.
+- **Guard clauses** (Ch 2) — every check returns null on failure; the happy path is at the bottom.
+
+---
+
+## Lesson 26.9 — What you can now read in the wild
+
+After Chapter 26 you can:
+
+- Read **`function f(x: unknown)`** and explain why we don't write `any`.
+- Read **`if (typeof x === 'string')`**, **`Array.isArray(x)`**, **`x instanceof Date`** as narrowing predicates.
+- Read **`function isFoo(x: unknown): x is Foo`** as a custom type guard.
+- Spot a missing boundary parser as a security/correctness gap.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] `parseHabit.ts` exists and is exported.
@@ -788,6 +872,24 @@ The function's *return type* tells the caller *exactly* what failures can happen
 
 ---
 
+## Lesson 27.7 — Recurring concepts from earlier chapters
+
+- **Discriminated unions** (Ch 23) — `Result<T, E>` is exactly one (`{ ok: true; value: T } | { ok: false; error: E }`).
+- **String unions for errors** — `'name-empty' | 'name-taken'` instead of `string`.
+- **Boundary parser** (Ch 26) — refactored to return `Result` for richer error info.
+
+---
+
+## Lesson 27.8 — What you can now read in the wild
+
+After Chapter 27 you can:
+
+- Read **`type X = string & { readonly __brand: 'X' }`** as a branded primitive.
+- Read **`Result<T, E>`** and the `ok()` / `err()` constructors.
+- Tell when to **`throw`** (programmer error) vs **return `Result.err`** (caller-handles-this).
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] `HabitId` and `UserId` are branded; you can no longer mix them.
@@ -845,18 +947,20 @@ class Counter {
 const c = new Counter(5); // value starts at 5
 ```
 
-You can also use TypeScript's parameter properties:
+You can also use TypeScript's parameter properties for fields that *aren't* reactive:
 
 ```ts
 class Counter {
-  value: number;
+  value = $state(0);
   constructor(public readonly initial: number = 0) {
-    this.value = $state(initial);
+    this.value = initial;
   }
 }
 ```
 
-`public readonly initial: number` declares-and-assigns in one line.
+`public readonly initial: number` declares-and-assigns in one line — `initial` is a non-reactive frozen field.
+
+> **A subtlety with `$state` in classes.** `$state(...)` must be on the *field declaration*, not assigned in the constructor body. `this.value = $state(0)` inside a constructor would assign a plain number to a non-reactive field. Always declare reactive fields at the class top: `value = $state(0)`. Then the constructor *reassigns* it (`this.value = initial`), which works because `value` is already reactive.
 
 ---
 
@@ -898,6 +1002,25 @@ export class Toggle {
 
 ---
 
+## Lesson 28.5 — Recurring concepts from earlier chapters
+
+- **`$state(...)`** (Ch 1) — the same rune, now on a class field.
+- **Encapsulation via `#private`** — invariants enforced by visibility.
+- **Methods returning `void`** (Ch 1) — same convention applies.
+
+---
+
+## Lesson 28.6 — What you can now read in the wild
+
+After Chapter 28 you can:
+
+- Read **`class X { value = $state(0); ... }`** as a reactive class.
+- Read **`new X()`** and **`x.method()`** with full type inference.
+- Read **`#field`** as truly private state.
+- Spot the *"`$state` only on field declarations, not in constructors"* gotcha.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] You wrote a class with `$state` fields.
@@ -922,10 +1045,11 @@ import { habitId, ok, err, type Habit, type HabitId, type Result } from '$lib/ty
 export class HabitStore {
   habits = $state<Habit[]>([]);
 
-  add(name: string): Result<Habit, 'empty' | 'duplicate'> {
+  add(name: string): Result<Habit, 'empty'> {
     const trimmed = name.trim();
     if (trimmed === '') return err('empty');
-    if (this.habits.some((h) => h.name === trimmed)) return err('duplicate');
+    // Duplicates are *allowed* — each habit has a unique id, and the user may genuinely
+    // want to track "Read" twice (e.g. morning vs evening). We do not enforce uniqueness.
     const habit: Habit = {
       id: habitId(crypto.randomUUID()),
       name: trimmed,
@@ -1001,6 +1125,26 @@ This creates *one shared instance* across the entire process. On a server, that'
 Senior rule: **stores are instantiated per request / per component tree, never globally.** We'll formalise per-request stores via context in Chapter 32.
 
 > **SSR-singleton landmine** — sharing state across users by mistake when running on a server.
+
+---
+
+## Lesson 29.4 — Recurring concepts from earlier chapters
+
+- **Classes with `$state`** (Ch 28) — the foundation of `HabitStore`.
+- **`Result<T, E>`** (Ch 27) — every fallible method returns one.
+- **Branded types** (Ch 27) — `HabitId` keeps habit-IDs distinct from user-IDs.
+- **Getters** — `get count()` is a reactive read computed each access.
+
+---
+
+## Lesson 29.5 — What you can now read in the wild
+
+After Chapter 29 you can:
+
+- Read a **class-based reactive store** in a `.svelte.ts` module.
+- Pass a class instance as a prop and let the child read its reactive fields.
+- Spot the **SSR-singleton landmine** in a code review.
+- Pick between **per-component-tree stores** (via context, Ch 32) and **plain class instances**.
 
 ---
 
@@ -1144,19 +1288,50 @@ The senior fix: always integer cents.
 <details>
 <summary>Worked answer (sketch)</summary>
 
+In `src/lib/money.ts` (add at the bottom):
+
 ```ts
+import { ok, err, type Result } from '$lib/types';
+
 export function parseCents(input: string): Result<Cents, 'invalid'> {
   const trimmed = input.trim();
   if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) return err('invalid');
-  const [whole, fraction = ''] = trimmed.split('.');
+  const [whole = '0', fraction = ''] = trimmed.split('.');
   const padded = (fraction + '00').slice(0, 2);
   const total = Number(whole) * 100 + Number(padded);
   return ok(cents(total));
 }
 ```
 
+The `[whole = '0', fraction = '']` defaults guard against `noUncheckedIndexedAccess` (Ch 7) — `split('.')` returns `string[]`, so each slot is `string | undefined`. We default both.
+
 We'll write a property-based test for this in Chapter 58.
 </details>
+
+---
+
+## Lesson 30.8 — Recurring concepts from earlier chapters
+
+Part IV's spine, in one place:
+
+- **Discriminated unions** (Ch 23) — `RequestState`, `Result`, future `BillingStatus`.
+- **Generics** (Ch 24) — `Result<T, E>`, `<List>`, `groupBy`.
+- **`as const` / `readonly` / `satisfies`** (Ch 25) — used by `HABIT_CATEGORIES`.
+- **Boundary parsing** (Ch 26) — `parseHabit` from `unknown`.
+- **Branded types + `Result`** (Ch 27) — `HabitId`, `UserId`, `Cents`.
+- **Classes with `$state`** (Ch 28, 29) — `HabitStore`.
+- **The `Money` module** (Ch 30) — `Cents`, `formatCents`, `applyBps`, `splitCents`, `parseCents`.
+
+---
+
+## Lesson 30.9 — What you can now read in the wild
+
+After Part IV you can:
+
+- Read most of a senior TypeScript codebase line-by-line: discriminated unions, generics, branded types, `Result` returns, class-based reactive stores.
+- Spot a missing boundary parser and add one.
+- Spot floats used for money and rewrite as integer cents.
+- Pass type-checked, branded values across module boundaries with confidence.
 
 ---
 
