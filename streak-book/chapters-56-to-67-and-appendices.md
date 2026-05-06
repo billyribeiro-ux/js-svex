@@ -2874,46 +2874,372 @@ After Chapter 63 you can:
 
 # Chapter 64 — Public REST API, emails, cron
 
-## Lesson 64.1 — REST versioning
+> *Today's job:* Streak has a versioned public REST API at `/api/v1/*` documented in OpenAPI; signups send a real verification email via Resend; a daily cron job sends streak-reminders. *Visible win:* `curl -H "Authorization: Bearer pat_..." https://streak.example.com/api/v1/habits` returns JSON; signing up triggers a real email; tomorrow at 09:00 UTC, cron fires.
 
-```
-/api/v1/habits        GET (list), POST (create)
-/api/v1/habits/[id]   GET (one), PATCH (update), DELETE
-```
+This is the operational tail of Streak — the last set of capabilities before the principal-engineer chapter and graduation.
 
 ---
 
-## Lesson 64.2 — Personal access tokens
+## Lesson 64.1 — REST API design
+
+| Path | Method | Purpose |
+|---|---|---|
+| `/api/v1/habits` | `GET` | List habits (paginated) |
+| `/api/v1/habits` | `POST` | Create a habit |
+| `/api/v1/habits/[id]` | `GET` | Read one habit |
+| `/api/v1/habits/[id]` | `PATCH` | Update a habit |
+| `/api/v1/habits/[id]` | `DELETE` | Delete a habit |
+
+Senior conventions:
+
+- **Version in the path** (`/v1/`). Easier to reason about than headers; cache-friendly.
+- **Cursor-based pagination**, never offset. Cursors don't shift when items are inserted/deleted between pages.
+- **`PATCH` for partial updates**, `PUT` reserved for full replacement (we use `PATCH` here).
+- **Plural resource names** (`/habits`, not `/habit`).
+- **Lowercase paths**, hyphens not underscores (`/habit-categories`, not `/habitCategories`).
+
+> **cursor pagination** — pass back a `cursor` token; client sends it on the next request. Stable across inserts/deletes. Offset pagination (`?page=3`) reorders items as the data shifts.
+
+---
+
+## Lesson 64.2 — Personal access tokens (PATs)
+
+API auth via short tokens the user generates in Settings. Show once, store hashed.
 
 ```ts
+// schema.ts additions
+import { pgTable, uuid, text, timestamp } from 'drizzle-orm/pg-core';
+
 export const personalAccessTokens = pgTable('personal_access_tokens', {
   id: uuid('id').primaryKey().defaultRandom(),
   userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   hashedToken: text('hashed_token').notNull().unique(),
   name: text('name').notNull(),
+  scopes: text('scopes').array().notNull().default([]),
   lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 ```
 
-Token shown once at creation: `pat_<base64>`. Stored hashed.
+Creation flow:
+
+```ts
+// src/lib/pat.ts
+import { randomBytes, createHash } from 'node:crypto';
+import { db } from '$lib/db/client';
+import { personalAccessTokens } from '$lib/db/schema';
+import { eq, and, gt, isNull } from 'drizzle-orm';
+
+const PREFIX = 'pat_';
+
+export function newPat(): { token: string; hash: string } {
+  const raw = randomBytes(32).toString('base64url');
+  const token = `${PREFIX}${raw}`;
+  const hash = sha256(token);
+  return { token, hash };
+}
+
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
+
+export async function createPat(userId: string, name: string): Promise<{ token: string; id: string }> {
+  const { token, hash } = newPat();
+  const [row] = await db.insert(personalAccessTokens)
+    .values({ userId, name, hashedToken: hash })
+    .returning({ id: personalAccessTokens.id });
+  if (row === undefined) throw new Error('failed to insert PAT');
+  return { token, id: row.id };
+}
+
+export async function findUserByPat(token: string): Promise<string | null> {
+  if (!token.startsWith(PREFIX)) return null;
+  const hash = sha256(token);
+  const [row] = await db.select({ userId: personalAccessTokens.userId })
+    .from(personalAccessTokens)
+    .where(and(
+      eq(personalAccessTokens.hashedToken, hash),
+      // either no expiry, or expiry in the future
+    ))
+    .limit(1);
+  if (row === undefined) return null;
+
+  // touch lastUsedAt asynchronously (don't block the request on it)
+  void db.update(personalAccessTokens)
+    .set({ lastUsedAt: new Date() })
+    .where(eq(personalAccessTokens.hashedToken, hash));
+
+  return row.userId;
+}
+```
+
+We use `sha256` (not Argon2) for PATs because the token is high-entropy (256 bits) — the slow-hash defence against brute-force isn't needed when the input space is already astronomical. Argon2 is for *human-typed* passwords with low entropy.
+
+> **personal access token (PAT)** — a long random string the user creates and pastes into clients to authenticate API calls. Equivalent to a password but for machines.
 
 ---
 
-## Lesson 64.3 — RFC 7807 errors
+## Lesson 64.3 — RFC 7807 problem details
+
+The standardised error shape for JSON APIs:
 
 ```ts
-function problem(status: number, title: string, detail: string): Response {
-  return new Response(JSON.stringify({ type: 'about:blank', title, detail, status }), {
+// src/lib/api/errors.ts
+type Problem = {
+  type: string;
+  title: string;
+  status: number;
+  detail?: string;
+  instance?: string;
+};
+
+export function problem(status: number, title: string, detail?: string): Response {
+  const body: Problem = {
+    type: 'about:blank',
+    title,
+    status,
+    ...(detail !== undefined && { detail }),
+  };
+  return new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/problem+json' },
   });
 }
 ```
 
+Use across all API endpoints:
+
+```ts
+// inside any /api/v1/* handler:
+if (!user) return problem(401, 'Unauthorized', 'Missing or invalid token');
+if (!habit) return problem(404, 'Not Found', `No habit with id ${id}`);
+```
+
+> **RFC 7807** — IETF spec for JSON-shaped error bodies. Standard across mature APIs.
+
 ---
 
-## Lesson 64.4 — Resend for email
+## Lesson 64.4 — A complete `/api/v1/habits` endpoint
+
+```ts
+// src/routes/api/v1/habits/+server.ts
+import type { RequestHandler } from './$types';
+import { json } from '@sveltejs/kit';
+import * as v from 'valibot';
+import { db } from '$lib/db/client';
+import { habits } from '$lib/db/schema';
+import { eq, desc, lt, and } from 'drizzle-orm';
+import { findUserByPat } from '$lib/pat';
+import { problem } from '$lib/api/errors';
+import { addHabitForUser } from '$lib/habits-server';
+
+const PAGE_SIZE = 50;
+
+const ListQuery = v.object({
+  cursor: v.optional(v.string()),
+});
+
+const CreateBody = v.object({
+  name: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(100)),
+  description: v.optional(v.pipe(v.string(), v.maxLength(500))),
+});
+
+async function authUser(request: Request): Promise<string | Response> {
+  const auth = request.headers.get('authorization');
+  if (auth === null || !auth.startsWith('Bearer ')) {
+    return problem(401, 'Unauthorized', 'Missing Bearer token');
+  }
+  const token = auth.slice(7);
+  const userId = await findUserByPat(token);
+  if (userId === null) return problem(401, 'Unauthorized', 'Invalid token');
+  return userId;
+}
+
+export const GET: RequestHandler = async ({ request, url }) => {
+  const userId = await authUser(request);
+  if (userId instanceof Response) return userId;
+
+  const cursor = url.searchParams.get('cursor');
+  const cursorTime = cursor !== null ? Number(cursor) : null;
+  if (cursorTime !== null && !Number.isFinite(cursorTime)) {
+    return problem(400, 'Bad Request', 'Invalid cursor');
+  }
+
+  const where = cursorTime !== null
+    ? and(eq(habits.userId, userId), lt(habits.createdAt, new Date(cursorTime)))
+    : eq(habits.userId, userId);
+
+  const rows = await db.select()
+    .from(habits)
+    .where(where)
+    .orderBy(desc(habits.createdAt))
+    .limit(PAGE_SIZE + 1);
+
+  const hasMore = rows.length > PAGE_SIZE;
+  const page = hasMore ? rows.slice(0, PAGE_SIZE) : rows;
+  const last = page[page.length - 1];
+  const nextCursor = hasMore && last ? String(last.createdAt.getTime()) : null;
+
+  return json({
+    data: page,
+    cursor: nextCursor,
+  });
+};
+
+export const POST: RequestHandler = async ({ request }) => {
+  const userId = await authUser(request);
+  if (userId instanceof Response) return userId;
+
+  const raw: unknown = await request.json();
+  const parsed = v.safeParse(CreateBody, raw);
+  if (!parsed.success) {
+    return problem(400, 'Bad Request', parsed.issues[0]?.message ?? 'Invalid body');
+  }
+
+  const result = await addHabitForUser(userId, parsed.output.name);
+  if (!result.ok) return problem(409, 'Conflict', `Habit limit reached`);
+
+  return json({ id: result.value.id }, { status: 201 });
+};
+```
+
+Read aloud:
+
+| Line | Read aloud as |
+|---|---|
+| `authUser` returns `string \| Response` | *"Either a user-ID string (auth succeeded), or a Response object (auth failed and we want to return that response immediately)."* |
+| `if (userId instanceof Response) return userId;` | *"If auth returned a Response, short-circuit out."* |
+| `lt(habits.createdAt, new Date(cursorTime))` | *"Cursor pagination: 'less than the cursor's timestamp', plus desc ordering."* |
+| `rows.slice(0, PAGE_SIZE + 1)` then `hasMore` | *"Fetch one extra row; if we got it, there's another page."* |
+
+This is a real, runnable endpoint. Test it with `curl`:
+
+```bash
+TOKEN="pat_..."
+curl -H "Authorization: Bearer $TOKEN" https://streak.example.com/api/v1/habits
+curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"name": "Read"}' https://streak.example.com/api/v1/habits
+```
+
+---
+
+## Lesson 64.5 — OpenAPI spec
+
+`docs/openapi.yaml` (excerpt):
+
+```yaml
+openapi: 3.1.0
+info:
+  title: Streak API
+  version: 1.0.0
+servers:
+  - url: https://streak.example.com/api/v1
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Habit:
+      type: object
+      required: [id, name, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 100 }
+        description: { type: string, maxLength: 500 }
+        createdAt: { type: string, format: date-time }
+    HabitList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Habit' }
+        cursor:
+          type: string
+          nullable: true
+paths:
+  /habits:
+    get:
+      summary: List habits
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HabitList' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      summary: Create a habit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                description: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+```
+
+The contract test from Chapter 59 validates the live API against this spec. Drift is caught immediately.
+
+---
+
+## Lesson 64.6 — CORS
+
+If your API is going to be called from third-party browsers (a mobile app you don't control, a partner's web app), set CORS:
+
+```ts
+// inside any /api/v1/* handler:
+import { dev } from '$app/environment';
+
+const ALLOWED_ORIGINS = dev
+  ? ['*']
+  : ['https://streak.example.com', 'https://app.partner.com'];
+
+function corsHeaders(origin: string | null): HeadersInit {
+  if (origin === null) return {};
+  const allowed = ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes('*');
+  if (!allowed) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Max-Age': '86400',
+  };
+}
+
+export const OPTIONS: RequestHandler = async ({ request }) => {
+  return new Response(null, { status: 204, headers: corsHeaders(request.headers.get('origin')) });
+};
+```
+
+Allowlist explicitly. Wildcards are fine in dev; never in prod.
+
+---
+
+## Lesson 64.7 — Resend for email
 
 ```bash
 pnpm add resend
@@ -2927,126 +3253,674 @@ import { RESEND_API_KEY } from '$env/static/private';
 export const resend = new Resend(RESEND_API_KEY);
 ```
 
-Send:
+Sending:
 
 ```ts
-await resend.emails.send({
-  from: 'Streak <noreply@streak.example.com>',
-  to: user.email,
-  subject: 'Verify your email',
-  html: emailVerificationHtml(token),
-});
+// src/lib/mail/send.ts
+import { resend } from './client';
+import { logger } from '$lib/logger';
+
+const FROM = 'Streak <noreply@streak.example.com>';
+
+export async function sendVerificationEmail(to: string, link: string): Promise<void> {
+  const { error } = await resend.emails.send({
+    from: FROM,
+    to,
+    subject: 'Verify your email',
+    html: `
+      <p>Welcome to Streak.</p>
+      <p>Click to verify: <a href="${link}">${link}</a></p>
+      <p>This link expires in 24 hours.</p>
+    `,
+  });
+  if (error !== null && error !== undefined) {
+    logger.error({ err: error, to }, 'mail.failed.verify');
+    throw new Error('Email send failed');
+  }
+}
 ```
+
+To deliver to inboxes (not spam folders), set up SPF, DKIM, and DMARC records on your domain. Resend's dashboard walks you through it.
 
 ---
 
-## Lesson 64.5 — Cron via `vercel.json`
+## Lesson 64.8 — Email idempotency
+
+A user retries signup or a network blip causes a duplicate; the verification email shouldn't go out twice. Track sends:
+
+```ts
+export const emailSendLog = pgTable('email_send_log', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  recipient: text('recipient').notNull(),
+  kind: text('kind', { enum: ['verify', 'reminder', 'reset'] }).notNull(),
+  sentAt: timestamp('sent_at', { withTimezone: true }).notNull().defaultNow(),
+  // dedupe key: same (recipient, kind, contextId) won't re-send for an hour
+  dedupeKey: text('dedupe_key').notNull().unique(),
+});
+```
+
+Around the actual send:
+
+```ts
+export async function sendOnce(kind: string, dedupeKey: string, fn: () => Promise<void>): Promise<void> {
+  const inserted = await db.insert(emailSendLog)
+    .values({ recipient: '...', kind, dedupeKey })
+    .onConflictDoNothing()
+    .returning();
+  if (inserted.length === 0) return; // already sent
+  await fn();
+}
+```
+
+Senior pattern: emails to external providers are *external side effects* — Bible rule #12 applies.
+
+---
+
+## Lesson 64.9 — Cron via `vercel.json`
 
 ```json
 {
   "crons": [
-    { "path": "/api/cron/daily-reminders", "schedule": "0 9 * * *" }
+    { "path": "/api/cron/daily-reminders", "schedule": "0 9 * * *" },
+    { "path": "/api/cron/weekly-summary", "schedule": "0 14 * * 0" }
   ]
 }
 ```
 
-In the handler, check a shared secret in the `Authorization` header so randoms can't trigger cron.
+Cron expressions: minute / hour / day-of-month / month / day-of-week. `0 9 * * *` is "every day at 09:00 UTC".
+
+Handler:
+
+```ts
+// src/routes/api/cron/daily-reminders/+server.ts
+import type { RequestHandler } from './$types';
+import { error } from '@sveltejs/kit';
+import { CRON_SECRET } from '$env/static/private';
+import { sendOnce } from '$lib/mail/send';
+import { logger } from '$lib/logger';
+
+export const GET: RequestHandler = async ({ request }) => {
+  // Vercel sends `Authorization: Bearer <CRON_SECRET>` for crons.
+  const auth = request.headers.get('authorization');
+  if (auth !== `Bearer ${CRON_SECRET}`) error(401, 'Unauthorized');
+
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  // ... fetch users who haven't logged today, send reminders, with sendOnce(...)
+  logger.info({ date: today }, 'cron.daily-reminders.start');
+
+  // ... actual sending logic ...
+
+  logger.info({ date: today }, 'cron.daily-reminders.done');
+  return new Response('ok');
+};
+```
+
+The `Authorization` check is critical — without it, anyone hitting `/api/cron/daily-reminders` would trigger your cron. Bible rule #12 again: idempotency, dedupe, auth.
+
+> **CRON_SECRET** — random string set in Vercel env vars; Vercel uses it to authenticate cron invocations.
+
+---
+
+## Lesson 64.10 — Read this code
+
+```ts
+const auth = request.headers.get('authorization');
+if (auth !== `Bearer ${CRON_SECRET}`) error(401);
+```
+
+Two issues. Find them.
+
+<details>
+<summary>Answer</summary>
+
+1. **`auth !== \`Bearer ${CRON_SECRET}\`` is a non-constant-time comparison.** In theory, an attacker could time the comparison to leak characters of `CRON_SECRET` byte by byte. Use `crypto.timingSafeEqual` (Ch 44):
+
+```ts
+import { timingSafeEqual } from 'node:crypto';
+const expected = `Bearer ${CRON_SECRET}`;
+if (auth === null) error(401);
+const a = Buffer.from(auth);
+const b = Buffer.from(expected);
+if (a.length !== b.length || !timingSafeEqual(a, b)) error(401);
+```
+
+2. **No `null` check.** If `auth` is `null` (header missing), the `!==` is `true`, but a more explicit check tells the reader you thought about it.
+</details>
+
+---
+
+## Lesson 64.11 — Now you write it
+
+**The English sentence first:**
+
+> *"Add a `weekly-summary` cron that fires Sundays at 14:00 UTC. For each Pro user who logged at least one habit in the past 7 days, send a summary email with the count. Use `sendOnce` so a retry doesn't double-send."*
+
+<details>
+<summary>Worked answer (sketch)</summary>
+
+```ts
+// src/routes/api/cron/weekly-summary/+server.ts
+import type { RequestHandler } from './$types';
+import { error } from '@sveltejs/kit';
+import { CRON_SECRET } from '$env/static/private';
+import { db } from '$lib/db/client';
+import { users, habits, subscriptions } from '$lib/db/schema';
+import { and, eq, gte } from 'drizzle-orm';
+import { sendOnce } from '$lib/mail/send';
+import { resend } from '$lib/mail/client';
+
+export const GET: RequestHandler = async ({ request }) => {
+  if (request.headers.get('authorization') !== `Bearer ${CRON_SECRET}`) error(401);
+
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const weekKey = sevenDaysAgo.toISOString().slice(0, 10);
+
+  const proUsers = await db.select({ id: users.id, email: users.email })
+    .from(users)
+    .innerJoin(subscriptions, eq(subscriptions.userId, users.id))
+    .where(eq(subscriptions.plan, 'pro'));
+
+  for (const user of proUsers) {
+    const userHabits = await db.select()
+      .from(habits)
+      .where(and(eq(habits.userId, user.id), gte(habits.createdAt, sevenDaysAgo)));
+    if (userHabits.length === 0) continue;
+
+    await sendOnce(
+      'summary',
+      `weekly:${user.id}:${weekKey}`,
+      async () => {
+        await resend.emails.send({
+          from: 'Streak <hi@streak.example.com>',
+          to: user.email,
+          subject: `Your week: ${userHabits.length} habits`,
+          html: `<p>You logged ${userHabits.length} habits this week. Keep the streak.</p>`,
+        });
+      },
+    );
+  }
+
+  return new Response('ok');
+};
+```
+
+Idempotent (`sendOnce` keyed per user per week). Auth-gated. Logs not shown but should be added at start/end. Senior shape.
+</details>
+
+---
+
+## Lesson 64.12 — Recurring concepts from earlier chapters
+
+- **`+server.ts`** (Ch 33, 50) — REST endpoints same as webhook handlers.
+- **Valibot for input parsing** (Ch 41, 51) — every body parsed.
+- **`Result<T, E>`** (Ch 27) — `addHabitForUser` returns one; mapped to HTTP codes.
+- **Idempotency-keyed inserts** (Ch 50) — webhooks and email sends use the same dedupe pattern.
+- **`crypto.timingSafeEqual`** (Ch 44) — every secret comparison is constant-time.
+
+---
+
+## Lesson 64.13 — What you can now read in the wild
+
+After Chapter 64 you can:
+
+- Read **`/api/vN/...`** as a versioned REST API and tell good from bad versioning.
+- Read **cursor pagination** vs offset and explain the trade-off.
+- Read **PATs** with hashed-at-rest storage and SHA-256 (because tokens are high-entropy).
+- Read **RFC 7807 problem+json** error responses.
+- Read **OpenAPI 3.x** specs and trace a path-method to its handler.
+- Read **CORS preflight** handlers (`OPTIONS`).
+- Read **`vercel.json` cron** entries and explain the schedule.
+- Spot **non-constant-time secret comparisons** in cron handlers.
+
+---
+
+## Glossary added in Chapter 64
+
+| Term | Definition |
+|---|---|
+| cursor pagination | Token-based pagination stable across mutations. |
+| PAT | Personal access token; user-generated machine credential. |
+| RFC 7807 | Standard JSON shape for API error responses. |
+| OpenAPI | Spec format for documenting REST APIs (formerly Swagger). |
+| CORS | Cross-Origin Resource Sharing; browser policy for cross-domain requests. |
+| `vercel.json` crons | Vercel's scheduled-handler config. |
+| email idempotency | Track sends to prevent duplicates on retry. |
 
 ---
 
 ## End-of-chapter checkpoint
 
-- [ ] `/api/v1/habits` works with PAT auth.
-- [ ] Emails actually send.
-- [ ] Cron job fires.
+- [ ] `/api/v1/habits` GET + POST work with PAT auth.
+- [ ] `docs/openapi.yaml` exists and the contract test is green.
+- [ ] Real verification email arrives in your inbox after signup.
+- [ ] Daily-reminders cron handler exists and is auth-gated.
+- [ ] `email_send_log` dedupes a manually-replayed cron.
 
 ---
 
-# Chapter 65 — Code review, architecture, scaling, ADRs, boring tech
+# Chapter 65 — Code review, architecture, scaling, ADRs, the boring-tech doctrine
+
+> *Today's job:* you do a structured 600-line code review and produce a written report; you draft a one-page scaling plan for *"at 100k users, where does Streak break first?"*; you write ADR-001 explaining *"why Postgres, not Mongo."* *Visible win:* three artifacts in `docs/` that show principal-engineer-level thinking — the kind a hiring committee or a CTO would weight heavily.
+
+This is the chapter where *technical fluency* becomes *engineering judgment*. By the end, you can review code, plan capacity, and document decisions at staff/principal level.
+
+---
 
 ## Lesson 65.1 — The structured-review framework
 
-For every PR:
+A senior engineer reviews a PR through eight lenses, in order. Skip none. Each lens has its own concrete questions:
 
-| Category | Questions |
+| Lens | Questions to ask |
 |---|---|
-| Correctness | Does this match the spec? Off-by-one? Boundary conditions? |
-| Security | New attack surface? Inputs trusted? Secrets logged? |
-| Performance | New query without index? N+1? Bundle bloat? |
-| Maintainability | Names? Comments lying? Repeated logic that should be extracted? |
-| Accessibility | ARIA? Keyboard? Contrast? |
-| Observability | Errors logged? Metrics? Useful breadcrumbs? |
-| Tests | Unit + integration + e2e where appropriate? |
-| Docs | API change documented? Runbook updated? |
+| **Correctness** | Does this match the spec? Off-by-one? Boundary conditions (zero, one, max)? Race conditions? |
+| **Security** | New attack surface? Inputs validated? Secrets logged? Auth checks present? RBAC honored? |
+| **Performance** | New query without an index? N+1? Bundle bloat? Hot path with a sync I/O call? |
+| **Maintainability** | Names true? Comments match code? Repeated logic? Public API stable? |
+| **Accessibility** | ARIA labels? Keyboard navigation? Contrast? Screen-reader announcements? |
+| **Observability** | Errors logged? Metrics? Trace breadcrumbs? Useful at 3am? |
+| **Tests** | Unit + integration + e2e where appropriate? Tests aligned with the change's blast radius? |
+| **Docs** | API change in OpenAPI? Runbook updated? CHANGELOG mentions it? |
+
+The senior practice: **scan the diff once for shape (file count, lines, scope creep), then walk each lens.** Drop comments per lens with concrete suggestions, not vague concerns.
 
 ---
 
-## Lesson 65.2 — The 600-line PR fixture
+## Lesson 65.2 — Comment style
 
-A PR with planted bugs:
-- A SELECT-then-UPDATE (TOCTOU).
-- A console.log of `password`.
-- A new metric with raw user input as a label.
-- An `<img>` without width/height.
-- A `// O(1) lookup` comment on an O(n) implementation.
-- A `.catch(() => {})` swallow.
-- A migration that drops a column without a deprecation period.
-- An unbounded retry loop.
+Reviews live or die by tone. Senior comments:
 
-Reader writes a structured review naming each. Cite the Bible rule per finding.
-
----
-
-## Lesson 65.3 — Scaling plan
-
-*"At 100k users with 30 habits each, where does Streak break first?"*
-
-The reader works through:
-- DB connections (pool sizing).
-- Read vs write ratio (do we need read replicas?).
-- Query plans for the 10 hottest queries.
-- Hot tables that might need partitioning (audit_log).
-- Cache opportunities (immutable habit data).
-- Edge vs origin tradeoffs.
+- **Specific** — *"`xs[0]` is `T | undefined` under `noUncheckedIndexedAccess`. Either narrow with `if (xs[0] === undefined) return;` or use `xs.at(0)`."*
+- **Cite the rule** — *"Bible rule #11: SELECT-then-UPDATE is a TOCTOU. Replace with atomic `UPDATE … WHERE … RETURNING`."*
+- **Suggest, don't dictate** — *"Have you considered extracting `parseFooBody` so the integration tests can hit the validator directly?"*
+- **Use prefixes** to weight your comments:
+  - `BLOCKING:` — must fix before merge.
+  - `nit:` — nitpick; author can ignore without explanation.
+  - `consider:` — alternative for the author to weigh.
+  - `praise:` — yes, call out good code; reviewers who only criticise burn out the team.
 
 ---
 
-## Lesson 65.4 — ADR template
+## Lesson 65.3 — The 600-line PR fixture
 
+Below is a deliberately-flawed PR. **Read it carefully. Find every issue.** Don't peek at the answers.
+
+The PR description: *"Adds a `/admin/reset-password` route. Admin can paste a user email and trigger a password reset. The user gets a magic-link email."*
+
+```ts
+// src/routes/(app)/admin/reset-password/+page.server.ts
+import type { Actions } from './$types';
+import { db } from '$lib/db/client';
+import { users, passwordResets } from '$lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { sendResetEmail } from '$lib/mail/send';
+import { recordCounter } from '$lib/metrics';
+
+export const actions: Actions = {
+  default: async ({ request }) => {
+    const data = await request.formData();
+    const email = data.get('email') as string;
+    console.log(`Admin reset for ${email}, password was: ${data.get('admin_password')}`);
+
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    if (!user) return { success: true };
+
+    const existing = await db.select().from(passwordResets).where(eq(passwordResets.userId, user.id));
+    if (existing.length > 0) {
+      await db.delete(passwordResets).where(eq(passwordResets.userId, user.id));
+    }
+
+    const token = Math.random().toString(36).slice(2);
+    await db.insert(passwordResets).values({ userId: user.id, token, expiresAt: new Date(Date.now() + 86400000) });
+
+    recordCounter.inc({ kind: 'reset', email });
+
+    while (true) {
+      try {
+        await sendResetEmail(user.email, `https://streak.example.com/reset?t=${token}`);
+        break;
+      } catch (e) {
+        console.log('retrying email');
+      }
+    }
+
+    return { success: true };
+  },
+};
 ```
+
+```svelte
+<!-- src/routes/(app)/admin/reset-password/+page.svelte -->
+<script>
+  let { form } = $props();
+</script>
+
+<form method="POST">
+  <input name="email" type="text" />
+  <input name="admin_password" type="password" />
+  <button>Reset</button>
+</form>
+
+<img src="/admin-banner.png" />
+```
+
+```sql
+-- migrations/0042_drop_legacy_column.sql
+ALTER TABLE users DROP COLUMN legacy_email;
+```
+
+How many BLOCKING issues do you find? Take your time; write them down with citations.
+
+<details>
+<summary>The full review (12 BLOCKING + 4 nits)</summary>
+
+**BLOCKING:**
+
+1. **No auth check.** `/admin/reset-password` is in `(app)/admin/`, but the page itself doesn't call `requireRole(event, 'admin')`. We rely on `(app)/admin/+layout.server.ts`, but if that layout is missing or misconfigured, this leaks. Add an explicit `requireRole(event, 'admin')` in the action body. **Bible rule #19** (defence in depth).
+
+2. **`console.log` of `admin_password`.** Logs the admin's password to the console, which ships to the structured logger and from there to your log aggregator and possibly third parties. **Bible rule #15.** Remove.
+
+3. **`data.get('email') as string`.** `FormData.get` returns `string | File | null`. Casting blindly will yield `null` cast as `string` if the field is missing. Validate with Valibot. **Bible rule #3** (no `as` casts that lie).
+
+4. **Account enumeration.** The action returns `{ success: true }` immediately if user is missing — but the UI shows "Email sent" only if it didn't throw. An attacker could time the response to deduce which emails exist. Also: any visible error (unhandled exception) leaks "user does not exist." Make the path constant-time and behave identically. **Bible rule #19** + Ch 44 threat model.
+
+5. **`Math.random()` for the token.** Not cryptographically secure. Use `crypto.randomBytes(32).toString('base64url')`. Bible rule echo: never invent crypto.
+
+6. **SELECT-then-DELETE pattern.** Two queries instead of one atomic delete. Should be `db.delete(...).where(eq(passwordResets.userId, user.id))` directly — DELETE on no rows is a noop. The select wastes a round-trip. **Performance lens.**
+
+7. **Cardinality bomb in metrics.** `recordCounter.inc({ kind: 'reset', email })` — every email is a unique label. **Bible rule #14.** Drop the email; put it in the *log line*, not the metric.
+
+8. **Unbounded retry loop.** `while (true) ... sendResetEmail(...)` will spin forever if Resend is down. Catastrophic at scale. Bound the retries; back off; eventually fail loud. **Bible rule echo:** every external call needs a budget.
+
+9. **Email is not idempotent.** Hitting submit twice fires two emails. Use `sendOnce` from Ch 64 with a key like `reset:${user.id}:${date}`. **Bible rule #12.**
+
+10. **No audit row.** Admin actions on user accounts must `withAudit`. **Bible rule echo, Ch 47.**
+
+11. **No CSRF protection mentioned, but `admin_password` is in the form.** Why is the admin re-authing via a form field? Sessions exist. Re-auth should use the session's `fresh` flag (Ch 44), not a re-typed password through a form field — and definitely not unencrypted in form data being logged.
+
+12. **Migration drops a column with no deprecation period.** `ALTER TABLE users DROP COLUMN legacy_email;` — if any code still reads it, deploy breaks. **Bible rule #18:** migrations forward-only; column removals require a two-deploy dance (stop reading → next deploy drops). Also missing `IF EXISTS`.
+
+**nits:**
+
+1. **`<img src="/admin-banner.png" />`** — no `width`, `height`, or `alt`. **Bible rule #16** + accessibility.
+2. **`<input name="email" type="text" />`** — should be `type="email"`, with `autocomplete="email"`.
+3. **`<button>` has no `type`** — defaults to `type="submit"` inside a `<form>`, which is fine here, but **Bible rule #5** says always be explicit.
+4. **Action returns `{ success: true }` for "email sent" but doesn't communicate to the UI that the email actually went out.** No toast. Silent UX.
+
+The senior reviewer leaves all 16 comments in the PR. The BLOCKING ones must be fixed before merge; the nits are author's call.
+</details>
+
+---
+
+## Lesson 65.4 — Architecture diagrams
+
+A senior PR for any non-trivial change includes a Mermaid diagram in the description. Streak's full architecture, hand-drawn:
+
+```mermaid
+flowchart LR
+  Browser --> Vercel[Vercel Edge / Functions]
+  Vercel --> SK[SvelteKit handler]
+  SK --> Pool[PgBouncer pool]
+  Pool --> PG[(Postgres / Neon)]
+  SK --> Stripe[Stripe API]
+  SK --> Resend[Resend API]
+  SK --> R2[(Cloudflare R2)]
+  Stripe -- webhooks --> Vercel
+  Vercel -- cron --> SK
+  SK -. metrics .-> Prom[Prometheus]
+  SK -. logs .-> Logs[Log aggregator]
+  SK -. traces .-> OTel[OpenTelemetry collector]
+```
+
+When you propose a new external service, the diagram updates first, then the code. Review what's *drawn* before you review what's *coded*.
+
+---
+
+## Lesson 65.5 — Capacity planning math
+
+Back-of-envelope sizing. *"At 100k users with 30 habits each, where does Streak break first?"*
+
+**Storage:**
+- 100k users × 30 habits × ~200 bytes/habit = 600 MB. Postgres can handle that on the cheapest tier.
+- Audit log: ~5 events/user/day × 100k × 200 bytes = 100 MB/day. After a year, 36 GB. **First scaling problem: audit_log table partitioning** (Postgres declarative partitioning by month).
+
+**Traffic:**
+- 100k DAU × 5 sessions/day × 10 requests/session = 5M requests/day = ~60 RPS average, ~300 RPS peak (5× factor).
+- Each request: median ~50ms, p99 ~500ms.
+- 300 RPS × 50ms = 15 concurrent requests; 300 RPS × 500ms = 150 concurrent at p99. **Vercel's serverless scales horizontally; Postgres connections become the bottleneck.**
+
+**Database:**
+- Pooled URL allows ~500 concurrent connections.
+- 150 in-flight × ~3 queries/request = 450 in-use connections at p99 peak. **Margin is thin; connection-pool exhaustion is the next failure mode.**
+- Mitigation: read-only replica for `/api/v1/habits GET` traffic (high read volume; doesn't need primary).
+
+**External services:**
+- Stripe: rate-limited at 100 RPS by default. Streak's billing actions are <1 RPS. **No issue.**
+- Resend: free tier is 100 emails/day; paid is unlimited. At 100k users with daily reminders, that's 100k emails/day. **Need paid tier; need to batch.**
+
+**The summary** (drop into ADR-005 or a `docs/scaling.md`):
+
+> *At 100k users, the first three problems are (1) audit_log size — partition by month at 10 GB; (2) DB connection pool at 80% utilisation peaks — add a read replica for the API; (3) Resend pricing — move to paid tier and batch reminders. Storage and per-request latency are not a concern. Vercel scales horizontally; we don't hit a function-runtime ceiling at this size.*
+
+> **back-of-envelope** *(idiom)* — quick capacity math done from rough numbers, in the head or on a napkin. The senior pre-flight before optimising for problems that aren't real yet.
+
+---
+
+## Lesson 65.6 — ADRs (Architecture Decision Records)
+
+When you make a decision that constrains future work, write it down. The format:
+
+```markdown
 # ADR-NNN: <Decision>
 
-## Status
-Accepted | Rejected | Superseded by ADR-XXX
+- **Status:** Accepted | Rejected | Superseded by ADR-XXX
+- **Date:** YYYY-MM-DD
+- **Deciders:** @billy, @reviewer
 
 ## Context
-What forced the decision.
+What forced the decision. Constraints, prior art, time pressure, team skill, integrations.
 
 ## Decision
-What we chose.
+What we chose. One paragraph.
 
 ## Alternatives considered
-What we rejected, why.
+Each option, why we rejected it. Two or three.
 
 ## Consequences
-What this enables and constrains.
+What this enables. What it constrains. What we'll need to revisit and when.
+
+## References
+Links: prior PRs, vendor docs, prior art at other companies, blog posts.
 ```
 
-Reader writes ADR-001 for *"Why Postgres, not Mongo."*
+ADR-001 for Streak — *"Why Postgres, not Mongo"*:
+
+```markdown
+# ADR-001: Postgres as the primary datastore
+
+- **Status:** Accepted
+- **Date:** 2026-05-01
+- **Deciders:** @billy
+
+## Context
+Streak needs persistence for users, habits, sessions, subscriptions, audit_log,
+webhook_events. We need transactions (Stripe webhooks must update subscriptions
+and webhook_events atomically), foreign keys (cascading user→habits delete),
+and rich query power for stats/analytics. Tooling on May 2026 includes Drizzle
+(typed Postgres ORM), Neon (serverless Postgres), pgvector (future ML), and
+mature observability via `pg_stat_statements`.
+
+## Decision
+Use Postgres (Neon-hosted in production, Docker locally) as the primary
+datastore. Drizzle as the typed ORM.
+
+## Alternatives considered
+1. **MongoDB.** Rejected. Subscription updates + webhook dedupe both require
+   single-doc transactions across collections, which Mongo only added recently
+   and remains awkward. ACID semantics in Postgres are battle-tested.
+2. **Supabase.** Equivalent to Neon for our needs; Neon's branching model
+   (per-PR branches) is a sharper fit for our preview-deploy pipeline. We can
+   migrate later — Postgres-to-Postgres is straightforward.
+3. **SQLite + Litestream.** Tempting for solo-dev simplicity but the moment
+   we add a worker thread for cron and the Vercel functions can't share file
+   storage, the model breaks.
+
+## Consequences
+- **Enables:** atomic mutations (Bible rule #11), real foreign keys, structured
+  query plans via EXPLAIN, full-text search via `tsvector` if needed.
+- **Constrains:** every serverless function must use the pooled connection
+  string; some DDL (e.g. CREATE INDEX CONCURRENTLY) requires the unpooled URL
+  and a separate runner.
+- **Revisit:** if write throughput exceeds ~5k TPS sustained, consider Citus
+  or app-level sharding by user_id.
+
+## References
+- Neon docs: https://neon.tech/docs
+- Drizzle docs: https://orm.drizzle.team
+- "Postgres for Everything" — https://gist.github.com/cpursley/...
+```
+
+Senior habit: **decisions live longer than the people who made them.** The ADR is the artifact future-you can read in two years and remember why.
+
+> **ADR (Architecture Decision Record)** *(noun)* — a numbered, dated, blameless write-up of a non-trivial technical decision and its alternatives.
 
 ---
 
-## Lesson 65.5 — The boring-tech doctrine
+## Lesson 65.7 — The boring-tech doctrine
 
-Pick technologies whose failure modes are well-understood. Postgres > exotic-DB-of-the-month. Stripe > rolling your own payments. Boring is fast in 6 months, even when novel feels fast today.
+Dan McKinley's essay *"Choose Boring Technology"* (2015, still required reading) named the doctrine: **every team has a finite number of innovation tokens.** Spend them where they buy you the most. Use boring, well-understood tech everywhere else.
+
+Boring choices for Streak:
+- **Postgres** over Mongo / DynamoDB / FaunaDB.
+- **Stripe** over rolling your own payments.
+- **Resend** (or SendGrid / Postmark) over an in-house mail server.
+- **Vercel** over self-hosting on EC2.
+- **Drizzle** over a hand-rolled query builder.
+- **TypeScript-strict** over loose-mode-with-aspirations.
+
+Where to spend an innovation token: maybe Svelte 5 (a year old, lightly battle-tested in production but maturing fast). Maybe Drizzle (only ~3 years old as of 2026). The tokens are *deliberate* spending decisions, not accidents.
+
+> **innovation token** *(idiom, McKinley)* — a metaphorical resource. Each team has 3 to spend across all their tech choices. Spend a token = take on the cost of unfamiliar failure modes. Spend zero on the boring choices; spend strategically on the new ones.
+
+---
+
+## Lesson 65.8 — Read this code
+
+A code-review fragment:
+
+```ts
+// src/lib/cache.ts
+const cache = new Map<string, unknown>();
+export function memoize<T>(key: string, fn: () => T): T {
+  if (!cache.has(key)) cache.set(key, fn());
+  return cache.get(key) as T;
+}
+```
+
+Three issues a senior reviewer flags. Find them.
+
+<details>
+<summary>Answer</summary>
+
+1. **`cache as T` cast.** Bypasses type safety. The `Map` is `unknown`-valued; we trust it stores the right shape because of the `key`. But there's no enforcement. Fix with a generic-parameterised cache class or typed-key.
+
+2. **Module-scoped Map = SSR singleton landmine.** On a server, this map is shared across *all users*. If `key` includes user data, it leaks. **Bible rule echo, Ch 29.** Move to per-request via `event.locals` or context.
+
+3. **No eviction, no size cap.** Memory grows unboundedly. After a long-running deploy, this map could OOM the function. Use an LRU with a size cap (e.g. `lru-cache` package), or expire entries by TTL.
+
+A senior wouldn't merge this without all three addressed.
+</details>
+
+---
+
+## Lesson 65.9 — Now you write it
+
+**The English sentence first:**
+
+> *"Write ADR-002 explaining 'Why we use Resend, not Postmark or SendGrid.' Cover context (we need transactional email + occasional batch), the decision, two alternatives rejected, and consequences."*
+
+<details>
+<summary>Worked answer (one valid version)</summary>
+
+```markdown
+# ADR-002: Resend for transactional email
+
+- **Status:** Accepted
+- **Date:** 2026-05-03
+- **Deciders:** @billy
+
+## Context
+Streak needs transactional email (verification, password reset, weekly summary,
+daily reminders). At 100k users this is ~100k emails/day with bursts. We need:
+typed SDK (TS-strict alignment), DKIM/SPF/DMARC verification flow that's
+straightforward, audit trail of sends, deliverability comparable to incumbents.
+
+## Decision
+Use Resend as the email provider.
+
+## Alternatives considered
+1. **Postmark.** Excellent deliverability and mature; their TS SDK is older and
+   less ergonomic; pricing higher per-email at our volume. Rejected mainly on
+   developer experience parity with the rest of the stack.
+2. **SendGrid (Twilio).** Industry standard; SDK is clunky; Twilio's billing
+   surprises (deliverability problems → enforced segmented sending) caused
+   real outages at past employers. Rejected on operational concerns.
+3. **Self-host Postfix.** Two innovation tokens for an undifferentiated
+   capability. Rejected immediately.
+
+## Consequences
+- **Enables:** clean TS types, DKIM/SPF/DMARC instructions in the dashboard,
+  webhooks for bounces and complaints we can wire into our audit trail.
+- **Constrains:** vendor lock-in for the send API surface (mitigated: our
+  `sendOnce` wrapper isolates Resend behind a 4-line interface; swapping
+  takes a day).
+- **Revisit:** if deliverability drops below 98% to inbox, evaluate Postmark.
+```
+</details>
+
+---
+
+## Lesson 65.10 — Recurring concepts from earlier chapters
+
+- **Every Bible rule** — the review is the moment you cite them.
+- **`audit_log`** (Ch 47) — partitioning is the scaling endgame.
+- **`Result`, `unknown`, `noUncheckedIndexedAccess`** — the type-system reasons your reviews are short.
+- **Boring-tech doctrine** — the meta-rule that explains *why* the Bible exists at all.
+
+---
+
+## Lesson 65.11 — What you can now read in the wild
+
+After Chapter 65 you can:
+
+- Walk a 600-line PR through eight review lenses and produce a structured comment list.
+- Read an ADR and tell good from cargo-cult.
+- Do back-of-envelope capacity math on any system size.
+- Read a Mermaid architecture diagram and spot what's missing.
+- Apply the **innovation-token** lens to *any* technology decision.
+
+---
+
+## Glossary added in Chapter 65
+
+| Term | Definition |
+|---|---|
+| structured review | Eight-lens code review with prefix-tagged comments. |
+| BLOCKING / nit / consider / praise | Comment-prefix conventions. |
+| Mermaid | Text-based diagram format embedded in Markdown. |
+| capacity planning | Back-of-envelope sizing for projected scale. |
+| ADR | Architecture Decision Record. |
+| boring-tech doctrine | McKinley: spend innovation tokens deliberately. |
+| innovation token | The cost of unfamiliarity in a tech choice. |
 
 ---
 
 ## End-of-chapter checkpoint
 
-- [ ] You wrote a 600-line review.
-- [ ] You wrote ADR-001.
-- [ ] You wrote a 1-page scaling plan.
+- [ ] You wrote the full review of the planted-PR fixture (12 BLOCKING + 4 nits).
+- [ ] `docs/adr/0001-postgres-over-mongo.md` exists.
+- [ ] `docs/adr/0002-resend.md` exists (or your equivalent).
+- [ ] `docs/architecture.md` has a Mermaid diagram of Streak's full topology.
+- [ ] `docs/scaling.md` has the back-of-envelope plan for 100k users.
 
 ---
 
