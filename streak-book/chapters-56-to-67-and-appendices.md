@@ -2117,7 +2117,13 @@ After Chapter 61 you can:
 
 # Chapter 62 — Deploying to Vercel, custom domains
 
-## Lesson 62.1 — adapter-vercel
+> *Today's job:* Streak is live at `streak.example.com` (or whatever you chose) with HTTPS, custom domain, real Postgres, real Stripe, real R2, real Resend. *Visible win:* you sign up on your own production URL with a real email.
+
+A senior engineer treats first deploy as the *easy* part. The hard part is everything that *follows* — the runbook, the rollback plan, the env-var rotation, the on-call expectation. We set those up at deploy time, not afterward.
+
+---
+
+## Lesson 62.1 — `@sveltejs/adapter-vercel`
 
 ```bash
 pnpm add -D @sveltejs/adapter-vercel
@@ -2126,41 +2132,268 @@ pnpm add -D @sveltejs/adapter-vercel
 ```ts
 // svelte.config.ts
 import adapter from '@sveltejs/adapter-vercel';
-export default {
-  kit: { adapter: adapter({ runtime: 'nodejs22.x' }) },
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+import type { Config } from '@sveltejs/kit';
+
+const config: Config = {
+  preprocess: vitePreprocess(),
+  kit: {
+    adapter: adapter({
+      runtime: 'nodejs22.x',
+      regions: ['iad1'], // pick the region closest to your DB
+      memory: 1024,
+      maxDuration: 30,
+    }),
+  },
 };
+
+export default config;
 ```
 
+Read aloud:
+
+| Field | Read aloud as |
+|---|---|
+| `runtime: 'nodejs22.x'` | *"Run as a Node.js 22 serverless function."* |
+| `regions: ['iad1']` | *"Pin the function to the us-east-1 region — same region as the Postgres."* |
+| `memory: 1024` | *"1 GB of RAM per invocation."* |
+| `maxDuration: 30` | *"Hard-cap any one request at 30 seconds."* |
+
+Pinning the region matters: if your function runs in `iad1` and your DB is in `eu-west-1`, every query crosses the Atlantic. Latency dies. Pick one region and stay there until you genuinely need geographic distribution.
+
 ---
 
-## Lesson 62.2 — Vercel project
+## Lesson 62.2 — Vercel project setup
 
-1. Push to GitHub.
-2. Import in Vercel.
-3. Set every env var (production + preview).
-4. Custom domain → DNS records → wait for cert.
-5. Enable HSTS preload (after a few weeks of HTTPS-only).
+1. **Push to GitHub.** The repo is already there.
+2. **Vercel → New Project → Import Git Repository.** Pick `streak`.
+3. **Framework preset: SvelteKit** — Vercel auto-detects.
+4. **Root directory: `./`**. Build command: `pnpm build`. Output: `.vercel/output` (auto).
+5. **Environment Variables** — paste from `.env`, but **per environment**: Production, Preview, Development. Set each:
+   - `DATABASE_URL` (production points to prod DB; preview points to a separate preview DB)
+   - `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `RESEND_API_KEY`, `R2_*`
+   - `PUBLIC_SITE_URL` (production: `https://streak.example.com`; preview: leave blank — Vercel auto-injects `VERCEL_URL`)
+6. **Deploy.** First build takes 60–120 s. You get a `.vercel.app` URL.
+7. Visit it. Sign up. Confirm.
 
 ---
 
-## Lesson 62.3 — Pre-launch checklist
+## Lesson 62.3 — Database hosting
+
+Two senior choices for serverless-friendly Postgres in May 2026:
+
+- **[Neon](https://neon.tech)** — branchable; per-PR Postgres branches. Pooler URL recommended for serverless.
+- **[Supabase](https://supabase.com)** — Postgres + auth + storage + realtime; you can use just the DB.
+
+Both expose a PgBouncer-style pooler URL. Use the **pooled** URL for serverless functions, not the direct one — Vercel's serverless runtime spins up many short-lived processes that would exhaust direct connections.
+
+Set `DATABASE_URL` to the *pooled* URL. Apply migrations against the *unpooled* URL (some DDL statements don't work over PgBouncer):
+
+```bash
+DATABASE_URL=$UNPOOLED_URL pnpm db:migrate
+```
+
+> **connection pooler** *(noun)* — a process that maintains a pool of long-lived connections to Postgres and lets short-lived clients (serverless functions) borrow them. Without one, serverless apps hit Postgres's `max_connections` limit fast.
+
+---
+
+## Lesson 62.4 — Custom domain and DNS
+
+Buy a domain (Namecheap, Cloudflare, wherever). In Vercel project settings → Domains → Add `streak.example.com`. Vercel gives you the DNS records:
+
+- `A` record on `streak.example.com` → `76.76.21.21` (Vercel's anycast IP), or
+- `CNAME` on `www.streak.example.com` → `cname.vercel-dns.com`.
+
+Add at your DNS provider. Wait 5–60 minutes for propagation. Vercel auto-provisions a Let's Encrypt cert.
+
+Once HTTPS works, **wait two weeks** with HSTS active (you set the header in Ch 48 already). Then submit to **HSTS preload**:
+
+```
+https://hstspreload.org/?domain=streak.example.com
+```
+
+Once accepted, every major browser will refuse HTTP for your domain *forever*. Don't preload until you're sure HTTPS is solid; the preload list is hard to leave.
+
+---
+
+## Lesson 62.5 — The pre-launch checklist
 
 `docs/checklists/launch.md`:
 
+```markdown
+# Streak — Launch Checklist
+
+## Infrastructure
+- [ ] All env vars set in production *and* preview (boot validator confirms)
+- [ ] DB pooler URL used for `DATABASE_URL`
+- [ ] DB migrations applied to production
+- [ ] DB backup schedule confirmed (Neon auto-snaps; verify retention)
+- [ ] Stripe webhook endpoint registered with prod URL + signing secret
+- [ ] R2 bucket created; CORS configured for the production origin
+- [ ] Resend domain verified (SPF + DKIM + DMARC records)
+
+## Security
+- [ ] All security headers present (`pnpm security:headers` against prod)
+- [ ] HSTS preload submitted (after 2 weeks HTTPS-only)
+- [ ] CSP audited; no `'unsafe-inline'` for scripts
+- [ ] Rate-limits live on `/login` and `/signup`
+
+## Observability
+- [ ] Logger DSN active (Sentry or chosen vendor)
+- [ ] Request IDs in every log line
+- [ ] Vercel Analytics enabled
+- [ ] On-call rotation defined (even if it's just you for now)
+- [ ] Status page or runbook bookmark
+
+## Content
+- [ ] `robots.txt` allows what it should; disallows `/app/`, `/admin/`
+- [ ] `sitemap.xml` validates (https://www.xml-sitemaps.com/validate-xml-sitemap.html)
+- [ ] OpenGraph image renders correctly when the URL is shared
+- [ ] Lighthouse: marketing pages 100/100/100/100
+
+## API
+- [ ] OpenAPI spec matches `/api/v1/*` (contract tests green)
+- [ ] CORS allowlist for the API matches expected callers
+
+## Operations
+- [ ] Rollback runbook current (`docs/runbooks/rollback.md`)
+- [ ] Secret-rotation runbook current (`docs/runbooks/secret-rotation.md`)
+- [ ] DB-restore runbook drafted
+
+## Sign-off
+- [ ] You signed up on production with a real email; everything works.
 ```
-- [ ] All env vars set in production
-- [ ] Stripe webhook URL updated to prod URL
-- [ ] DB migrations applied
-- [ ] Sentry DSN active (or chosen logger)
-- [ ] Rate-limits enabled
-- [ ] robots.txt allows what it should
-- [ ] sitemap.xml validates
-- [ ] Lighthouse on / is 100/100/100/100
-- [ ] OpenAPI spec matches /api/v1/*
-- [ ] Backup strategy documented
-- [ ] Rollback runbook current
-- [ ] On-call rotation defined (even if it's just you)
+
+The checklist is a *contract*. Going live before every box is ticked is how teams ship Friday-night incidents.
+
+---
+
+## Lesson 62.6 — First deploy ceremony
+
+The literal sequence:
+
+1. **PR is green.** All CI jobs passed.
+2. **Tag a release.** `git tag v0.1.0 && git push origin v0.1.0` (or let `release-please` do it).
+3. **Merge to main.** Vercel deploys to production.
+4. **Smoke test.** Visit the production URL. Sign up. Log a habit. Logout. Login. Add a Stripe Pro subscription with the test card. Verify the webhook fired.
+5. **Watch logs for 5 minutes.** Vercel → Logs → confirm no errors in the request stream.
+6. **Tweet about it.** Optional but earned.
+
+Senior habit: **don't ship Friday afternoon.** Ship Tuesday morning when you have the rest of the day to fix anything that breaks.
+
+---
+
+## Lesson 62.7 — Rollback runbook
+
+`docs/runbooks/rollback.md`:
+
+```markdown
+# Rollback runbook
+
+Triggered when production is broken and a fix-forward isn't fast.
+
+## 1. Promote the previous deployment in Vercel
+- Vercel dashboard → Deployments → find the last green deployment → "..." → Promote to Production.
+- This takes ~30 seconds; users see no downtime.
+
+## 2. Verify
+- Open the production URL.
+- Log in; verify the broken behaviour is gone.
+- Check `/api/v1/health` returns 200.
+
+## 3. Communicate
+- If users were impacted >5 minutes, post in #status (or your status page).
+- Open a GitHub issue tagged `incident`.
+
+## 4. Post-mortem
+- Within 24h, write a blameless post-mortem (template: `docs/post-mortems/_template.md`).
+- Land a fix forward; add a regression test.
 ```
+
+Test the rollback once *before* you need it. Senior pattern: **the runbook you've never tested doesn't work.**
+
+---
+
+## Lesson 62.8 — Read this code
+
+```ts
+// svelte.config.ts
+adapter: adapter({ runtime: 'edge' }),
+```
+
+When is this *wrong* for Streak?
+
+<details>
+<summary>Answer</summary>
+
+`runtime: 'edge'` runs your function on Vercel's edge network — closer to users, but with a *different runtime* (Cloudflare Workers, V8 isolates) that doesn't support Node-only APIs.
+
+Streak uses:
+- **`@node-rs/argon2`** — native Node binding, doesn't run on edge.
+- **`postgres-js`** — uses Node's `net` module.
+- **Worker threads** — Node-only.
+
+Edge runtime would silently break all three. We use `'nodejs22.x'` for Streak. `'edge'` is right for *some* read-heavy GET handlers (geo-aware redirects, content-only marketing pages); we'd opt in per-route via page-level `export const config = { runtime: 'edge' }`.
+</details>
+
+---
+
+## Lesson 62.9 — Now you write it
+
+**The English sentence first:**
+
+> *"Add a `/api/v1/health` endpoint that returns 200 + a JSON body with `{ ok: true, version, time }` — used by the rollback runbook to verify a deployment."*
+
+<details>
+<summary>Worked answer</summary>
+
+```ts
+// src/routes/api/v1/health/+server.ts
+import type { RequestHandler } from './$types';
+import { json } from '@sveltejs/kit';
+
+const VERSION = process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? 'dev';
+
+export const GET: RequestHandler = () => {
+  return json({ ok: true, version: VERSION, time: new Date().toISOString() });
+};
+```
+
+`VERCEL_GIT_COMMIT_SHA` is auto-injected by Vercel — gives you a commit SHA in the response so you can verify *which* version is live. Bookmark `https://streak.example.com/api/v1/health` and refresh after every deploy.
+</details>
+
+---
+
+## Lesson 62.10 — Recurring concepts from earlier chapters
+
+- **Boot validator** (Ch 57) — the deploy fails fast if any env var is wrong.
+- **Security headers** (Ch 48) — applied at the edge via `handle`.
+- **HSTS preload** — the two-week soak is the senior caution.
+- **The runbook discipline** (Ch 57) — secret rotation and rollback both shipped before launch.
+
+---
+
+## Lesson 62.11 — What you can now read in the wild
+
+After Chapter 62 you can:
+
+- Read **`adapter-vercel`** options (`runtime`, `regions`, `memory`, `maxDuration`).
+- Read **a launch checklist** and tell what's missing.
+- Read **`docs/runbooks/*.md`** as senior operational artifacts.
+- Tell **edge from node** runtimes and pick correctly per-route.
+- Spot **direct DB connections in serverless** as a connection-exhaustion bug waiting.
+
+---
+
+## Glossary added in Chapter 62
+
+| Term | Definition |
+|---|---|
+| `adapter-vercel` | SvelteKit adapter that builds for Vercel's serverless runtime. |
+| connection pooler | Process that lends DB connections to short-lived clients. |
+| HSTS preload | Permanent HTTPS-only listing in browsers. |
+| smoke test | Quick post-deploy manual verification. |
+| rollback runbook | Documented steps to revert a bad deploy. |
 
 ---
 
@@ -2168,12 +2401,23 @@ export default {
 
 - [ ] Streak is live at a real URL.
 - [ ] You signed up on your own production site.
+- [ ] HSTS preload submitted (2 weeks after launch).
+- [ ] Rollback runbook tested at least once.
+- [ ] `/api/v1/health` returns the deployed commit SHA.
 
 ---
 
-# Chapter 63 — Observability — logs, metrics, traces, on-call
+# Chapter 63 — Observability — structured logs, metrics, traces, on-call
 
-## Lesson 63.1 — Structured logger
+> *Today's job:* every request emits a structured JSON log line with a request ID; Prometheus metrics expose latency + traffic + errors with bounded labels; you read a 200-line log dump and find a planted bug. *Visible win:* you point at a `p99 > 2s` line on a Grafana panel and trace it back through the request ID to the slow query.
+
+The on-call engineer's mindset — *"the user said it's broken; my gates are green; my gates must be insufficient"* — is what this chapter installs.
+
+---
+
+## Lesson 63.1 — Why structured
+
+`console.log('error: ' + message)` is *unstructured*. Greppable for a short string, useless for filtering by user, route, severity, or time window. **Structured logs are JSON, one object per line.**
 
 ```bash
 pnpm add pino
@@ -2183,41 +2427,130 @@ pnpm add pino
 // src/lib/logger.ts
 import pino from 'pino';
 
-const SENSITIVE = ['password', 'passwordHash', 'token', 'cookie', 'sessionToken', 'authorization'];
+const SENSITIVE = [
+  'password',
+  'passwordHash',
+  'password_hash',
+  'token',
+  'cookie',
+  'sessionToken',
+  'authorization',
+  'authHeader',
+  'stripeSignature',
+  'creditCard',
+  'cvv',
+  'ssn',
+  '*.password',
+  '*.passwordHash',
+  '*.token',
+];
 
 export const logger = pino({
   level: process.env.LOG_LEVEL ?? 'info',
-  redact: {
-    paths: SENSITIVE,
-    remove: true,
+  base: {
+    app: 'streak',
+    env: process.env.NODE_ENV ?? 'development',
+    version: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? 'dev',
+  },
+  redact: { paths: SENSITIVE, remove: true },
+  timestamp: pino.stdTimeFunctions.isoTime,
+  formatters: {
+    level: (label) => ({ level: label }),
   },
 });
 ```
+
+Read aloud:
+
+| Field | Read aloud as |
+|---|---|
+| `level` | *"Log level — info or above by default."* |
+| `base` | *"Every line includes app + env + commit SHA."* |
+| `redact: { paths: SENSITIVE, remove: true }` | *"For each path in the deny-list, delete the field entirely from the output."* |
+| `timestamp: ...isoTime` | *"ISO 8601 timestamps so log aggregators can sort."* |
+
+The `SENSITIVE` deny-list is the application of Bible rule #15. The `'*.password'` glob form catches `user.password`, `body.password`, etc. — anywhere the field shows up in a nested object.
+
+> **structured logging** *(noun)* — JSON-line logs with consistent fields. The format every modern aggregator (Datadog, Logflare, Better Stack, Grafana Loki) ingests directly.
 
 ---
 
 ## Lesson 63.2 — Request IDs
 
+The bridge between user complaint ("error ID `f3a1`") and operator query ("show me logs for `f3a1`"). Wire it in `handle`:
+
 ```ts
-// hooks.server.ts handle:
-const requestId = crypto.randomUUID();
-event.locals.requestId = requestId;
-const start = Date.now();
-const response = await resolve(event);
-response.headers.set('x-request-id', requestId);
-logger.info('request', {
-  requestId,
-  method: event.request.method,
-  path: event.url.pathname,
-  status: response.status,
-  durationMs: Date.now() - start,
-});
-return response;
+// src/hooks.server.ts (extended)
+import type { Handle } from '@sveltejs/kit';
+import { sequence } from '@sveltejs/kit/hooks';
+import { logger } from '$lib/logger';
+
+const logHandle: Handle = async ({ event, resolve }) => {
+  const requestId = event.request.headers.get('x-request-id') ?? crypto.randomUUID();
+  event.locals.requestId = requestId;
+
+  const start = Date.now();
+  const log = logger.child({ requestId });
+  event.locals.log = log;
+
+  let response: Response;
+  try {
+    response = await resolve(event);
+  } catch (err) {
+    log.error({ err }, 'request.failed');
+    throw err;
+  }
+
+  response.headers.set('x-request-id', requestId);
+  log.info({
+    method: event.request.method,
+    path: event.url.pathname,
+    status: response.status,
+    durationMs: Date.now() - start,
+    userId: event.locals.user?.id ?? null,
+  }, 'request');
+  return response;
+};
+
+export const handle = sequence(authHandle, logHandle /* , ... */);
 ```
+
+Read aloud: *"For every request, mint a request ID — or accept one from the upstream proxy. Attach it to a child logger. Time the response. Log the request line with method, path, status, duration, user. Echo the ID in the response header so the client can quote it."*
+
+Update `App.Locals` in `app.d.ts`:
+
+```ts
+declare global {
+  namespace App {
+    interface Locals {
+      user?: { id: string; email: string; role: 'user' | 'admin' };
+      requestId: string;
+      log: import('pino').Logger;
+    }
+  }
+}
+```
+
+Now any `event.locals.log.info(...)` inside actions, loads, or `+server.ts` handlers automatically carries the request ID. Senior pattern: **never pass `requestId` by hand** — let the request-scoped child logger do it.
 
 ---
 
-## Lesson 63.3 — Prometheus metrics with bounded labels
+## Lesson 63.3 — The four golden signals
+
+Google's SRE book named four signals every service must monitor:
+
+1. **Latency** — how long requests take (especially p50 and p99).
+2. **Traffic** — how many requests per second.
+3. **Errors** — what fraction fail.
+4. **Saturation** — how full the system is (CPU, memory, queue depth, DB pool).
+
+A senior dashboard has at least one panel for each. A senior alert fires when *any* of them crosses a threshold sustained across the alert window.
+
+> **p99 latency** — the 99th-percentile latency. *"99% of requests complete in under X ms."* The median (`p50`) lies about user experience; `p99` tells the truth.
+
+---
+
+## Lesson 63.4 — Prometheus metrics with bounded labels
 
 ```bash
 pnpm add prom-client
@@ -2235,56 +2568,307 @@ export const requestCounter = new Counter({
 
 export const requestLatency = new Histogram({
   name: 'streak_request_duration_seconds',
-  help: 'Request latency',
+  help: 'Request latency in seconds',
   labelNames: ['method', 'route'] as const,
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10],
 });
 
-const KNOWN_ROUTES = new Set(['/', '/login', '/signup', '/app/habits', '/billing']);
+export const dbQueryLatency = new Histogram({
+  name: 'streak_db_query_duration_seconds',
+  help: 'Database query latency',
+  labelNames: ['operation'] as const,
+  buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
+});
+
+// Bounded label set — never accept raw user input as a label.
+const KNOWN_ROUTES = new Set([
+  '/',
+  '/about',
+  '/pricing',
+  '/login',
+  '/signup',
+  '/dashboard',
+  '/billing',
+  '/admin/users',
+  '/api/v1/habits',
+  '/api/stripe/webhook',
+]);
 
 export function safeRouteLabel(path: string): string {
-  return KNOWN_ROUTES.has(path) ? path : 'other';
+  if (KNOWN_ROUTES.has(path)) return path;
+  // Collapse known dynamic shapes into a single bucket.
+  if (path.startsWith('/habits/')) return '/habits/[id]';
+  if (path.startsWith('/api/v1/habits/')) return '/api/v1/habits/[id]';
+  return 'other';
 }
 
 export function safeStatusClass(status: number): string {
-  return `${Math.floor(status / 100)}xx`;
+  return `${Math.floor(status / 100)}xx`; // 2xx, 3xx, 4xx, 5xx
 }
+
+export { register };
 ```
 
-The `safeRouteLabel` is the **bounded-label rule** applied — never feed raw user input as a label.
-
-Expose via `/metrics/+server.ts`:
+Wire metrics into the log handle:
 
 ```ts
-import { register } from 'prom-client';
-import type { RequestHandler } from './$types';
+import { requestCounter, requestLatency, safeRouteLabel, safeStatusClass } from '$lib/metrics';
 
-export const GET: RequestHandler = async () => {
-  return new Response(await register.metrics(), { headers: { 'content-type': register.contentType } });
-};
+// ... inside logHandle, after `response = await resolve(event)`:
+const route = safeRouteLabel(event.url.pathname);
+const statusClass = safeStatusClass(response.status);
+const durationS = (Date.now() - start) / 1000;
+
+requestCounter.inc({ method: event.request.method, route, status_class: statusClass });
+requestLatency.observe({ method: event.request.method, route }, durationS);
 ```
 
-(Gate it; only allow Prometheus scrapers.)
+Why the bounded-label discipline matters: Prometheus stores **one time series per unique label combination**. If you used the raw `path` as a label and a malicious actor hit `/abc-123-def`, `/abc-124-def`, `/abc-125-def`, ..., you'd grow a million time series in seconds. Memory blows up. Scrape fails. Alerting goes dark. Prod dies. **This is a real production-incident class** — Bible rule #14.
+
+> **cardinality explosion** *(noun)* — uncontrolled growth in unique time series due to high-cardinality labels. The single most common Prometheus failure mode in production.
 
 ---
 
-## Lesson 63.4 — Reading prod logs
+## Lesson 63.5 — Exposing `/metrics`
 
-The drill: a synthetic 200-line log dump with planted bugs. Reader spots:
-- a 500 spike at minute 12,
-- a missing `requestId` on one log line (bug),
-- a slow query (`durationMs > 1000`) recurring,
-- the missing audit-log-on-cancel bug.
+```ts
+// src/routes/_metrics/+server.ts
+import { error } from '@sveltejs/kit';
+import { register } from '$lib/metrics';
+import { METRICS_TOKEN } from '$env/static/private';
+import type { RequestHandler } from './$types';
 
-This is the chapter that produces the on-call mindset.
+export const GET: RequestHandler = async ({ request }) => {
+  // Gate with a shared token; only Prometheus scrapers should hit this.
+  const auth = request.headers.get('authorization');
+  if (auth !== `Bearer ${METRICS_TOKEN}`) error(401, 'Unauthorized');
+
+  return new Response(await register.metrics(), {
+    headers: { 'content-type': register.contentType },
+  });
+};
+```
+
+The `_metrics` route prefix (with leading underscore) is a senior convention for *"endpoint not for end users"*. Configure your Prometheus scraper to hit it with the bearer token:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: streak
+    metrics_path: /_metrics
+    bearer_token: "<METRICS_TOKEN value>"
+    static_configs:
+      - targets: ['streak.example.com']
+```
+
+---
+
+## Lesson 63.6 — OpenTelemetry tracing
+
+In May 2026, SvelteKit ships **experimental tracing** that auto-instruments `handle`, `load`, actions, and remote functions. Enable in `svelte.config.ts`:
+
+```ts
+const config: Config = {
+  kit: {
+    adapter: adapter(/* ... */),
+    experimental: {
+      tracing: { server: true },
+    },
+  },
+};
+```
+
+Add an OTLP exporter (or any compatible vendor):
+
+```bash
+pnpm add @opentelemetry/sdk-node @opentelemetry/exporter-trace-otlp-http @opentelemetry/auto-instrumentations-node
+```
+
+```ts
+// src/instrumentation.server.ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+
+const sdk = new NodeSDK({
+  serviceName: 'streak',
+  traceExporter: new OTLPTraceExporter({ url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+sdk.start();
+```
+
+Now every request produces a *trace* — a tree of spans showing how time was spent: handle → load → db.query → external.fetch → render. When p99 spikes, you click the slowest trace and see *exactly* which span ate the budget.
+
+> **trace** (in observability) *(noun)* — a tree of timed spans across one request. Distinguishes *"DB was slow"* from *"render was slow"* without guessing.
+
+Sample at 10% in production to keep cost reasonable. Senior heuristic: 100% sampling for first month after launch (you need the data); ramp down once dashboards are stable.
+
+---
+
+## Lesson 63.7 — Alerts — when to wake someone up
+
+A senior alert is **actionable, specific, and non-flaky**. Bad: *"errors > 0"*. Good: *"5xx error rate > 1% sustained for 5 minutes"*.
+
+Three pages-the-on-call alerts for Streak:
+
+1. **5xx rate > 1% over 5 min** — something's broken; the user notices.
+2. **p99 latency > 2s over 5 min** — degraded experience.
+3. **DB connection pool > 80% over 5 min** — saturation; an outage is approaching.
+
+Three *non-paging* alerts (open a ticket, don't wake anyone):
+
+1. **Successful signups < expected weekly average × 0.5** — funnel problem.
+2. **Webhook processing lag > 5 min** — Stripe is OK; we're behind.
+3. **Cert expiring in < 7 days** — renew it.
+
+> **alert fatigue** — when on-call ignores alerts because too many fire. The death of an observability culture. *Alerts must be rare and meaningful.*
+
+---
+
+## Lesson 63.8 — Reading a prod log dump
+
+Drill. Below is a synthetic 30-line log dump (real ones run thousands of lines; the principle's the same). Find the planted bugs.
+
+```
+{"level":"info","time":"2026-05-05T10:00:00Z","requestId":"a1","method":"GET","path":"/dashboard","status":200,"durationMs":42,"userId":"u1"}
+{"level":"info","time":"2026-05-05T10:00:01Z","requestId":"a2","method":"POST","path":"/dashboard?/addHabit","status":200,"durationMs":78,"userId":"u1"}
+{"level":"info","time":"2026-05-05T10:00:03Z","requestId":"a3","method":"GET","path":"/api/v1/habits","status":200,"durationMs":35,"userId":"u2"}
+{"level":"info","time":"2026-05-05T10:00:12Z","requestId":"a4","method":"POST","path":"/login","status":200,"durationMs":201,"userId":null}
+{"level":"info","time":"2026-05-05T10:01:33Z","requestId":"a5","method":"POST","path":"/login","status":429,"durationMs":3,"userId":null}
+{"level":"error","time":"2026-05-05T10:02:01Z","requestId":"a6","method":"POST","path":"/billing?/upgrade","status":500,"durationMs":10042,"userId":"u3","err":{"name":"Error","message":"Stripe checkout.sessions.create timed out"}}
+{"level":"error","time":"2026-05-05T10:02:14Z","requestId":"a7","method":"POST","path":"/billing?/upgrade","status":500,"durationMs":10039,"userId":"u4","err":{"name":"Error","message":"Stripe checkout.sessions.create timed out"}}
+{"level":"error","time":"2026-05-05T10:02:25Z","requestId":"a8","method":"POST","path":"/billing?/upgrade","status":500,"durationMs":10044,"userId":"u5","err":{"name":"Error","message":"Stripe checkout.sessions.create timed out"}}
+{"level":"info","time":"2026-05-05T10:03:01Z","method":"GET","path":"/dashboard","status":200,"durationMs":51,"userId":"u1"}
+{"level":"info","time":"2026-05-05T10:04:00Z","requestId":"a9","method":"GET","path":"/dashboard","status":200,"durationMs":1840,"userId":"u9"}
+{"level":"info","time":"2026-05-05T10:04:12Z","requestId":"a10","method":"GET","path":"/dashboard","status":200,"durationMs":2105,"userId":"u9"}
+{"level":"info","time":"2026-05-05T10:04:30Z","requestId":"a11","method":"GET","path":"/dashboard","status":200,"durationMs":1998,"userId":"u9"}
+```
+
+What three problems do you spot?
+
+<details>
+<summary>Answer</summary>
+
+1. **Three 500s in a row at 10:02 (lines 6–8) all from `/billing?/upgrade` with the same Stripe-timeout error.** The 10s `durationMs` matches the `timeout: 10_000` we set in Ch 49. Stripe's API is degraded. Action: post a status update; consider a circuit breaker; check Stripe's status page.
+
+2. **Line 9 is missing `requestId`.** Every log line should have one (Lesson 63.2). This indicates a code path that bypasses the `logHandle` middleware — possibly a direct `console.log` someone forgot to remove. Action: grep for `console.log` in src/.
+
+3. **Lines 10–12: dashboard requests for user `u9` taking 1.8–2.1 seconds.** That's a tail-latency outlier — most are <100 ms. Action: check that user's data; do they have unusually many habits triggering an N+1 query? Add an `EXPLAIN ANALYZE` for that query.
+
+The senior on-call mindset: *every weird line is a signal*. You don't ignore them — you investigate or you file them.
+</details>
+
+---
+
+## Lesson 63.9 — Read this code
+
+```ts
+metrics.requestCounter.inc({
+  method: req.method,
+  route: req.url, // ❌
+  user_id: req.userId, // ❌
+});
+```
+
+Two cardinality bombs. Find them.
+
+<details>
+<summary>Answer</summary>
+
+1. **`route: req.url`** — the full URL includes query strings. `?q=foo`, `?q=bar`, `?q=...` each become unique label combinations. After a day, you have a million series.
+
+2. **`user_id: req.userId`** — every user is a unique label value. With 100k users, that's 100k series per other-label-combination. Cardinality death.
+
+The fix: `safeRouteLabel(pathname)` + drop `user_id` (it goes in *logs*, not *metrics*).
+</details>
+
+---
+
+## Lesson 63.10 — Now you write it
+
+**The English sentence first:**
+
+> *"Add a `streak_signups_total{plan}` counter that increments after every successful signup, with `plan` bounded to `{free, pro}`. Drop the user's email — that would be a cardinality bomb."*
+
+<details>
+<summary>Worked answer</summary>
+
+```ts
+// src/lib/metrics.ts (add)
+export const signupCounter = new Counter({
+  name: 'streak_signups_total',
+  help: 'Total successful signups',
+  labelNames: ['plan'] as const,
+});
+
+const KNOWN_PLANS = new Set(['free', 'pro']);
+
+export function safePlanLabel(plan: string): string {
+  return KNOWN_PLANS.has(plan) ? plan : 'unknown';
+}
+```
+
+In the signup action:
+
+```ts
+import { signupCounter, safePlanLabel } from '$lib/metrics';
+
+// ... after successful signup:
+signupCounter.inc({ plan: safePlanLabel('free') });
+event.locals.log.info({ userId: created.id }, 'signup');
+```
+
+Email goes in the **log line** (where it can be searched per-user); plan goes in the **metric** (where the bounded label is safe).
+</details>
+
+---
+
+## Lesson 63.11 — Recurring concepts from earlier chapters
+
+- **`crypto.randomUUID()`** (Ch 9) — every request mints one.
+- **Bible rule #14** — bounded label sets, applied as `safeRouteLabel`/`safePlanLabel`.
+- **Bible rule #15** — pino's `redact` paths apply the deny-list.
+- **`event.locals`** (Ch 45) — request-scoped logger lives there.
+
+---
+
+## Lesson 63.12 — What you can now read in the wild
+
+After Chapter 63 you can:
+
+- Read **`pino`** config with `redact`, `base`, `formatters`.
+- Read **`logger.child({ requestId })`** as the per-request scoping pattern.
+- Read **`Counter` / `Histogram` / `Gauge`** from prom-client and explain the difference.
+- Read a **Grafana dashboard** with the four golden signals.
+- Read an **OpenTelemetry trace** and identify the slow span.
+- Spot a **cardinality bomb** in unbounded metric labels.
+
+---
+
+## Glossary added in Chapter 63
+
+| Term | Definition |
+|---|---|
+| structured log | JSON-line log with consistent fields. |
+| `pino` | Fast structured-logging library for Node. |
+| request ID | UUID minted per request; carried through logs and the `x-request-id` header. |
+| four golden signals | Latency, traffic, errors, saturation. |
+| p99 latency | 99th-percentile latency; the truth-teller about user experience. |
+| cardinality explosion | Unbounded growth in unique time series due to high-cardinality labels. |
+| trace | Tree of timed spans across one request. |
+| OpenTelemetry (OTel) | Vendor-neutral standard for traces / metrics / logs. |
+| alert fatigue | When too many alerts make on-call ignore real ones. |
 
 ---
 
 ## End-of-chapter checkpoint
 
 - [ ] Logs are JSON, structured, with request IDs.
-- [ ] Metrics endpoint serves Prometheus format.
+- [ ] `/_metrics` serves Prometheus format, gated by token.
+- [ ] OpenTelemetry traces export to your chosen backend.
 - [ ] You debugged the planted log dump.
+- [ ] You can articulate the four golden signals out loud.
 
 ---
 
