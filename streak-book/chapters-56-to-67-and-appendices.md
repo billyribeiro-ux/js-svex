@@ -33,13 +33,18 @@ export const handleError: HandleServerError = ({ error, event, status, message }
   return { message: 'An unexpected error occurred.', code: errorId };
 };
 
-function redact(err: unknown): { name: string; message: string; stack?: string } | { value: string } {
-  if (err instanceof Error) {
-    return { name: err.name, message: err.message, stack: err.stack };
+function redact(err: unknown): { name: string; message: string; stack?: string } {
+  if (!(err instanceof Error)) {
+    return { name: 'Unknown', message: 'Unknown error' };
   }
-  return { value: String(err) };
+  const message = err.message
+    .replace(/[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]+/g, '[redacted-email]')
+    .replace(/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, '[redacted-card]');
+  return { name: err.name, message, stack: err.stack };
 }
 ```
+
+Postgres errors leak PII via *"duplicate key value"* messages — the redactor handles the common shapes (emails, card numbers); for production, add domain-specific patterns as you discover them in your logs.
 
 Read aloud:
 
@@ -84,6 +89,8 @@ export const handleError: HandleClientError = ({ error, event, status, message }
 
 Same contract as the server side: don't throw, don't leak PII, return a generic `App.Error`. The client cannot redact anything that's already in the user's browser memory — but it *can* refuse to ship sensitive payloads to your telemetry vendor.
 
+Why `console.error` and not `pino`? The client side doesn't have pino — bundling pino into the browser would balloon the JS payload. Server-side `handleError` uses pino through `$lib/logger`; client-side uses `console.error` with a structured object payload. The client can't reach the structured logger because doing so would ship pino to the browser bundle. In production, replace this `console.error` with a thin wrapper around your telemetry SDK (Sentry's `captureException`, Logflare's HTTP API, etc.) — those *are* designed to ship to the browser.
+
 ---
 
 ## Lesson 56.3 — Error IDs surfaced to the user
@@ -122,7 +129,7 @@ The route-level `+error.svelte` catches errors from `load`. Errors inside *rende
 ```svelte
 <svelte:boundary>
   <RiskyChartWidget data={chart} />
-  {#snippet failed(error: unknown, reset: () => void)}
+  {#snippet failed(error, reset)}
     <div class="boundary-fail">
       <p>This chart couldn't load.</p>
       <button type="button" onclick={reset}>Retry</button>
@@ -135,7 +142,7 @@ Read aloud: *"render the chart; if it throws during render, swap in the failed s
 
 The rest of the page (header, nav, other widgets) keeps working. This is the *graceful-degradation* pattern.
 
-> **`<svelte:boundary>`** — Svelte 5 element that catches errors thrown during render of its children. Has a `failed(error, reset)` snippet for the fallback UI.
+> **`<svelte:boundary>`** — Svelte 5 element (added in 5.3) that catches errors thrown during render of its children. The `failed` snippet receives `(error, reset)`; `reset` re-creates the boundary's contents. Pinned to the May 2026 docs at `svelte/svelte-boundary`; verify before adopting if the API has shifted in a later minor.
 
 ---
 
@@ -300,7 +307,7 @@ Now `RiskyWidget` failing leaves the header and `SafeWidget` working. *Granular*
     {/each}
   </ul>
 
-  {#snippet failed(error: unknown, reset: () => void)}
+  {#snippet failed(error, reset)}
     <div class="boundary-fail">
       <p>Couldn't load habits — try refreshing.</p>
       <button type="button" onclick={reset}>Retry</button>
@@ -388,7 +395,7 @@ What goes where:
 | Dynamic private | Per-deploy secrets that rotate (e.g. SSO client secrets that change without rebuilds) |
 | Dynamic public | Feature flags read fresh on each request (rare; usually use a flag service) |
 
-> **`PUBLIC_` prefix** — SvelteKit's signal that a value is public. Anything *without* the prefix in `.env` is treated as private. The prefix is configurable via `kit.env.publicPrefix` in `svelte.config.ts`; we use the default.
+> **`PUBLIC_` prefix** — SvelteKit's signal that a value is browser-safe. Env vars imported via `$env/static/private` (or `$env/dynamic/private`) are server-only; the build refuses to ship them to the client. The `PUBLIC_` prefix is what gates `static/public` and `dynamic/public` access. A non-prefixed env var without an explicit private import isn't auto-private — it's just unimported. The prefix is configurable via `kit.env.publicPrefix` in `svelte.config.ts`; we use the default.
 
 ---
 
@@ -477,8 +484,10 @@ Then import this module from `src/hooks.server.ts`:
 
 ```ts
 // src/hooks.server.ts
-import { env } from '$lib/env'; // forces the validator to run on first request
+import { env } from '$lib/env'; // top-level import → validator runs at module load
 ```
+
+Top-level imports run at module load. On Vercel serverless, that's per-cold-start. The validator throws synchronously at import; the function fails to boot if env vars are missing. The validation cost is paid once per cold start, not per request.
 
 If any value is missing or malformed, `v.parse` throws a useful error and the server fails to boot. **Fail-fast is the senior pattern**: crash now with a clear message; don't crash three hours later when the first user hits the route that needs that variable.
 
@@ -583,7 +592,7 @@ export const dynEnv = v.parse(DynamicSchema, {
 });
 ```
 
-`SENTRY_DSN` is `optional` because dev environments don't ship to Sentry. In production, the deploy fails to boot if it's malformed. Add to `.env.example` (commented):
+`SENTRY_DSN` is `optional` because dev environments don't ship to Sentry. In production, the running server fails to boot if it's malformed. Dynamic-private env vars are populated at runtime, not build time — the build won't fail on a missing optional dynamic var; only the running server validates. Add to `.env.example` (commented):
 
 ```
 # Optional — set in production only
@@ -784,7 +793,8 @@ describe('splitCents', () => {
       fc.integer({ min: 1, max: 100 }),
       (total, n) => {
         const parts = splitCents(cents(total), n);
-        const sum = parts.reduce<number>((a, b) => a + (b as number), 0);
+        // `Cents extends number`, so the sum works without a cast.
+        const sum = parts.reduce<number>((a, b) => a + b, 0);
         return sum === total;
       },
     ));
@@ -888,18 +898,18 @@ Senior heuristic: if a function is gnarly enough that its coverage drops below 8
 ```ts
 it('addHabit succeeds', async () => {
   const result = await addHabit('Read', mockDb);
-  expect(result.ok).toBe(true);
+  expect(result.success).toBe(true);
 });
 ```
 
-What's wrong?
+What's wrong? (Two bugs — one design, one assertion.)
 
 <details>
 <summary>Answer</summary>
 
-`mockDb` — Bible rule #5: *don't mock the database*. Mocked DBs lie about transactional semantics, foreign-key behaviour, atomic UPDATEs, race conditions. The integration test against a real Postgres (Ch 59) is the right home for this.
+1. **`mockDb`** — Bible rule #5: *don't mock the database*. Mocked DBs lie about transactional semantics, foreign-key behaviour, atomic UPDATEs, race conditions. The integration test against a real Postgres (Ch 59) is the right home for this. A unit test should test a *pure* function. If `addHabit` touches the DB, push the DB-touching part down to a thin layer and unit-test the *pure logic* (validation, name normalisation, the `Result` shape).
 
-A unit test should test a *pure* function. If `addHabit` touches the DB, push the DB-touching part down to a thin layer and unit-test the *pure logic* (validation, name normalisation, the `Result` shape).
+2. **`expect(result.success).toBe(true)`** — the test reads the wrong field. The book's `Result` API uses `.ok`, not `.success`. The test would *fail* — `result.success` is `undefined`, not `true` — but the failure message points at the assertion, not at the typo. A senior reviewer catches this in review and saves the round-trip through CI. Fix: `expect(result.ok).toBe(true)`.
 </details>
 
 ---
@@ -945,6 +955,8 @@ describe('parseCents', () => {
 ```
 
 When this is green, you've proved `parseCents` and `formatCents` are inverses for every integer-cents value up to ~$100k. Property-based tests that assert *inverse pairs* catch entire bug classes that example-based tests would miss.
+
+**Locale trap.** `formatCents` uses `Intl.NumberFormat`; the output depends on the runtime's locale. For en-US, `$12,345.67`; for de-DE, `12.345,67 €`. The regex `[^\d.]` strips `$` and `,` — fine for en-US, *broken* for de-DE (which swaps the period and comma). For round-trip tests, either pin the locale (`formatCents(c, { locale: 'en-US' })`) or use the simpler `(c / 100).toFixed(2)` form that doesn't depend on locale at all. The book's snippet pins en-US implicitly via the test runtime; document the assumption so the test isn't a flake-on-CI in a different locale.
 </details>
 
 ---
@@ -1053,6 +1065,8 @@ export default defineConfig({
 });
 ```
 
+The `projects` array is the recommended form in Vitest 1.6+; older versions used `test.workspace` in a separate `vitest.workspace.ts` file. Pin to your installed version — verify against May 2026 Vitest before copy-pasting.
+
 `tests/setup-component.ts`:
 
 ```ts
@@ -1117,7 +1131,7 @@ Read aloud:
 |---|---|
 | `render(HabitRow, { habit, onDelete })` | *"Mount HabitRow with these props in jsdom."* |
 | `screen.getByText('Read 20 minutes')` | *"Find the element whose text reads 'Read 20 minutes'."* |
-| `screen.getByRole('button', { name: /remove read/i })` | *"Find the button accessible-named 'Remove Read' (case-insensitive)."* |
+| `screen.getByRole('button', { name: /remove read/i })` | *"Find the button accessible-named 'Remove Read' (case-insensitive)."* (the `aria-label="Remove ${habit.name}"` was wired in Chapter 8 / Chapter 13's `HabitRow`.) |
 | `await userEvent.click(button)` | *"Simulate a real click — including focus, mouseup, etc."* |
 | `expect(onDelete).toHaveBeenCalledWith(habitId('h1'))` | *"The onDelete callback was invoked exactly once with the right argument."* |
 
@@ -1162,11 +1176,17 @@ import { db, closeDb } from '$lib/db/client';
 import { sql } from 'drizzle-orm';
 
 beforeAll(() => {
-  // Apply migrations to the test DB
-  execSync('pnpm drizzle-kit migrate', {
-    env: { ...process.env, DATABASE_URL: process.env.TEST_DATABASE_URL },
-    stdio: 'inherit',
-  });
+  // Apply migrations to the test DB. `stdio: 'pipe'` keeps the test output
+  // clean; we only print drizzle's chatter when the migration actually fails.
+  try {
+    execSync('pnpm drizzle-kit migrate', {
+      env: { ...process.env, DATABASE_URL: process.env.TEST_DATABASE_URL },
+      stdio: 'pipe',
+    });
+  } catch (e) {
+    console.error(e);
+    throw e;
+  }
 });
 
 beforeEach(async () => {
@@ -1191,6 +1211,7 @@ import { DATABASE_URL } from '$env/static/private';
 const url = process.env.TEST_DATABASE_URL ?? DATABASE_URL;
 const client = postgres(url, { max: 5, idle_timeout: 20, connect_timeout: 10 });
 export const db = drizzle(client);
+// `client.end()` returns `Promise<void>` in `postgres-js` 3.x (verified May 2026).
 export const closeDb = (): Promise<void> => client.end();
 ```
 
@@ -1277,6 +1298,10 @@ pnpm add -D @stoplight/spectral-core @stoplight/spectral-rulesets ajv ajv-format
 import { describe, it, expect } from 'vitest';
 import yaml from 'yaml';
 import fs from 'node:fs/promises';
+// Pin to ajv 8.x in package.json: `"ajv": "^8.17.1"`, `"ajv-formats": "^3.0.1"`.
+// ajv 8.x ships a default export (`import Ajv from 'ajv'`); some prereleases
+// shipped a named export (`import { Ajv } from 'ajv'`). Verify against the
+// version in your lockfile before copying.
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
 
@@ -1427,9 +1452,10 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: 'tests/e2e',
   fullyParallel: true,
-  // We deliberately set retries to 0. Two retries hides flakes; the senior bar is
-  // "every test is deterministic." If a test flakes once, we fix it, not retry it.
-  retries: 0,
+  // CI flakes are the only place retries help — same machine, same code, but the
+  // ephemeral runner sometimes hits a transient network / browser hiccup. Retry
+  // twice on CI; never locally (a local flake is a real bug, fix it).
+  retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? 'github' : 'list',
 
@@ -1462,7 +1488,7 @@ Read aloud:
 | Field | Read aloud as |
 |---|---|
 | `fullyParallel: true` | *"Run tests in parallel by default."* |
-| `retries: 0` | *"Never retry."* — every test is deterministic; flakes get fixed, not retried. |
+| `retries: process.env.CI ? 2 : 0` | *"Retry twice on CI, never locally."* — CI flakes (network, browser-startup hiccups on ephemeral runners) are the only place retries help; a local flake is a real bug. |
 | `trace: 'on-first-retry'` | *"On first retry, save a full trace I can replay in the Playwright Inspector."* |
 | `webServer` | *"Boot `pnpm preview` automatically; in CI, hit the real preview URL instead."* |
 | `projects: [chromium, firefox, webkit]` | *"Run every test against Chrome, Firefox, and Safari engines."* |
@@ -1584,6 +1610,8 @@ export { expect } from '@playwright/test';
 
 Tests import `test` and `expect` from this fixture instead of `@playwright/test` directly. Every test starts from a clean slate.
 
+> **The two-process trap.** Playwright tests run against the *running preview server*; the truncate fixture connects to the DB *from the test process*. Both must point at the same database. Set `DATABASE_URL` in `.env.test` and have both Playwright's `webServer` config and the test fixture's DB client read from `.env.test` (e.g. via `dotenv/config` in a setup file). If the preview server uses prod and the truncate uses test, the test wipes nothing the server reads — and your fresh-user-per-test guarantee silently breaks.
+
 ---
 
 ## Lesson 60.5 — Testing flows that hit external services
@@ -1591,17 +1619,16 @@ Tests import `test` and `expect` from this fixture instead of `@playwright/test`
 Stripe and Resend can't run in the test DB. Two senior patterns:
 
 1. **Stripe test mode** — use real Stripe APIs with `sk_test_*` keys; the `4242 4242 4242 4242` test card always succeeds.
-2. **Test-mode bypass flags** — env vars like `TEST_SKIP_EMAIL_VERIFICATION=1` that the *server* respects only in test environments. Add a check inside the signup action:
+2. **Test-mode bypass flags** — env vars like `TEST_MODE=1` that the *server* respects only in test environments. Add a check inside the signup action:
 
 ```ts
-import { dev } from '$app/environment';
-const skipVerify = dev && process.env.TEST_SKIP_EMAIL_VERIFICATION === '1';
+const skipVerify = process.env.TEST_MODE === '1';
 if (skipVerify) {
   await db.update(users).set({ emailVerifiedAt: new Date() }).where(eq(users.id, created.id));
 }
 ```
 
-Wired only in `dev` builds; never on production.
+Use `TEST_MODE=1` instead of `dev` from `$app/environment`: Playwright runs against the built *preview* server (`pnpm preview`), where `dev` is `false`, so the bypass would never fire. The env var is set only in `.env.test` and never in production — production deploys never see `TEST_MODE`, so the bypass is unreachable there.
 
 ---
 
@@ -1669,8 +1696,10 @@ test.describe('visual regression', () => {
 
   test('home matches snapshot', async ({ page }) => {
     await page.goto('/');
-    // 3. Wait for fonts to load before screenshotting.
-    await page.evaluate(() => document.fonts.ready);
+    // 3. Wait for fonts to load before screenshotting. `waitForFunction` is more
+    //    explicit than `evaluate(() => document.fonts.ready)` — it polls until the
+    //    predicate is true and fails the test if the condition never holds.
+    await page.waitForFunction(() => document.fonts.status === 'loaded');
     await expect(page).toHaveScreenshot('home.png', {
       maxDiffPixelRatio: 0.01,
       fullPage: true,
@@ -1679,7 +1708,7 @@ test.describe('visual regression', () => {
 
   test('pricing matches snapshot', async ({ page }) => {
     await page.goto('/pricing');
-    await page.evaluate(() => document.fonts.ready);
+    await page.waitForFunction(() => document.fonts.status === 'loaded');
     await expect(page).toHaveScreenshot('pricing.png', {
       maxDiffPixelRatio: 0.01,
       fullPage: true,
@@ -1834,6 +1863,9 @@ on:
   pull_request:
 
 env:
+  # Lock the pnpm action and version to your `package.json#packageManager` field
+  # so CI and local dev never drift. As of May 2026, pnpm 10 is current; pin to
+  # whatever the lockfile + packageManager specify, not whatever's "latest."
   NODE_VERSION: 22
   PNPM_VERSION: 9
 
@@ -1949,6 +1981,17 @@ jobs:
 
 Five parallel jobs (`lint-and-type`, `unit`, `integration`, `e2e`, `build`); `e2e` depends on `unit` and `integration`. The Playwright report uploads as an artifact so you can download and replay the trace when something fails on CI but passes locally.
 
+> **The dummy-env-var trap.** The boot validator (Ch 57) regex-checks each value. Make sure each CI dummy actually passes the check, or the e2e job fails before the first test runs:
+>
+> | Var | Regex | Dummy that passes |
+> |---|---|---|
+> | `STRIPE_SECRET_KEY` | `^sk_(test\|live)_` | `sk_test_dummy` |
+> | `STRIPE_WEBHOOK_SECRET` | `^whsec_` | `whsec_dummy` |
+> | `RESEND_API_KEY` | `^re_` | `re_dummy` |
+> | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` | `minLength(1)` only | `dummy` |
+>
+> If you tighten any regex later, update both the validator and the CI dummies in the same PR.
+
 ---
 
 ## Lesson 61.2 — Branch protection
@@ -2011,6 +2054,9 @@ on:
 
 jobs:
   e2e-preview:
+    # `'Preview'` is capitalised — Vercel's deployment-event payload sends the
+    # environment name in title case (`'Preview'`, `'Production'`). The match
+    # is case-sensitive; verify against current Vercel docs before relying on it.
     if: github.event.deployment_status.state == 'success' && github.event.deployment.environment == 'Preview'
     runs-on: ubuntu-latest
     steps:
@@ -2187,7 +2233,7 @@ Read aloud:
 
 | Field | Read aloud as |
 |---|---|
-| `runtime: 'nodejs22.x'` | *"Run as a Node.js 22 serverless function."* |
+| `runtime: 'nodejs22.x'` | *"Run as a Node.js 22 serverless function."* (Node 22 is LTS as of Oct 2024 and current on Vercel as of May 2026; if Vercel adds a Node 24 LTS slot later, switch.) |
 | `regions: ['iad1']` | *"Pin the function to the us-east-1 region — same region as the Postgres."* |
 | `memory: 1024` | *"1 GB of RAM per invocation."* |
 | `maxDuration: 30` | *"Hard-cap any one request at 30 seconds."* |
@@ -2246,6 +2292,8 @@ https://hstspreload.org/?domain=streak.example.com
 ```
 
 Once accepted, every major browser will refuse HTTP for your domain *forever*. Don't preload until you're sure HTTPS is solid; the preload list is hard to leave.
+
+The HSTS header itself must include the `preload` directive (already in the Chapter 48 header — `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`). The preload list site (`hstspreload.org`) requires this directive plus a fully HTTPS redirect chain from the apex domain. The two-week wait is conservative — the real requirement is *"survive the 30-day max-age long enough to be confident HTTPS is solid before locking the door."* If you're certain on day three, submit on day three; if you're shaky on day fourteen, wait longer.
 
 ---
 
@@ -2344,6 +2392,8 @@ Triggered when production is broken and a fix-forward isn't fast.
 ```
 
 Test the rollback once *before* you need it. Senior pattern: **the runbook you've never tested doesn't work.**
+
+> **The migration trap.** If the bad deploy ran a migration, rollback recovers code only — DB schema changes are *not* reverted by promoting an older deployment. The DB-restore runbook (`docs/runbooks/db-restore.md`) covers schema rollback via point-in-time recovery for the destructive case. For *additive* migrations (new columns, new tables) the rollback is safe because the old code ignores new columns; for *destructive* migrations (dropped columns, renamed tables, narrowed types) the rollback is broken until the schema is restored. This is the strongest argument for Bible rule #18 (forward-only) — *additive forever* makes rollback simple.
 
 ---
 
@@ -2460,22 +2510,20 @@ pnpm add pino
 // src/lib/logger.ts
 import pino from 'pino';
 
+// pino's `redact.paths` takes literal paths or single-level wildcards. Deep
+// nesting needs explicit paths — `password` does NOT match `user.password`.
+// Spell each nested path out, then add `*.password`-style wildcards for the
+// common shallow shapes. Test with a sample log to confirm redaction fires
+// (a debug `logger.info({ user: { password: 'x' } }, ...)` should print
+// without the `password` field).
 const SENSITIVE = [
-  'password',
-  'passwordHash',
-  'password_hash',
+  'user.password',
+  'user.passwordHash',
   'token',
-  'cookie',
-  'sessionToken',
-  'authorization',
-  'authHeader',
-  'stripeSignature',
-  'creditCard',
-  'cvv',
-  'ssn',
   '*.password',
   '*.passwordHash',
-  '*.token',
+  'authorization',
+  'cookie',
 ];
 
 export const logger = pino({
@@ -2632,6 +2680,9 @@ export function safeRouteLabel(path: string): string {
   // Collapse known dynamic shapes into a single bucket.
   if (path.startsWith('/habits/')) return '/habits/[id]';
   if (path.startsWith('/api/v1/habits/')) return '/api/v1/habits/[id]';
+  // `'other'` is itself a label — attackers piling counts under it cause no
+  // cardinality bomb because it's a fixed string. Bible #14 satisfied: every
+  // label value comes from a static set.
   return 'other';
 }
 
@@ -2667,6 +2718,7 @@ Why the bounded-label discipline matters: Prometheus stores **one time series pe
 ```ts
 // src/routes/_metrics/+server.ts
 import { error } from '@sveltejs/kit';
+import { timingSafeEqual } from 'node:crypto';
 import { register } from '$lib/metrics';
 import { METRICS_TOKEN } from '$env/static/private';
 import type { RequestHandler } from './$types';
@@ -2674,7 +2726,20 @@ import type { RequestHandler } from './$types';
 export const GET: RequestHandler = async ({ request }) => {
   // Gate with a shared token; only Prometheus scrapers should hit this.
   const auth = request.headers.get('authorization');
-  if (auth !== `Bearer ${METRICS_TOKEN}`) error(401, 'Unauthorized');
+  if (auth === null || !auth.startsWith('Bearer ')) {
+    throw error(401, 'Unauthorized');
+  }
+  const provided = auth.slice('Bearer '.length);
+
+  // `timingSafeEqual` throws on different-length buffers. Length-mismatch is
+  // already a "wrong token" so we reject without timing the comparison; the
+  // only constant-time path runs on equal-length tokens.
+  if (provided.length !== METRICS_TOKEN.length) {
+    throw error(401, 'Unauthorized');
+  }
+  if (!timingSafeEqual(Buffer.from(provided), Buffer.from(METRICS_TOKEN))) {
+    throw error(401, 'Unauthorized');
+  }
 
   return new Response(await register.metrics(), {
     headers: { 'content-type': register.contentType },
@@ -2714,19 +2779,25 @@ const config: Config = {
 Add an OTLP exporter (or any compatible vendor):
 
 ```bash
-pnpm add @opentelemetry/sdk-node @opentelemetry/exporter-trace-otlp-http @opentelemetry/auto-instrumentations-node
+pnpm add @opentelemetry/sdk-node @opentelemetry/exporter-trace-otlp-http \
+         @opentelemetry/instrumentation-http @opentelemetry/instrumentation-fetch
 ```
 
 ```ts
 // src/instrumentation.server.ts
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
-import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
+import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
 
+// Pin to HTTP + fetch only. `getNodeAutoInstrumentations()` includes packages
+// that conflict with Vercel's serverless runtime (`fs`, `net`, `dns`) and
+// silently inflate the function bundle. Explicit instrumentations are the
+// senior pattern for serverless: opt in to what you need; nothing else.
 const sdk = new NodeSDK({
   serviceName: 'streak',
   traceExporter: new OTLPTraceExporter({ url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT }),
-  instrumentations: [getNodeAutoInstrumentations()],
+  instrumentations: [new HttpInstrumentation(), new FetchInstrumentation()],
 });
 sdk.start();
 ```
@@ -3073,7 +3144,11 @@ import { json } from '@sveltejs/kit';
 import * as v from 'valibot';
 import { db } from '$lib/db/client';
 import { habits } from '$lib/db/schema';
-import { and, eq, desc, sql } from 'drizzle-orm';
+// All of these are used somewhere in the file — the cursor logic uses `sql`,
+// `and`, `eq`, `desc`; the user lookup in `findUserByPat` (in `pat.ts`) uses
+// `lt`, `or`, `isNull`. Audit every `+server.ts` snippet for missing imports
+// before copy-paste; an unimported helper is the most common copy-paste bug.
+import { sql, and, eq, lt, or, isNull, desc } from 'drizzle-orm';
 import { findUserByPat } from '$lib/pat';
 import { problem } from '$lib/api/errors';
 import { addHabitForUser } from '$lib/habits-server';
@@ -3140,6 +3215,9 @@ export const GET: RequestHandler = async ({ request, url }) => {
   const hasMore = rows.length > PAGE_SIZE;
   const page = hasMore ? rows.slice(0, PAGE_SIZE) : rows;
   const last = page[page.length - 1];
+  // Cursor format: `<unix-ms>:<uuid>`. The decoder splits on `:`; we rely on
+  // UUIDs containing no colons. If we ever change the ID type (e.g. to
+  // base32-with-dashes), update both the encoder and the decoder.
   const nextCursor = hasMore && last !== undefined
     ? `${last.createdAt.getTime()}:${last.id}`
     : null;
@@ -3239,6 +3317,27 @@ components:
         cursor:
           type: string
           nullable: true
+    Problem:
+      # RFC 7807 — every error response uses this shape.
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri, default: 'about:blank' }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string, format: uri }
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid token
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
 paths:
   /habits:
     get:
@@ -3358,6 +3457,8 @@ export async function sendVerificationEmail(to: string, link: string): Promise<v
 }
 ```
 
+We never use `==` (Bible rule #5b). The explicit `!== null && !== undefined` is verbose but matches the Bible — `error == null` is the one-liner that catches both, and it's banned. `?? null` is the one-line shortcut where the value is *used* rather than *checked* (`const x = maybe ?? null`).
+
 To deliver to inboxes (not spam folders), set up SPF, DKIM, and DMARC records on your domain. Resend's dashboard walks you through it.
 
 ---
@@ -3370,7 +3471,7 @@ A user retries signup or a network blip causes a duplicate; the verification ema
 export const emailSendLog = pgTable('email_send_log', {
   id: uuid('id').primaryKey().defaultRandom(),
   recipient: text('recipient').notNull(),
-  kind: text('kind', { enum: ['verify', 'reminder', 'reset'] }).notNull(),
+  kind: text('kind', { enum: ['verify', 'reminder', 'reset', 'summary'] }).notNull(),
   sentAt: timestamp('sent_at', { withTimezone: true }).notNull().defaultNow(),
   // dedupe key: same (recipient, kind, contextId) won't re-send for an hour
   dedupeKey: text('dedupe_key').notNull().unique(),
@@ -3380,15 +3481,22 @@ export const emailSendLog = pgTable('email_send_log', {
 Around the actual send:
 
 ```ts
-export async function sendOnce(kind: string, dedupeKey: string, fn: () => Promise<void>): Promise<void> {
+export async function sendOnce(
+  kind: 'verify' | 'reminder' | 'reset' | 'summary',
+  recipient: string,
+  dedupeKey: string,
+  fn: () => Promise<void>,
+): Promise<void> {
   const inserted = await db.insert(emailSendLog)
-    .values({ recipient: '...', kind, dedupeKey })
+    .values({ recipient, kind, dedupeKey })
     .onConflictDoNothing()
     .returning();
   if (inserted.length === 0) return; // already sent
   await fn();
 }
 ```
+
+Call sites pass the recipient explicitly so the dedupe row records who the email went to, e.g. `await sendOnce('verify', user.email, \`verify:${user.id}\`, async () => sendVerificationEmail(user.email, link))`.
 
 Senior pattern: emails to external providers are *external side effects* — Bible rule #12 applies.
 
@@ -3418,8 +3526,10 @@ import { sendOnce } from '$lib/mail/send';
 import { logger } from '$lib/logger';
 
 export const GET: RequestHandler = async ({ request }) => {
-  // Vercel sends `Authorization: Bearer <CRON_SECRET>` for crons.
-  const auth = request.headers.get('authorization');
+  // Vercel sends `Authorization: Bearer <CRON_SECRET>` for crons. Headers are
+  // case-insensitive in fetch's API, but the canonical form is `Authorization`;
+  // tighten for readability so reviewers don't wonder if we meant `lowercase`.
+  const auth = request.headers.get('Authorization');
   if (auth !== `Bearer ${CRON_SECRET}`) error(401, 'Unauthorized');
 
   const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
@@ -3506,6 +3616,7 @@ export const GET: RequestHandler = async ({ request }) => {
 
     await sendOnce(
       'summary',
+      user.email,
       `weekly:${user.id}:${weekKey}`,
       async () => {
         await resend.emails.send({
@@ -3523,6 +3634,8 @@ export const GET: RequestHandler = async ({ request }) => {
 ```
 
 Idempotent (`sendOnce` keyed per user per week). Auth-gated. Logs not shown but should be added at start/end. Senior shape.
+
+**Scaling note.** For 100 users, sequential `await`s are fine. For 100k users, this loop times out — Vercel cron `maxDuration: 30s` is the hard ceiling, and serial sends can't fit. Two senior moves: (a) `Promise.all` with a concurrency limit (`p-limit` keeps the pool at, say, 10) so latency overlaps; (b) batch the work into a queue (Inngest, Trigger.dev, or your own SQS-shaped table) and let a worker drain it asynchronously. Chapter 65's capacity-planning section covers the math; for the brief, the rule is *"if the loop has > 1k iterations, reach for a queue."*
 </details>
 
 ---
@@ -3713,7 +3826,7 @@ How many BLOCKING issues do you find? Take your time; write them down with citat
 
 10. **No audit row.** Admin actions on user accounts must `withAudit`. **Bible rule echo, Ch 47.**
 
-11. **No CSRF protection mentioned, but `admin_password` is in the form.** Why is the admin re-authing via a form field? Sessions exist. Re-auth should use the session's `fresh` flag (Ch 44), not a re-typed password through a form field — and definitely not unencrypted in form data being logged.
+11. **No CSRF protection mentioned, but `admin_password` is in the form.** Why is the admin re-authing via a form field? Sessions exist. Re-auth should use the session's `fresh` flag (Ch 44), not a re-typed password through a form field — and definitely not unencrypted in form data being logged. **Scope-honesty caveat:** `fresh` is set on login (Ch 44.4) and never refreshed on action. To use it for re-auth gating, add a `requireFresh(event)` helper that throws redirect to `/auth/reauth` if `fresh` is `false`. The book doesn't ship the gate; the planted bug here pretends it does. Treat this review note as *"this is what should exist; verify the codebase actually has it."*
 
 12. **Migration drops a column with no deprecation period.** `ALTER TABLE users DROP COLUMN legacy_email;` — if any code still reads it, deploy breaks. **Bible rule #18:** migrations forward-only; column removals require a two-deploy dance (stop reading → next deploy drops). Also missing `IF EXISTS`.
 
@@ -3865,7 +3978,7 @@ Senior habit: **decisions live longer than the people who made them.** The ADR i
 
 ## Lesson 65.7 — The boring-tech doctrine
 
-Dan McKinley's essay *"Choose Boring Technology"* (2015, still required reading) named the doctrine: **every team has a finite number of innovation tokens.** Spend them where they buy you the most. Use boring, well-understood tech everywhere else.
+Dan McKinley's essay *"Choose Boring Technology"* (March 2015, still required reading — the original talk + transcript at `mcfunley.com/choose-boring-technology`) named the doctrine: **every team has a finite number of innovation tokens.** Spend them where they buy you the most. Use boring, well-understood tech everywhere else.
 
 Boring choices for Streak:
 - **Postgres** over Mongo / DynamoDB / FaunaDB.
@@ -4036,7 +4149,12 @@ Estimated effort: 6–10 hours of focused work.
 
 > **The timezone trap, named.** Read the brief twice — the word "calendar month" is doing real work. A user in Tokyo sees the calendar flip to February at 00:00 JST, which is **15:00 UTC the previous day**. If your reset cron fires at 00:00 UTC, the Tokyo user gets a "new month" freeze 9 hours after their February-1 morning has already started. This is a UX bug *and* an unfairness bug (Pacific users effectively get a longer month). A senior brief surfaces this; a senior implementation handles it.
 >
-> Two valid approaches: (a) store `users.timezone` (e.g. `"Asia/Tokyo"`) and reset per-user when their local clock crosses month-boundary — usually via a more frequent cron (e.g. hourly) that checks per-user; (b) compute "remaining freezes" *on read* from `freeze_consumed_at` timestamps relative to the user's local month, no reset cron needed. Option (b) is usually cleaner. Defend your choice in ADR-003.
+> Two valid approaches:
+>
+> 1. **Store `users.timezone`** (e.g. `"Asia/Tokyo"`, IANA name) — a Ch 39-style migration adds the column. The reset cron runs hourly and resets per-user when their local clock crosses the month boundary; "remaining freezes" reads pass through this stored value for any date math.
+> 2. **Compute on read** from stored UTC `freeze_consumed_at` timestamps — no reset cron needed. The "remaining freezes" query bucketises consumption timestamps into the user's local month at read time. Cleaner; needs the timezone column too, but only as a presentation concern.
+>
+> Both are buildable from what's already in the book (migrations, atomic UPDATEs, audit log). The ADR (deliverable #2) is where you defend the choice — concision counts; the senior judgment shows in *which* one you pick and *why*, not in the implementation.
 
 ---
 
@@ -4054,7 +4172,7 @@ These are level-7 deliverables. Every one. No shortcuts.
 8. **`<ConfirmDialog>`** for the user-facing confirm step (Ch 53 primitive).
 9. **`/api/cron/reset-freezes/+server.ts`** — auth-gated, idempotent monthly reset, with `withAudit`.
 10. **Unit tests** for any pure helper.
-11. **Property-based test** if you have suitable invariants (e.g. resetting twice in the same month produces the same final state).
+11. **Required**: at least one property-based test on a pure helper. Find an invariant — `splitCents(t, n).reduce((a, b) => a + b) === t`, the freeze-counter never goes negative across N random consume-and-reset interleavings, the on-read computation returns the same value for the same input regardless of when called. The shrinker (`fast-check`) will find counterexamples your example-based tests would miss.
 12. **Integration test:** 10 simultaneous `consumeFreezeForUser` calls; assert ≤ 1 succeeds.
 13. **Playwright e2e tests:** the happy path (consume freeze; banner shows "0 left"); the empty path (no freezes left; button disabled); the non-Pro path (free user doesn't see the feature).
 14. **Feature flag** `PUBLIC_ENABLE_STREAK_FREEZES` so you can roll out / roll back instantly.
@@ -4062,7 +4180,7 @@ These are level-7 deliverables. Every one. No shortcuts.
 16. **Structured log line** per consume + cron run, with request ID and user ID.
 17. **Runbook** `docs/runbooks/streak-freezes.md` explaining what to do if (a) consume rates spike, (b) the monthly cron fails to fire, (c) the database column drifts.
 18. **PR description** citing every Bible rule the change depends on.
-19. **Runtime evidence** for every claim — `EXPLAIN ANALYZE` on the new query, `pnpm test:integration:concurrent-freezes` green, screenshot of the Prometheus metric after a test consumption, Stripe-CLI replay proving the Pro check.
+19. **EXPLAIN ANALYZE** on the most-used query in the freeze flow (e.g. the user-status check that reads `freezes_remaining_month` or the on-read consumption count), confirming the index is hit and the plan is bounded. The concurrent-insert integration test (deliverable #12) is the runtime evidence for the atomic UPDATE; the metric screenshot (deliverable #15) is the runtime evidence for the bounded label set; the Stripe-CLI replay is the runtime evidence for the Pro gate. Bible #21: compilation and tests are necessary, not sufficient — you write down the EXPLAIN plan for review, not just the test result.
 
 ---
 
@@ -4246,6 +4364,13 @@ pattern from Ch 42 / 47 were prerequisites.
   product intent; I assumed yes.
 - I haven't tested the rollback (flag off after on); should rehearse this
   before next month's reset.
+- **Timezone gap.** The monthly cron at `0 0 1 * *` resets via UTC. Users
+  west of UTC see their freezes reset *before* their local month starts;
+  users east see it *after*. The brief said "calendar month in user's local
+  timezone"; the cron does not honour that. The fix is either (a) split the
+  cron into per-timezone-bucket runs (one per IANA zone we have users in),
+  or (b) compute reset boundaries on read using `users.timezone`. We did
+  neither in v1; v2 needs it. Filed as ADR-003-followup.
 
 ## Bible rules cited
 - ✅ #11 (atomic UPDATE) — `consumeFreezeForUser` line 12.
@@ -4253,8 +4378,14 @@ pattern from Ch 42 / 47 were prerequisites.
 - ✅ #14 (bounded labels) — `safePlanLabel`.
 - ✅ #15 (no PII logged) — log lines have user IDs only, no emails.
 - ✅ #18 (forward-only migrations) — column added, never dropped.
-- ⚠️ #20 (visible win) — bent: PR 1 had no visible win, just the migration.
-  Justified because PR 1 was infra-only; visible win came in PR 3.
+- ✅ #20 (visible win) — *re-read on review:* PR 1 (migration only) does
+  have a visible win — the deploy succeeds and `EXPLAIN` shows the new
+  column. The visible win for a migration PR is the schema change; the
+  user-facing feature lands in PR 2. The earlier "bent" framing was wrong:
+  Bible #20 says *"every chapter delivers a visible win"* — that applies to
+  *chapters*, not *PRs*. PRs are scoped by deployability, which migration
+  PRs satisfy. Lesson learned: cite the rule's exact wording, not the
+  paraphrase that lives in your head.
 
 ## What I'd plant for the next learner
 Three deliberate bugs:
@@ -4367,11 +4498,13 @@ The flag pair is required because remote functions use top-level `await` in mark
 
 ## A.2 — The five primitives
 
+> **Pinned to SvelteKit 2.5x with `kit.experimental.remoteFunctions: true`** (May 5, 2026). Verify each signature against the live docs before adoption — the API has shifted between minor releases more than once. In particular, `query.live`'s async-generator pattern and the `command` shape have moved.
+
 `$app/server` exports:
 
 - **`query(schema?, fn)`** — read-only server function. Cached per argument, deduplicated within a render. Has `.refresh()`, `.set(data)` for client-side cache invalidation.
 - **`query.batch(schema, fn)`** — solves the N+1 problem. Server receives an array of args; returns a function mapping each to a result. Calls within a macrotask are batched.
-- **`query.live(schema, fn)`** — async generator returning a stream. Auto-reconnects on disconnect. Use for real-time features.
+- **`query.live(schema, fn)`** — async generator returning a stream. Auto-reconnects on disconnect. Use for real-time features. (Async-generator pattern is the form pinned here; the docs warn it may shift.)
 - **`form(schema, fn)`** — replaces a form action. Returns a spreadable object you put on `<form {...myForm}>` plus typed `fields` accessors for `<input {...myForm.fields.name.as('text')}>`.
 - **`command(schema, fn)`** — imperative mutation, called from event handlers. No automatic page revalidation; you trigger refreshes manually.
 
@@ -4404,6 +4537,9 @@ export const addHabit = form(
     const user = event.locals.user;
     if (!user) throw new Error('not authed');
     await addHabitForUser(user.id, name);
+    // fire-and-forget; refresh is best-effort. The `void` operator silences
+    // `no-floating-promises` and signals the intent to reviewers — *we know
+    // this is a Promise; we deliberately don't await it.*
     void getHabits().refresh();
   },
 );
@@ -4415,6 +4551,7 @@ export const deleteHabit = form(
     const user = event.locals.user;
     if (!user) throw new Error('not authed');
     await db.delete(habits).where(and(eq(habits.id, id), eq(habits.userId, user.id)));
+    // fire-and-forget; refresh is best-effort.
     void getHabits().refresh();
   },
 );
@@ -4536,7 +4673,7 @@ The senior judgment call: spend an *innovation token* (Ch 65) on remote function
 ## Books worth owning
 
 - **John Ousterhout — *A Philosophy of Software Design*** — short, dense, the book on naming and complexity.
-- **Brian Goetz et al — *Effective Java*** (the language doesn't matter; the principles transfer).
+- **Brian Kernighan & Rob Pike — *The Practice of Programming*** — the canonical short book on the *craft* of software (debugging, style, performance, portability). Twenty years old; still right about almost everything that matters in 2026.
 - **Donald Norman — *The Design of Everyday Things*** — UX you'll feel in every form you ever wire up.
 
 ## What not to read
@@ -4593,6 +4730,11 @@ CORRECTNESS
 EVIDENCE
 21. Compilation and tests are necessary, not sufficient.
     Demand runtime evidence.
+
+----
+Rule 5 has 7 sub-rules (5a–5g, the senior idioms).
+Total: 21 numbered + 6 sub-rules = 27 named rules.
+The card lists 21 for printability; sub-rules are inline in the book.
 ```
 
 ---

@@ -26,7 +26,7 @@ We pick **sessions**. Streak is a fintech-shaped app; revocability matters more 
 export const sessions = pgTable('sessions', {
   id: uuid('id').primaryKey().defaultRandom(),
   userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
-  token: text('token').notNull().unique(),
+  tokenHash: text('token_hash').notNull().unique(),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   fresh: boolean('fresh').notNull().default(true),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -35,7 +35,7 @@ export const sessions = pgTable('sessions', {
 export const emailVerifications = pgTable('email_verifications', {
   id: uuid('id').primaryKey().defaultRandom(),
   userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
-  token: text('token').notNull().unique(),
+  tokenHash: text('token_hash').notNull().unique(),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
 });
 ```
@@ -51,30 +51,49 @@ Generate and apply.
 import { db } from '$lib/db/client';
 import { sessions } from '$lib/db/schema';
 import { and, eq, gt } from 'drizzle-orm';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function newSessionToken(): string {
-  return randomBytes(32).toString('hex');
+  return randomBytes(32).toString('base64url');
+}
+
+function sha256Hex(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
 }
 
 export async function createSession(userId: string): Promise<string> {
   const token = newSessionToken();
+  const tokenHash = sha256Hex(token);
   const expiresAt = new Date(Date.now() + SESSION_LIFETIME_MS);
-  await db.insert(sessions).values({ userId, token, expiresAt });
+  await db.insert(sessions).values({ userId, tokenHash, expiresAt });
   return token;
 }
 
 export async function findValidSession(token: string): Promise<{ userId: string } | null> {
+  const tokenHash = sha256Hex(token);
   const rows = await db.select().from(sessions)
-    .where(and(eq(sessions.token, token), gt(sessions.expiresAt, new Date())))
+    .where(and(eq(sessions.tokenHash, tokenHash), gt(sessions.expiresAt, new Date())))
     .limit(1);
-  return rows[0] ? { userId: rows[0].userId } : null;
+  const row = rows[0];
+  if (row === undefined) {
+    return null;
+  }
+  // Defence in depth: verify the row's stored hash against the cookie token's
+  // hash in constant time. Postgres equality on a unique-indexed column is
+  // already constant-time for this scenario (the index probe is content-
+  // independent, and the stored value is a fixed-width digest), so the extra
+  // check is belt-and-braces — but cheap, and explicit.
+  if (!safeEqualHex(row.tokenHash, tokenHash)) {
+    return null;
+  }
+  return { userId: row.userId };
 }
 
 export async function revokeSession(token: string): Promise<void> {
-  await db.delete(sessions).where(eq(sessions.token, token));
+  const tokenHash = sha256Hex(token);
+  await db.delete(sessions).where(eq(sessions.tokenHash, tokenHash));
 }
 
 export function safeEqualHex(a: string, b: string): boolean {
@@ -88,6 +107,8 @@ export function safeEqualHex(a: string, b: string): boolean {
 
 `timingSafeEqual` prevents timing attacks on token comparison. Senior habit.
 
+> **Sliding sessions, deferred.** `findValidSession` doesn't refresh `expiresAt`. A senior pattern is sliding sessions: if the session is past 50% of its TTL, extend `expiresAt` to now + 30 days. We don't ship the slide here but flag it as a known limitation; users will be logged out 30 days after first login regardless of activity. Add when the support load justifies it.
+
 ---
 
 ## Lesson 44.4 — Login action
@@ -96,6 +117,7 @@ export function safeEqualHex(a: string, b: string): boolean {
 // src/routes/(auth)/login/+page.server.ts
 import type { Actions } from './$types';
 import { fail, redirect } from '@sveltejs/kit';
+import { dev } from '$app/environment';
 import { db } from '$lib/db/client';
 import { users } from '$lib/db/schema';
 import { eq } from 'drizzle-orm';
@@ -105,8 +127,10 @@ import { createSession } from '$lib/sessions';
 export const actions: Actions = {
   default: async ({ request, cookies }) => {
     const data = await request.formData();
-    const email = String(data.get('email') ?? '').trim().toLowerCase();
-    const password = String(data.get('password') ?? '');
+    const rawEmail = data.get('email');
+    const rawPassword = data.get('password');
+    const email = (typeof rawEmail === 'string' ? rawEmail : '').trim().toLowerCase();
+    const password = typeof rawPassword === 'string' ? rawPassword : '';
 
     // generic error to avoid account enumeration
     const rows = await db.select().from(users).where(eq(users.email, email)).limit(1);
@@ -116,14 +140,14 @@ export const actions: Actions = {
     const dummyHash = '$argon2id$v=19$m=65536,t=3,p=4$dummy';
     const ok = await verifyPassword(password, user?.passwordHash ?? dummyHash);
 
-    if (!user || !ok) {
+    if (user === undefined || !ok) {
       return fail(400, { error: 'Invalid email or password.' });
     }
 
     const token = await createSession(user.id);
     cookies.set('session', token, {
       httpOnly: true,
-      secure: true,
+      secure: !dev,
       sameSite: 'lax',
       path: '/',
       maxAge: 60 * 60 * 24 * 30,
@@ -135,6 +159,8 @@ export const actions: Actions = {
 ```
 
 The `dummyHash` line: by always running `verifyPassword`, we avoid a timing leak that would reveal whether the email exists. Senior habit; cited in the OWASP authentication cheatsheet.
+
+> **`secure: !dev` matters.** `secure: true` requires HTTPS; the browser refuses to set a secure cookie on plain `http://localhost`. SvelteKit's `cookies.set` does NOT auto-downgrade — you'll silently lose your dev session. Gate with `dev` from `$app/environment` so production gets `secure: true` and local gets `secure: false`.
 
 ---
 
@@ -173,6 +199,8 @@ The `dummyHash` line: by always running `verifyPassword`, we avoid a timing leak
 | Replay | Short session lifetimes; "fresh" flag for sensitive actions. |
 
 > **Why `sameSite: 'lax'` instead of `'strict'`?** Strict mode strips the cookie on *any* cross-site navigation — including a user clicking a verification link from their email or a password-reset link. The session would not travel; the user would land logged out. Lax sends the cookie on top-level GET navigations from external origins (links, address bar) but blocks it on cross-site POSTs, which is the actual CSRF threat. Lax is the senior default for session cookies; reach for strict only on cookies guarding *additional* high-value actions (e.g. a separate "reauth" cookie that gates `/admin/*`).
+>
+> Modern Chromium "lax-but-allowed" defaults change the cross-site behaviour for top-level navigations — a user clicking a verification link from email may keep the cookie under some conditions. The exact behaviour drifts between Chromium releases; pin to OWASP's current guidance or empirically test the verification flow during launch.
 
 ---
 
@@ -198,6 +226,8 @@ export const passwordResets = pgTable('password_resets', {
 ```
 
 Note: we store the **hash** of the token, not the token itself. If the DB leaks, the leaked rows can't be used to reset accounts. The token is shown to the user once, embedded in the email link.
+
+> **One encoding, applied everywhere.** 256 bits of entropy in either base64url or hex; we pick base64url for shorter URLs. Every random token in this system — `passwordResets.hashedToken`'s pre-image, `emailVerifications`'s pre-image, `newSessionToken`, the impersonation token in Ch 47.4 — is `randomBytes(32).toString('base64url')`. Mixing encodings is the kind of inconsistency that hides bugs (a comparator written for hex silently fails on base64url, etc.). Pick one; apply it.
 
 Reset-request action:
 
@@ -254,7 +284,7 @@ Reset-consume action — atomic, single-use, revokes all sessions:
 ```ts
 // src/routes/(auth)/reset-password/[token]/+page.server.ts
 import type { Actions, PageServerLoad } from './$types';
-import { error, redirect } from '@sveltejs/kit';
+import { error, fail, redirect } from '@sveltejs/kit';
 import { db } from '$lib/db/client';
 import { passwordResets, sessions, users } from '$lib/db/schema';
 import { and, eq, gt, isNull } from 'drizzle-orm';
@@ -276,16 +306,21 @@ export const load: PageServerLoad = async ({ params }) => {
     ))
     .limit(1);
 
-  if (reset === undefined) throw error(400, 'Reset link is invalid or has expired.');
+  if (reset === undefined) {
+    throw error(400, 'Reset link is invalid or has expired.');
+  }
   return { tokenValid: true };
 };
 
 export const actions: Actions = {
   default: async ({ request, params, cookies }) => {
     const data = await request.formData();
-    const password = String(data.get('password') ?? '');
+    const rawPassword = data.get('password');
+    const password = typeof rawPassword === 'string' ? rawPassword : '';
     if (password.length < 12) {
-      throw error(400, 'Password must be at least 12 characters.');
+      // Short passwords from a user form are EXPECTED failures; use `fail`,
+      // not `error`. `error` is reserved for unexpected/bug-shaped failures.
+      return fail(400, { message: 'Password must be at least 12 characters.' });
     }
 
     const hashedToken = sha256(params.token);
@@ -303,7 +338,9 @@ export const actions: Actions = {
       .returning({ userId: passwordResets.userId });
 
     const [first] = consumed;
-    if (first === undefined) throw error(400, 'Reset link is invalid or has expired.');
+    if (first === undefined) {
+      throw error(400, 'Reset link is invalid or has expired.');
+    }
     const userId = first.userId;
 
     // Update the password and revoke all the user's existing sessions atomically.
@@ -374,16 +411,25 @@ import { sequence } from '@sveltejs/kit/hooks';
 import { db } from '$lib/db/client';
 import { users, sessions } from '$lib/db/schema';
 import { and, eq, gt } from 'drizzle-orm';
+import { createHash } from 'node:crypto';
+
+function sha256Hex(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
 
 const authHandle: Handle = async ({ event, resolve }) => {
   const token = event.cookies.get('session');
-  if (token) {
+  if (token !== undefined) {
+    const tokenHash = sha256Hex(token);
     const rows = await db.select({ user: users })
       .from(sessions)
       .innerJoin(users, eq(sessions.userId, users.id))
-      .where(and(eq(sessions.token, token), gt(sessions.expiresAt, new Date())))
+      .where(and(eq(sessions.tokenHash, tokenHash), gt(sessions.expiresAt, new Date())))
       .limit(1);
-    if (rows[0]) event.locals.user = rows[0].user;
+    const row = rows[0];
+    if (row !== undefined) {
+      event.locals.user = row.user;
+    }
   }
   return resolve(event);
 };
@@ -419,14 +465,20 @@ export {};
 import { redirect } from '@sveltejs/kit';
 import type { RequestEvent } from '@sveltejs/kit';
 
+// `Role` is the role-union pulled from `App.Locals['user']`. When we widen the
+// role set in Ch 47 (e.g. add 'support', 'auditor'), this stays in sync
+// without touching every call-site.
+export type Role = NonNullable<App.Locals['user']>['role'];
+
 export function requireUser(event: RequestEvent): NonNullable<App.Locals['user']> {
-  if (!event.locals.user) {
+  const user = event.locals.user;
+  if (user === undefined) {
     throw redirect(303, `/login?next=${encodeURIComponent(event.url.pathname)}`);
   }
-  return event.locals.user;
+  return user;
 }
 
-export function requireRole(event: RequestEvent, role: 'admin'): NonNullable<App.Locals['user']> {
+export function requireRole(event: RequestEvent, role: Role): NonNullable<App.Locals['user']> {
   const user = requireUser(event);
   if (user.role !== role) {
     throw redirect(303, '/');
@@ -434,6 +486,8 @@ export function requireRole(event: RequestEvent, role: 'admin'): NonNullable<App
   return user;
 }
 ```
+
+Both helpers `throw redirect(...)`. The `throw` is load-bearing: SvelteKit's `redirect()` returns `never` only when thrown, which lets TypeScript narrow `event.locals.user` from `undefined | User` to `User` after the guard. A bare `redirect(...)` call would leave the type un-narrowed *and* fail to redirect — the worst of both worlds.
 
 Use it in `(app)/+layout.server.ts`:
 
@@ -533,37 +587,37 @@ A hash takes ~100–300 ms — that blocks the Node event loop on the request th
 // src/lib/passwords/worker.ts
 import { parentPort } from 'node:worker_threads';
 import { hash, verify } from '@node-rs/argon2';
+import * as v from 'valibot';
 
 if (parentPort === null) {
   throw new Error('worker.ts must be loaded in a worker thread');
 }
-const port = parentPort; // narrowed to MessagePort
+const port = parentPort; // narrowed to MessagePort — no `!` past this point
 
 const params = { memoryCost: 19456, timeCost: 2, parallelism: 1 };
 
-type HashMsg = { id: string; op: 'hash'; data: string };
-type VerifyMsg = { id: string; op: 'verify'; data: { plain: string; hash: string } };
-type IncomingMsg = HashMsg | VerifyMsg;
-
-function isIncomingMsg(value: unknown): value is IncomingMsg {
-  if (typeof value !== 'object' || value === null) return false;
-  const v = value as Record<string, unknown>;
-  if (typeof v.id !== 'string') return false;
-  if (v.op === 'hash') return typeof v.data === 'string';
-  if (v.op === 'verify') {
-    return typeof v.data === 'object' && v.data !== null
-      && typeof (v.data as Record<string, unknown>).plain === 'string'
-      && typeof (v.data as Record<string, unknown>).hash === 'string';
-  }
-  return false;
-}
+// Boundary parser: the message arrives over an IPC channel and is therefore
+// untrusted input. Validate with Valibot rather than trust a discriminated
+// union and a hand-rolled type guard. Bible rule #5 (parse, don't cast).
+const HashRequest = v.object({
+  id: v.string(),
+  op: v.literal('hash'),
+  data: v.string(),
+});
+const VerifyRequest = v.object({
+  id: v.string(),
+  op: v.literal('verify'),
+  data: v.object({ plain: v.string(), hash: v.string() }),
+});
+const IncomingMsg = v.union([HashRequest, VerifyRequest]);
 
 port.on('message', async (raw: unknown) => {
-  if (!isIncomingMsg(raw)) {
-    // Don't crash the worker on malformed messages; just respond with an error.
+  const parsed = v.safeParse(IncomingMsg, raw);
+  if (!parsed.success) {
+    // Don't crash the worker on malformed messages; drop silently.
     return;
   }
-  const msg = raw;
+  const msg = parsed.output;
   try {
     let result: string | boolean;
     if (msg.op === 'hash') {
@@ -580,8 +634,8 @@ port.on('message', async (raw: unknown) => {
 
 Three senior touches over the naive form:
 
-1. **`if (parentPort === null) throw` then `const port = parentPort`** narrows for the rest of the file. No `!` needed (Bible rule #3).
-2. **Discriminated-union typing of incoming messages** with a real `is`-predicate (Ch 26's boundary-parser idiom). No `as` casts inside the branches.
+1. **`if (parentPort === null) throw` then `const port = parentPort`** narrows for the rest of the file. No `!` needed (Bible rule #3) — every subsequent reference uses `port` directly.
+2. **Valibot at the worker boundary** (`v.parse` / `v.safeParse`). No hand-rolled `is`-predicates, no `as Record<string, unknown>` casts. The schema is the source of truth for what the worker accepts.
 3. **`raw: unknown`** is the *real* type of a worker message — Node's typings used to default it to `any`, which silently allows bugs. Treat the boundary as untrusted.
 
 ```ts
@@ -591,6 +645,14 @@ import os from 'node:os';
 // Vite's `?worker` import returns a constructor that produces a Worker
 // running the bundled module. Works in dev (`pnpm dev`) and production builds.
 // Without `?worker`, you'd be loading a `.ts` file at runtime — broken on Node.
+//
+// IMPORTANT: verify against your production adapter. Vite's `?worker` query
+// bundles the worker into the build, and SvelteKit's adapter-vercel ships the
+// bundled output — but you should confirm the worker chunk lands at the right
+// path for your deploy target. If it doesn't, fall back to the plain
+//   new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' })
+// form. Test the build (`pnpm build && pnpm preview`) to confirm before
+// shipping.
 import HashWorker from './worker.ts?worker';
 
 type WorkerMessage =
@@ -628,10 +690,17 @@ function ensurePool(): void {
       // A worker crashed. Reject every in-flight call routed to it.
       // (We don't track per-worker routing here for brevity; in production,
       // you'd map jobs → workers and only reject affected ones.)
-      for (const [id, pending] of queue) {
-        clearTimeout(pending.timer);
-        pending.reject(err);
-        queue.delete(id);
+      // Snapshot the keys first — mutating a Map while iterating it is
+      // allowed in V8 but skips entries depending on insertion order. The
+      // snapshot makes the iteration order-independent.
+      const ids = [...queue.keys()];
+      for (const id of ids) {
+        const pending = queue.get(id);
+        if (pending !== undefined) {
+          clearTimeout(pending.timer);
+          pending.reject(err);
+          queue.delete(id);
+        }
       }
     });
     pool.push(w);
@@ -692,38 +761,61 @@ Things still left for a real production version: per-worker job routing (so one 
 ```ts
 // src/routes/(auth)/signup/+page.server.ts
 import type { Actions } from './$types';
-import { fail } from '@sveltejs/kit';
+import { error, fail } from '@sveltejs/kit';
+import * as v from 'valibot';
 import { db } from '$lib/db/client';
 import { users, emailVerifications } from '$lib/db/schema';
-import { eq } from 'drizzle-orm';
 import { hashPassword } from '$lib/passwords';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 const TOKEN_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
+// Lightweight syntactic check. Real validation is the verification email
+// roundtrip — anything else (regex, mx-record probe) is theatre.
+const EmailSchema = v.pipe(v.string(), v.email());
+
+function sha256Hex(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
 
 export const actions: Actions = {
   default: async ({ request }) => {
     const data = await request.formData();
-    const email = String(data.get('email') ?? '').trim().toLowerCase();
-    const password = String(data.get('password') ?? '');
+    const rawEmail = data.get('email');
+    const rawPassword = data.get('password');
+    const emailInput = (typeof rawEmail === 'string' ? rawEmail : '').trim().toLowerCase();
+    const password = typeof rawPassword === 'string' ? rawPassword : '';
 
-    if (!/^[^@]+@[^@]+\.[^@]+$/.test(email)) return fail(400, { error: 'Invalid email.' });
-    if (password.length < 12) return fail(400, { error: 'Password must be at least 12 characters.' });
-
-    // generic response — same whether email exists or not
-    const existing = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    if (existing.length > 0) {
-      // pretend we sent the email; same UX
-      return { success: true };
+    const parsed = v.safeParse(EmailSchema, emailInput);
+    if (!parsed.success) {
+      return fail(400, { error: 'Invalid email.' });
+    }
+    const email = parsed.output;
+    if (password.length < 12) {
+      return fail(400, { error: 'Password must be at least 12 characters.' });
     }
 
     const passwordHash = await hashPassword(password);
-    const [created] = await db.insert(users).values({ email, passwordHash }).returning();
 
-    const token = randomBytes(32).toString('hex');
+    // Atomic insert-or-do-nothing replaces the SELECT-then-INSERT pattern
+    // (Bible rule #11). The unique constraint on `email` does the dedupe
+    // atomically — zero rows back means the email was taken. We respond the
+    // same way either path, preserving account-enumeration discipline.
+    const inserted = await db.insert(users)
+      .values({ email, passwordHash })
+      .onConflictDoNothing({ target: users.email })
+      .returning();
+    const [created] = inserted;
+    if (created === undefined) {
+      // Email already taken; respond with the same shape as the success path.
+      return { success: true };
+    }
+
+    const token = randomBytes(32).toString('base64url');
+    const tokenHash = sha256Hex(token);
     await db.insert(emailVerifications).values({
       userId: created.id,
-      token,
+      tokenHash,
       expiresAt: new Date(Date.now() + TOKEN_LIFETIME_MS),
     });
 
@@ -734,6 +826,11 @@ export const actions: Actions = {
   },
 };
 ```
+
+Two senior touches:
+
+1. **Valibot's `v.email()`** replaces the hand-rolled `/^[^@]+@[^@]+\.[^@]+$/` regex. The regex was loose (`a@b.c` passes; `user+tag@deep.sub.tld` passes) and tight in the wrong places. Real validation is the roundtrip — the user clicks a link in their inbox or they don't have the inbox.
+2. **Atomic insert with `onConflictDoNothing`** — no SELECT-then-INSERT race. Two simultaneous signups for the same email used to result in one row (DB-unique constraint catches it) but a 500 error on the second request because the SELECT had said "free." Now the INSERT itself decides; the loser gets `inserted = []` and we respond with the same enumeration-safe `{ success: true }`. The `if (created === undefined)` guard is mandatory under TS-strict — `[].at(0)` is `User | undefined`, never `User`. Bible rule #3.
 
 ---
 
@@ -815,8 +912,16 @@ The transaction type is the parameter type of `db.transaction`'s callback:
 import { db } from '$lib/db/client';
 import { auditLog } from '$lib/db/schema';
 import type { RequestEvent } from '@sveltejs/kit';
+// In May 2026 Drizzle, `PgTransaction` is the documented public type for the
+// transaction handle. Prefer it over the `Parameters<Parameters<...>>` trick
+// — easier to read, survives Drizzle's internal refactors. If your Drizzle
+// version pre-dates the export, fall back to:
+//   type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+// (which extracts the first parameter of the callback `db.transaction`
+// expects — i.e. the transaction handle.)
+import type { PgTransaction } from 'drizzle-orm/pg-core';
 
-type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+type Tx = PgTransaction<never, never, never>;
 
 export async function withAudit<T>(
   event: RequestEvent,
@@ -891,27 +996,43 @@ Action — the impersonation session goes into a *separate* cookie:
 // src/routes/(app)/admin/users/[id]/impersonate/+page.server.ts
 import type { Actions } from './$types';
 import { redirect, error } from '@sveltejs/kit';
+import { dev } from '$app/environment';
 import { db } from '$lib/db/client';
 import { sessions, users } from '$lib/db/schema';
 import { eq } from 'drizzle-orm';
 import { requireRole, withAudit } from '$lib/auth';
 import { newSessionToken } from '$lib/sessions';
+import { userId } from '$lib/brands';
+import { createHash, randomBytes } from 'node:crypto';
 
 const IMPERSONATION_LIFETIME_MS = 15 * 60 * 1000; // 15 minutes — short-lived
+
+function sha256Hex(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
 
 export const actions: Actions = {
   default: async (event) => {
     const admin = requireRole(event, 'admin');
-    const targetId = event.params.id;
-    const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
-    if (target === undefined) throw error(404, 'User not found');
+    const targetIdParam = event.params.id;
+    const [target] = await db.select().from(users).where(eq(users.id, targetIdParam)).limit(1);
+    if (target === undefined) {
+      throw error(404, 'User not found');
+    }
 
-    const token = newSessionToken();
+    // Match the encoding picked in Ch 44.7: base64url, 256 bits.
+    const token = randomBytes(32).toString('base64url');
+    const tokenHash = sha256Hex(token);
     await withAudit(event, 'user.impersonate.start', 'user', target.id, async (tx) => {
       await tx.insert(sessions).values({
-        userId: target.id,
+        // Re-brand at the boundary: `target.id` is `string` from Drizzle
+        // (Postgres uuid → JS string). We brand it through the `userId`
+        // constructor so the rest of the system sees `UserId`, not `string`.
+        // Same pattern applies to admin.id; `requireRole` already returns a
+        // re-branded user, so admin.id is already `UserId`.
+        userId: userId(target.id),
         impersonatorId: admin.id,
-        token,
+        tokenHash,
         expiresAt: new Date(Date.now() + IMPERSONATION_LIFETIME_MS),
         fresh: false,
       });
@@ -919,13 +1040,15 @@ export const actions: Actions = {
 
     // Set as a SECOND cookie — the admin's `session` cookie is preserved.
     event.cookies.set('session_impersonation', token, {
-      httpOnly: true, secure: true, sameSite: 'lax', path: '/',
+      httpOnly: true, secure: !dev, sameSite: 'lax', path: '/',
       maxAge: Math.floor(IMPERSONATION_LIFETIME_MS / 1000),
     });
     throw redirect(303, '/dashboard');
   },
 };
 ```
+
+> **Brand at the boundary, once.** `target.id` arrives as `string` because Drizzle reads Postgres uuids as JS strings. Pass it through `userId(target.id)` (or whichever brand constructor your `$lib/brands` module exposes) at the boundary; downstream code now sees `UserId`, not `string`, so a future bug that swaps `userId` and `impersonatorId` becomes a type error rather than a silent privilege escalation. Re-brand on every read from the DB or HTTP body — anywhere data crosses the trust boundary into your code.
 
 `handle` (in `+hooks.server.ts`) prefers the impersonation cookie when present:
 
@@ -939,18 +1062,22 @@ const authHandle: Handle = async ({ event, resolve }) => {
   const token = impersonationToken ?? sessionToken;
 
   if (token !== undefined) {
+    const tokenHash = sha256Hex(token);
     const rows = await db.select({
       user: users,
       impersonatorId: sessions.impersonatorId,
     })
       .from(sessions)
       .innerJoin(users, eq(sessions.userId, users.id))
-      .where(and(eq(sessions.token, token), gt(sessions.expiresAt, new Date())))
+      .where(and(eq(sessions.tokenHash, tokenHash), gt(sessions.expiresAt, new Date())))
       .limit(1);
 
-    if (rows[0] !== undefined) {
-      event.locals.user = rows[0].user;
-      event.locals.impersonatorId = rows[0].impersonatorId ?? null;
+    const row = rows[0];
+    if (row !== undefined) {
+      event.locals.user = row.user;
+      // `row.impersonatorId` is already `string | null` (Drizzle reads the
+      // nullable uuid column straight). No `?? null` needed.
+      event.locals.impersonatorId = row.impersonatorId;
     }
   }
 
@@ -967,11 +1094,16 @@ import { redirect } from '@sveltejs/kit';
 import { db } from '$lib/db/client';
 import { sessions } from '$lib/db/schema';
 import { eq } from 'drizzle-orm';
+import { createHash } from 'node:crypto';
 
-export const POST: RequestHandler = async ({ cookies, locals }) => {
+function sha256Hex(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
+
+export const POST: RequestHandler = async ({ cookies }) => {
   const token = cookies.get('session_impersonation');
   if (token !== undefined) {
-    await db.delete(sessions).where(eq(sessions.token, token));
+    await db.delete(sessions).where(eq(sessions.tokenHash, sha256Hex(token)));
   }
   cookies.delete('session_impersonation', { path: '/' });
   // The admin's `session` cookie is untouched — they're back in admin context.
@@ -994,6 +1126,8 @@ In the layout, show a banner when `event.locals.impersonatorId` is set:
 
 The principle: *separate cookie + handle prefers it + visible banner + audit at start and end + atomic delete on exit*. Without all five, impersonation becomes a backdoor.
 
+> **Session-row hygiene, forward-referenced.** Expired session rows accumulate in `sessions` until pruned. A leaked-cookie attacker can't use them (the row is past `expiresAt`, so `findValidSession` rejects), but the table grows unboundedly and complicates audits. Chapter 64 wires a daily cron at `/api/cron/prune-sessions` that deletes rows where `expiresAt < now()`. We don't need it functioning correctly until Streak has live users; we mention it here so it's on the launch-checklist and not invented from scratch later.
+
 Update `App.Locals` accordingly:
 
 ```ts
@@ -1015,7 +1149,7 @@ declare global {
 
 - **`db.transaction`** (Ch 42) — `withAudit` enforces atomicity.
 - **`Result` typing** (Ch 27) — every method that can fail uses it (still applies inside `withAudit`'s `fn`).
-- **`+layout.server.ts` central gate** (Ch 32, 45) — `requireRole` lives at the layout level.
+- **`+layout.server.ts` central gate** (Ch 45) — `requireRole` lives at the layout level. The original layout-data plumbing was introduced in Ch 32, but the central RBAC gate itself is the Ch 45 hook that populates `event.locals.user` plus the `requireRole` call inside `+layout.server.ts`.
 
 ---
 
@@ -1084,9 +1218,26 @@ grep -rE "(fetch|postgres|stripe|resend)\(" src/ | grep -v "timeout"
 ```ts
 // src/lib/rate-limit.ts
 type Bucket = { tokens: number; lastRefill: number };
-const buckets = new Map<string, Bucket>();
 const RATE = 5; // tokens
 const WINDOW_MS = 60_000;
+const MAX_KEYS = 10_000;
+
+// `Map` preserves insertion order, so deleting `keys().next().value` evicts
+// the oldest entry — a poor-man's LRU. For a real LRU we'd `delete` then
+// re-`set` on every access; this version evicts only on insert when the cap
+// is hit, which is fine for rate-limit purposes (the eviction target is
+// idle keys, not hot ones).
+const buckets = new Map<string, Bucket>();
+
+function setWithCap(key: string, bucket: Bucket): void {
+  if (!buckets.has(key) && buckets.size >= MAX_KEYS) {
+    const oldest = buckets.keys().next();
+    if (!oldest.done) {
+      buckets.delete(oldest.value);
+    }
+  }
+  buckets.set(key, bucket);
+}
 
 export function consume(key: string, tokensNeeded: number = 1): boolean {
   const now = Date.now();
@@ -1097,11 +1248,11 @@ export function consume(key: string, tokensNeeded: number = 1): boolean {
     b.lastRefill = now;
   }
   if (b.tokens < tokensNeeded) {
-    buckets.set(key, b);
+    setWithCap(key, b);
     return false;
   }
   b.tokens -= tokensNeeded;
-  buckets.set(key, b);
+  setWithCap(key, b);
   return true;
 }
 ```
@@ -1114,7 +1265,8 @@ import { consume } from '$lib/rate-limit';
 default: async ({ request, getClientAddress }) => {
   const ip = getClientAddress();
   const data = await request.formData();
-  const email = String(data.get('email') ?? '').toLowerCase();
+  const rawEmail = data.get('email');
+  const email = (typeof rawEmail === 'string' ? rawEmail : '').toLowerCase();
   if (!consume(`login:ip:${ip}`) || !consume(`login:email:${email}`)) {
     return fail(429, { error: 'Too many attempts. Try again in a minute.' });
   }
@@ -1122,7 +1274,9 @@ default: async ({ request, getClientAddress }) => {
 },
 ```
 
-In production, replace the in-memory map with Redis. Named.
+> **IP and PII boundary.** Raw IPs are fine inside an in-memory rate-limit Map (the keys self-expire and never leave the process). They MUST NOT feed Prometheus labels (Bible #14, cardinality explosion) or audit logs (Bible #15, PII at rest). The rate-limiter never re-emits these — `consume` returns a boolean, not the key. If you ever need to log a rate-limit decision, log the *bucket category* (`'login:ip'`) and not the IP itself.
+
+In production, replace the in-memory map with Redis. Named in the Bible. The 10k cap above is defence-in-depth: the in-memory map would otherwise grow without bound under attack, and a single-instance OOM is a worse outage than a brief rate-limit miss for the evicted key.
 
 ---
 
@@ -1142,6 +1296,8 @@ return response;
 ```
 
 Every value justified in the security-review doc. CSP starts strict; loosen only with reason.
+
+> **`'unsafe-inline'` for styles is a known relaxation.** We retain `'unsafe-inline'` in `style-src` because Svelte 5 inlines critical SSR styles for first-paint performance — turning it off breaks rendering. The known-relaxations list in `docs/security-review-2026-XX-XX.md` documents this with a planned migration to nonce-based CSP (every SSR'd `<style>` tag gets a per-request nonce; `style-src` becomes `'self' 'nonce-<value>'`). Verify the review doc actually names this relaxation; an undocumented `'unsafe-inline'` is a finding in itself, even if the relaxation is justified.
 
 ---
 
@@ -1180,6 +1336,8 @@ Add to `package.json`:
 
 In CI, this runs against the deployed preview URL via `TEST_BASE_URL`.
 
+> **The script assumes a server is up.** `pnpm security:headers` runs `fetch` against `:4173`, which is `pnpm preview`'s default port. Either start `pnpm preview` first (in another terminal) or wire a Playwright-style `webServer` config that starts the preview automatically. The bare `vitest run` here will fail with `ECONNREFUSED` if nothing is listening; that's the correct failure mode (no false-positive green) but it's a footgun for new contributors.
+
 ---
 
 ## Lesson 48.6 — The review document
@@ -1188,6 +1346,9 @@ In CI, this runs against the deployed preview URL via `TEST_BASE_URL`.
 
 ```markdown
 # Streak — Security Review (2026-05-05)
+
+Author: Billy Ribeiro
+Reviewers: <name 1>, <name 2>
 
 ## Scope
 Auth system: signup, login, logout, sessions, RBAC, audit log.

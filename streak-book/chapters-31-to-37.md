@@ -48,6 +48,38 @@ export const load: PageLoad = async () => {
 >
 > **universal `load`** — a `+page.ts` `load` runs on the server during SSR, then on the client during navigation. It must not access secrets or DB.
 
+> **Version note** — `PageProps` was added to `./$types` in SvelteKit 2.16 (December 2024). The book pins to SvelteKit 2.5x (May 2026). Older versions used `$$Props` or hand-typed `data`; if you're reading code from before late 2024 you'll see those shapes instead.
+
+### Read this code
+
+**Snippet A** — given:
+
+```ts
+// src/routes/+page.ts
+export const load: PageLoad = async () => {
+  console.log('load running');
+  return { now: Date.now() };
+};
+```
+
+You hard-reload `/` in the browser. How many times does `'load running'` print, and where?
+
+<details>
+<summary>Worked answer</summary>
+
+Twice. Once in your terminal (the server log, during SSR), once in the browser console (the client, during hydration). A universal `load` runs on the server first to render the HTML, then SvelteKit re-runs it on the client so the same `data` is reactive to client navigations. Subsequent client-side navigations only run it on the client.
+
+If you want `load` to run server-only, move it to `+page.server.ts` — then it runs once per request, on the server, and the client gets the serialised result.
+</details>
+
+**Snippet B** — given a route folder `src/routes/habits/[id]/+page.ts`, what is the type of `params.id` inside `load`?
+
+<details>
+<summary>Worked answer</summary>
+
+`string`. Folder names like `[id]` always become `string` keys on `params`, regardless of what shape you intend (numeric ID, UUID, slug). If you want a branded `HabitId`, you have to validate in `load` (Chapter 27's parsers) — TypeScript can't infer the brand from a folder name.
+</details>
+
 ---
 
 ## Lesson 31.2 — `data` is read-only from the page's perspective
@@ -67,6 +99,8 @@ The page can't mutate `data` directly. Mutations go through actions or store met
 ```
 
 (Cleaner is to pass the seed into the constructor; we'll do that in Chapter 32 once context enters.)
+
+> **SSR note.** This `const store = new HabitStore()` at the top of `+page.svelte` is per-component-instance, not module-level — it's SSR-safe. The `localStorage`-seeded singleton in Chapter 38 is where SSR matters; we'll context-ise it in Chapter 32.
 
 ---
 
@@ -90,6 +124,20 @@ This fetch:
 - passes through CSRF protections.
 
 Don't use the global `fetch` in `load` — use the one from the parameter. And don't trust the JSON shape: route it through the boundary parser from Chapter 26 (here, `parseHabits`).
+
+> **`Result` reconciliation.** Once Chapter 27 lands `Result`, `parseHabits` returns an array where each entry is `Result<Habit, ParseError>`. We drop the errors and keep the OK rows here:
+>
+> ```ts
+> export const load: PageLoad = async ({ fetch }) => {
+>   const res = await fetch('/api/habits');
+>   const raw: unknown = await res.json();
+>   const parsed = parseHabits(raw);
+>   const habits = parsed.filter((r) => r.ok).map((r) => r.value);
+>   return { habits };
+> };
+> ```
+>
+> In production you'd want to log the dropped error rows (Chapter 56's `handleError` is the natural sink). For now the filter keeps the page rendering when one row is malformed instead of nuking the whole page.
 
 ---
 
@@ -245,17 +293,10 @@ The senior pattern for per-user/per-request stores: `setContext`/`getContext` in
 
 > **`setContext(key, value)` / `getContext(key)`** — Svelte primitives for sharing values down a component tree without prop-drilling. The key can be a string or (preferred for big apps) a `Symbol`.
 
-The naive shape uses a string key with an `as` cast at the consumer:
+**Lead with the typed wrapper.** Define `setHabitStore` / `getHabitStore` once, in `$lib/contexts.ts`, and have the rest of the codebase call those helpers exclusively:
 
 ```ts
-// ❌ The naive shape — Bible rule #3 violation (`as` lies to the type system).
-const store = getContext('habit-store') as HabitStore;
-```
-
-If the consumer's key doesn't match what was set, you get `undefined` at runtime that the type system doesn't catch. Don't write this. Wrap with a typed helper instead:
-
-```ts
-// ✅ src/lib/contexts.ts
+// ✅ src/lib/contexts.ts — the only file that touches setContext/getContext directly.
 import { setContext, getContext } from 'svelte';
 import type { HabitStore } from '$lib/habits.svelte';
 
@@ -267,7 +308,9 @@ export function setHabitStore(store: HabitStore): void {
 
 export function getHabitStore(): HabitStore {
   const store = getContext<HabitStore | undefined>(HABIT_STORE_KEY);
-  if (store === undefined) throw new Error('HabitStore not in context — did you call setHabitStore?');
+  if (store === undefined) {
+    throw new Error('HabitStore not in context — did you call setHabitStore?');
+  }
   return store;
 }
 ```
@@ -294,6 +337,17 @@ Then use the helpers, never the raw primitives:
 ```
 
 Each user navigating their own browser tab has their own component tree, hence their own `HabitStore`. The `Symbol` makes the key globally unique; the wrapper enforces presence at the type level. No `as` cast anywhere. No SSR-singleton landmine.
+
+> **Symbol keys and SSR.** Symbol-as-key is module-scope; it doesn't share state across SSR requests, just identity. Each request still gets fresh instances if instantiated per-request inside a component or layout. The Symbol is the same identity in every render; the *value* stored under it lives inside the component tree, which SvelteKit recreates per request.
+
+**What the wrapper hides — never write this directly:**
+
+```ts
+// ❌ Bible rule #3 violation (`as` lies to the type system).
+const store = getContext('habit-store') as HabitStore;
+```
+
+If the consumer's key doesn't match what was set, you get `undefined` at runtime that the type system doesn't catch. The wrapper above is what protects you from that.
 
 ---
 
@@ -337,23 +391,45 @@ Create `src/routes/habits/[id]/+page.ts` and `+page.svelte`:
 ```ts
 // src/routes/habits/[id]/+page.ts
 import type { PageLoad } from './$types';
-import type { Habit } from '$lib/types';
-import { habitId } from '$lib/types';
+import type { Habit, HabitId } from '$lib/types';
+import { habitId, parseHabitId } from '$lib/types';
 import { error } from '@sveltejs/kit';
 
 export const load: PageLoad = async ({ params }) => {
+  // params.id is `string` — narrow it to HabitId at the boundary.
+  const id: HabitId | null = parseHabitId(params.id);
+  if (id === null) {
+    throw error(404, { message: 'Habit not found' });
+  }
+
   // For now, fake data. Real DB in Part VI.
   const fakeHabits: Habit[] = [
     { id: habitId('demo-1'), name: 'Drink water', createdAt: Date.now() },
     { id: habitId('demo-2'), name: 'Read 20 minutes', createdAt: Date.now() },
   ];
-  const habit = fakeHabits.find((h) => h.id === params.id);
-  if (habit === undefined) throw error(404, { message: 'Habit not found' });
+  const habit = fakeHabits.find((h) => h.id === id);
+  if (habit === undefined) {
+    throw error(404, { message: 'Habit not found' });
+  }
   return { habit };
 };
 ```
 
 > **`error(status, message)`** is documented to be used as `throw error(...)`. The helper does throw internally (its return type is `never`), so a bare `error(...)` works at runtime — but writing `throw` makes the control-flow visible in the source. Senior habit, and consistent with `throw redirect(...)`. We use `throw` everywhere.
+
+The `parseHabitId` helper is the same shape we built in Chapter 27:
+
+```ts
+// src/lib/types.ts (sketch)
+export function parseHabitId(s: string): HabitId | null {
+  if (!/^[a-zA-Z0-9_-]{4,40}$/.test(s)) {
+    return null;
+  }
+  return s as HabitId; // brand assertion lives behind one validated function
+}
+```
+
+In `Result` form (post-Ch-27) it'd be `Result<HabitId, ParseError>`; the call site swaps to `if (!id.ok) { throw error(404, ...); }` and uses `id.value`. Either way, `params.id: string` never flows into a `HabitId`-typed slot without a check.
 
 ```svelte
 <!-- src/routes/habits/[id]/+page.svelte -->
@@ -370,8 +446,6 @@ export const load: PageLoad = async ({ params }) => {
 ```
 
 Visit `http://localhost:5173/habits/demo-1`. The detail page renders. Visit `/habits/nonexistent` — `error(404, ...)` triggers.
-
-> **`error(status, message)`** — `@sveltejs/kit` helper that throws a typed error. Caught by `+error.svelte`.
 
 ---
 
@@ -394,6 +468,8 @@ export function match(param: string): boolean {
 ```
 
 Then `src/routes/habits/[id=habitId]/+page.svelte` — the `=habitId` ties the param to the matcher.
+
+> **No runes in matchers.** Param matchers are pure functions in plain `.ts` files (not `.svelte.ts`); they don't use runes. They run on the server during request routing, before any component context exists. Keep them deterministic: same input, same boolean.
 
 ---
 
@@ -499,9 +575,79 @@ export {};
 
 This typing flows into `page.error`.
 
+> **Forward reference.** Chapter 56 expands `App.Error` to include `category?: 'auth' | 'billing' | 'database' | 'unknown';` so `handleError` can route different failure classes to different telemetry buckets. We start minimal here — `message` plus an optional `code` is enough until the unexpected-error story lands.
+
 ---
 
-## Lesson 34.4 — Recurring concepts from earlier chapters
+## Lesson 34.4 — Now you write it
+
+**The English sentence first:**
+
+> *"Write a `+error.svelte` for `(app)/habits/[id]/` that distinguishes 404 (\"habit not found, try one of these:\") from other errors. Include a list of two example habit IDs the user could try."*
+
+<details>
+<summary>Worked answer</summary>
+
+`src/routes/(app)/habits/[id]/+error.svelte`:
+
+```svelte
+<script lang="ts">
+  import { page } from '$app/state';
+
+  const examples: ReadonlyArray<{ id: string; name: string }> = [
+    { id: 'demo-1', name: 'Drink water' },
+    { id: 'demo-2', name: 'Read 20 minutes' },
+  ];
+</script>
+
+<div class="error-card">
+  {#if page.status === 404}
+    <h2>Habit not found</h2>
+    <p>The habit you tried to open doesn't exist or has been deleted.</p>
+    <p>Try one of these:</p>
+    <ul>
+      {#each examples as example (example.id)}
+        <li><a href={`/habits/${example.id}`}>{example.name}</a></li>
+      {/each}
+    </ul>
+  {:else}
+    <h2>{page.status}</h2>
+    <p>{page.error?.message ?? 'Something went wrong.'}</p>
+    <a href="/dashboard">Back to dashboard</a>
+  {/if}
+</div>
+
+<style>
+  .error-card { padding: 2rem; border: 1px solid #fcc; border-radius: 0.5rem; }
+</style>
+```
+
+The route-specific `+error.svelte` *replaces* the parent one for errors thrown by this route or any descendant — SvelteKit walks up the tree until it finds an `+error.svelte`. Visit `/habits/nope`: this card shows. Throw a 500 from the load instead: the `else` branch shows.
+</details>
+
+---
+
+## Lesson 34.5 — Read this code
+
+**Snippet A** — given the root `+error.svelte` from Lesson 34.1, what shows when a `load` does `throw error(403, 'forbidden')` versus when a `load` runs an uncaught `throw new Error('boom')`?
+
+<details>
+<summary>Worked answer</summary>
+
+For `throw error(403, 'forbidden')`:
+- `page.status` is `403`.
+- `page.error?.message` is `'forbidden'`.
+- The card shows `403` and the literal string `forbidden`.
+
+For uncaught `throw new Error('boom')`:
+- This is *unexpected*. SvelteKit catches it, runs `handleError` (default or your override), and renders `+error.svelte` with `page.status === 500` and `page.error?.message === 'Internal Error'` (the safe default — your real message is logged server-side, not leaked to the user). You'd need to override `handleError` (Chapter 56) to surface a custom message to the UI.
+
+The takeaway: `throw error(...)` is the only way to control the user-visible message from a `load`. Anything else gets sanitized to a generic 500 message.
+</details>
+
+---
+
+## Lesson 34.6 — Recurring concepts from earlier chapters
 
 - **`error()` helper** (Ch 33) — same call, now visualised by `+error.svelte`.
 - **`?.` and `??`** (Ch 4) — `page.error?.message ?? 'Something went wrong.'`.
@@ -509,7 +655,7 @@ This typing flows into `page.error`.
 
 ---
 
-## Lesson 34.5 — What you can now read in the wild
+## Lesson 34.7 — What you can now read in the wild
 
 After Chapter 34 you can:
 
@@ -540,7 +686,7 @@ After Chapter 34 you can:
   import { page, navigating } from '$app/state';
 </script>
 
-<a href="/" class="logo" class:hidden={page.url.pathname === '/'}>Streak</a>
+<a href="/dashboard" class="logo" class:hidden={page.url.pathname === '/dashboard'}>Streak</a>
 <small>{page.url.pathname}</small>
 {#if navigating}<small>navigating…</small>{/if}
 
@@ -549,7 +695,7 @@ After Chapter 34 you can:
 </style>
 ```
 
-`page` and `navigating` are *reactive runes* — when the URL changes, anything reading `page.url.pathname` re-renders.
+`page` and `navigating` are *reactive values backed by runes*, not user-callable runes themselves. They expose runes-tracked state via getters — reading `page.url.pathname` registers a dependency in the surrounding reactive context, so anything that reads it re-renders when the URL changes. You don't call them like `$state(...)`; you import them and read fields off them.
 
 > **`$app/state`** — Svelte 5's runes-style replacement for the legacy `$app/stores`. Members: `page`, `navigating`, `updated`.
 
@@ -567,14 +713,91 @@ Screen readers announce *"current page"* on the active link.
 
 ---
 
-## Lesson 35.3 — Recurring concepts from earlier chapters
+## Lesson 35.3 — Now you write it
+
+**The English sentence first:**
+
+> *"Build a `<NavLink href, label>` component that wraps an `<a>`. It reads `page.url.pathname` and applies `aria-current=\"page\"` when its `href` matches the current path."*
+
+<details>
+<summary>Worked answer</summary>
+
+`src/lib/NavLink.svelte`:
+
+```svelte
+<script lang="ts">
+  import { page } from '$app/state';
+
+  type Props = {
+    href: string;
+    label: string;
+  };
+
+  const { href, label }: Props = $props();
+  const isCurrent = $derived(page.url.pathname === href);
+</script>
+
+<a {href} aria-current={isCurrent ? 'page' : undefined}>{label}</a>
+```
+
+Use it in the layout:
+
+```svelte
+<nav>
+  <NavLink href="/dashboard" label="Dashboard" />
+  <NavLink href="/stats" label="Stats" />
+</nav>
+```
+
+When the user navigates between routes, `page.url.pathname` changes, `isCurrent` re-derives, and the `aria-current` attribute toggles automatically. No event listeners, no manual subscriptions — the `$derived` rune does the wiring.
+</details>
+
+---
+
+## Lesson 35.4 — Read this code
+
+**Snippet** — given:
+
+```svelte
+<script lang="ts">
+  import { page } from '$app/state';
+  const search = $derived(page.url.search);
+</script>
+
+<p>Query: {search}</p>
+```
+
+The user navigates from `/foo?q=hello` to `/foo?q=hello#section`. Does `search` re-compute?
+
+<details>
+<summary>Worked answer</summary>
+
+Yes. `page.url` is a fresh `URL` instance per navigation — SvelteKit doesn't mutate the existing URL, it constructs a new one and re-assigns. So even though only the hash changed, the `URL` object is identity-different, and `page.url.search` is being read off a new object. The `$derived` re-runs and `search` is recalculated to the same string `'?q=hello'`.
+
+The render output is identical (Svelte's reactivity reconciliation skips DOM updates when the new value matches the old), but the derivation *does* run. If you depended on the derivation NOT running for hash-only changes (e.g., it logs analytics on every change), you'd want to compare strings yourself, not rely on URL identity.
+</details>
+
+---
+
+## Lesson 35.5 — Glossary
+
+| Term | Meaning |
+|---|---|
+| `page` | Reactive value from `$app/state`. Exposes `url`, `params`, `route`, `status`, `error`, `data`, `form`, `state` of the current request. Reads register dependencies. |
+| `navigating` | Reactive value from `$app/state`. Truthy (a `Navigation` object) while a client-side navigation is in flight, `null` otherwise. Use for spinners/progress UI. |
+| `updated` | Reactive value from `$app/state`. `updated.current` flips `true` when SvelteKit detects a new app version is available (after `pollInterval`). Pair with a "reload to update" banner. |
+| `aria-current` | ARIA attribute on a link/nav-item announcing the current location. Values: `'page'`, `'step'`, `'location'`, `'date'`, `'time'`, `'true'`, `'false'`, or omit. Screen readers announce *"current page"* when set to `'page'`. |
+
+---
+
+## Lesson 35.6 — Recurring concepts from earlier chapters
 
 - **`class:foo={cond}`** (Ch 5) — used here for `class:hidden`.
 - **`{#if navigating}`** — derived rendering on the navigation state rune.
 
 ---
 
-## Lesson 35.4 — What you can now read in the wild
+## Lesson 35.7 — What you can now read in the wild
 
 After Chapter 35 you can:
 
@@ -604,7 +827,7 @@ After Chapter 35 you can:
 import { goto } from '$app/navigation';
 
 async function handleDelete(): Promise<void> {
-  await goto('/');
+  await goto('/dashboard');
 }
 ```
 
@@ -639,14 +862,86 @@ Now any later `invalidate('streak:habits')` re-runs that load. The page's data p
   let isDirty = $state(false);
 
   beforeNavigate(({ cancel }) => {
-    if (isDirty && !window.confirm('Discard unsaved changes?')) cancel();
+    // TODO: replace with confirmDialog at Ch 53
+    if (isDirty && !window.confirm('Discard unsaved changes?')) {
+      cancel();
+    }
   });
 </script>
 ```
 
+> **Browser-native dialogs are placeholder code.** `window.confirm` / `window.alert` / `window.prompt` are unstyled and ignore the dark theme — they look like 1998 browser chrome dropped into a modern app. Senior teams replace them with a custom dialog primitive; Chapter 53 builds one. We use `window.confirm` for now to keep the focus on `beforeNavigate`. The `TODO` comment in the snippet is the real-world habit: never let a placeholder ship without a tracked replacement.
+
 ---
 
-## Lesson 36.4 — Recurring concepts from earlier chapters
+## Lesson 36.4 — Read this code
+
+**Snippet** — given a `/dashboard` `+page.ts` with a `load` that prints `'dashboard load running'`. The user is on `/about` and code runs `await goto('/foo')`. Does the dashboard `load` re-run?
+
+<details>
+<summary>Worked answer</summary>
+
+No. `goto('/foo')` navigates to `/foo`, not `/dashboard`. Loads run for the *destination* route's hierarchy (`/foo`'s `+page.ts`, plus any `+layout.ts` ancestors that depend on something that changed). The dashboard `+page.ts` is for `/dashboard` and isn't on the new route's hierarchy, so it doesn't run.
+
+Two cases where the dashboard load *would* re-run:
+1. `goto('/dashboard')` — destination is `/dashboard`, so its load runs.
+2. After an `invalidate(...)` whose key matches a `depends(...)` declared in the dashboard load, *and* the user navigates back to `/dashboard`. The invalidation marks the load as stale; the next time `/dashboard` is visited, it re-runs.
+
+Loads don't run "everywhere on every navigation" — they run for the route you're navigating *to*, plus shared ancestors whose dependencies changed.
+</details>
+
+---
+
+## Lesson 36.5 — Now you write it
+
+**The English sentence first:**
+
+> *"Inside the root `+layout.svelte`, register an `afterNavigate` hook that scrolls the `<main>` element to the top after every client-side navigation."*
+
+<details>
+<summary>Worked answer</summary>
+
+```svelte
+<!-- src/routes/+layout.svelte -->
+<script lang="ts">
+  import type { Snippet } from 'svelte';
+  import { afterNavigate } from '$app/navigation';
+
+  let { children }: { children: Snippet } = $props();
+  let mainEl: HTMLElement | undefined = $state();
+
+  afterNavigate(() => {
+    mainEl?.scrollTo({ top: 0, behavior: 'instant' });
+  });
+</script>
+
+<header><!-- nav --></header>
+<main bind:this={mainEl}>
+  {@render children()}
+</main>
+```
+
+`afterNavigate` runs after every successful client-side navigation (including the initial one). The `mainEl?.scrollTo` is null-safe in case the binding hasn't attached yet. We use `'instant'` because a smooth scroll competes with the user's reading focus on a fresh page.
+
+Why scope the scroll to `<main>` and not `window`? If the page layout puts the scrollbar on `<main>` (common with sticky headers), `window.scrollTo` is a no-op. Scoping to the actual scroll container is the senior habit.
+</details>
+
+---
+
+## Lesson 36.6 — Glossary
+
+| Term | Meaning |
+|---|---|
+| `goto(url, options?)` | Imperatively navigate. Returns a `Promise<void>` that resolves when the destination's loads finish. `await` it if you have follow-up logic. |
+| `invalidate(key)` | Mark loads that called `depends(key)` as stale. Re-runs them in place; the page's `data` prop refreshes without a full nav. `key` is a string or a URL-matching predicate. |
+| `invalidateAll()` | Mark *every* active load as stale. The blunt instrument; reach for `invalidate(key)` first. |
+| `beforeNavigate({ from, to, cancel, type })` | Fires before a navigation. Call `cancel()` to block it. The classic unsaved-changes guard. Doesn't fire for full-page reloads (the browser owns those). |
+| `afterNavigate({ from, to, type })` | Fires after a successful navigation, including the initial render. Use for analytics, scroll-restoration, focus management. |
+| `depends(key)` | Declared *inside* a `load`. Registers that this load is invalidated by `invalidate(key)`. The handshake that wires `invalidate` to specific loads. |
+
+---
+
+## Lesson 36.7 — Recurring concepts from earlier chapters
 
 - **`async`/`await`** (Ch 22) — `goto` and `invalidate` return Promises.
 - **`window.confirm`** (Ch 15) — placeholder dialog; we'll replace with `<ConfirmDialog>` in Ch 53.
@@ -654,7 +949,7 @@ Now any later `invalidate('streak:habits')` re-runs that load. The page's data p
 
 ---
 
-## Lesson 36.5 — What you can now read in the wild
+## Lesson 36.8 — What you can now read in the wild
 
 After Chapter 36 you can:
 
@@ -727,24 +1022,39 @@ You'll occasionally need to think about this; mostly it just works.
 ## Lesson 37.4 — The seven `+`-files cheat sheet
 
 ```
-+page.svelte         page UI
-+page.ts             universal load (no DB/secrets)
-+page.server.ts      server-only load + actions (DB, secrets, cookies)
-+layout.svelte       layout UI
-+layout.ts           universal layout load
-+layout.server.ts    server-only layout load (auth gating)
-+server.ts           REST endpoint (GET/POST/...)
-+error.svelte        error boundary
-+hooks.server.ts     handle/handleError/handleFetch
-+hooks.client.ts     handleError on the client
-+hooks.ts            reroute, transport (universal)
++page.svelte               page UI
++page.ts                   universal load (no DB/secrets)
++page.server.ts            server-only load + actions (DB, secrets, cookies)
++layout.svelte             layout UI
++layout.ts                 universal layout load
++layout.server.ts          server-only layout load (auth gating)
++server.ts                 REST endpoint (GET/POST/...)
++error.svelte              error boundary
++hooks.server.ts           handle/handleError/handleFetch
++hooks.client.ts           handleError on the client
++hooks.ts                  reroute, transport (universal)
++page@.svelte              page UI, layout-RESET — skip the immediate parent layout
++page@(group).svelte       page UI, layout-RESET — re-anchor to the named group/segment
++layout@.svelte            layout UI, layout-RESET — same idea, but for nested layouts
++layout@(group).svelte     layout UI, layout-RESET — re-anchor to the named group/segment
 ```
 
 Print this. Stick it above your monitor.
 
+The `@`-form (last four entries) is the layout-reset syntax introduced in Lesson 37.2 — `+page@.svelte` skips the immediate parent layout entirely; `+page@(marketing).svelte` re-anchors at the `(marketing)` group's layout. Same shape applies to `+layout@.svelte` for re-rooting a nested layout. Cross-reference Ch 37.2 for the worked example; this cheat sheet exists so you can spot it in the wild without flipping back.
+
 ---
 
 ## Lesson 37.5 — Now you write it
+
+> **URL sweep callout — read before you start.** Earlier chapters used `/` as the home/dashboard URL. Once you do this exercise, the marketing landing page owns `/` and the app dashboard moves to `/dashboard`. **If you're moving to Ch 37's split, swap `'/'` for `/dashboard` everywhere a previous chapter wrote it as the app's home.** Concretely:
+>
+> - Ch 33's `<a href="/">← Back</a>` on the habit detail page → `<a href="/dashboard">← Back</a>`.
+> - Ch 35.1's `class:hidden={page.url.pathname === '/dashboard'}` is already correct in this chapter; if you're cross-referencing an older draft that says `=== '/'`, update it.
+> - Ch 36.1's `await goto('/dashboard')` after delete is already correct; older drafts that said `goto('/')` should be updated.
+> - The `<a href="/" class="logo">` in `+layout.svelte` (Ch 32) stays as `/` — the logo points to the marketing landing, not the dashboard.
+>
+> Anything else inside earlier files stays untouched (those snippets predate the split). The sweep only matters from here forward.
 
 **The English sentence first:**
 

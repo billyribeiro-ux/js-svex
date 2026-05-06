@@ -38,6 +38,8 @@ function describe(state: RequestState<Habit[]>): string {
 
 Read aloud: *"if the status is success, return the habit count. If it's error, return the error message. Otherwise return the status string itself ('idle' or 'loading')."*
 
+After both early returns, TypeScript knows `state.status` cannot be `'success'` or `'error'`, so it's narrowed to `'idle' | 'loading'`.
+
 > **discriminated union** — a union of object types sharing a common literal field that lets the compiler tell them apart.
 >
 > **narrowing** — what TypeScript does when a check (`status === 'success'`) lets it deduce the variant.
@@ -100,8 +102,10 @@ Use it in `+page.svelte`:
 import type { Habit, RequestState } from '$lib/types';
 import { assertNever } from '$lib/types';
 
-let saveState: RequestState<void> = $state({ status: 'idle' });
+let saveState: RequestState<true> = $state({ status: 'idle' });
 ```
+
+We use `true` (not `void`) as the success payload because `void` is awkward here: a `success` arm typed `{ status: 'success'; data: void }` can't be constructed without writing `data: undefined`, and `void` is meant for *return types*, not data. `true` is a one-bit flag — succeeded with no payload. The success arm is `{ status: 'success', data: true }`.
 
 And in markup, the switch becomes:
 
@@ -181,7 +185,7 @@ This will appear, unchanged, in Chapter 49.
 
 ## Lesson 23.7 — Recurring concepts from earlier chapters
 
-- **Union types** (Ch 4, 14) — `RequestState` is a *discriminated* union.
+- **Union types** (Ch 4 introduced `string | null`; Ch 9 introduced the named `Habit` type) — `RequestState` is a *discriminated* union built on those primitives.
 - **The four-state UI rule** (Ch 22) — formalised here as a real type.
 - **`switch` over a discriminator** — natural extension of `if/else if/else`.
 - **Type narrowing** (Ch 19) — what the compiler does when you check the discriminator.
@@ -277,6 +281,8 @@ Use it:
 
 The compiler infers `T = Habit` from the call site. `h` inside the snippet is typed `Habit`.
 
+> **Aside.** The snippet name (`item`) must match the prop name on the component. `{#snippet item(h)}` binds to the `item` prop on `<List>`; rename it to `{#snippet row(h)}` and the compiler complains that `<List>` has no `row` prop and the `item` prop is missing.
+
 ---
 
 ## Lesson 24.3 — Constraints
@@ -334,7 +340,7 @@ export function groupBy<T>(items: T[], getKey: (item: T) => string): Record<stri
 
 `Record<string, T[]>` is TypeScript shorthand for "an object whose keys are strings and whose values are `T[]`". 
 
-Why the explicit `bucket` variable? Because under `noUncheckedIndexedAccess`, `result[key]` has type `T[] | undefined` *every* time you read it — even after `??=` would have ensured it's an array. The compiler doesn't track that. Pulling the bucket into a `const` narrows once and lets us `push` without re-reading.
+Why the explicit `bucket` variable? `noUncheckedIndexedAccess` is a `tsconfig.json` strict-flag (Ch 7) that makes every indexed read return `T | undefined`. Under it, `result[key]` has type `T[] | undefined` *every* time you read it — even after `??=` would have ensured it's an array. The compiler doesn't track that. The senior pattern is `result[key] ?? []` to fall back to an empty array, then assign. Pulling the bucket into a `const` narrows once and lets us `push` without re-reading.
 </details>
 
 ---
@@ -498,6 +504,39 @@ What's `HTTP_STATUSES.ok`'s type?
 
 > *"Define `BILLING_PLANS` as `as const` with `'free' | 'pro' | 'team'` and derive a `BillingPlan` type. Add a `plan: BillingPlan` field to a future `User` type."*
 
+<details>
+<summary>Worked answer</summary>
+
+```ts
+// src/lib/types.ts
+export type Plan = {
+  readonly id: 'free' | 'pro' | 'team';
+  readonly priceCents: number;
+  readonly seats: number;
+};
+
+export const BILLING_PLANS = [
+  { id: 'free', priceCents: 0, seats: 1 },
+  { id: 'pro', priceCents: 999, seats: 1 },
+] as const satisfies readonly Plan[];
+
+export type BillingPlan = (typeof BILLING_PLANS)[number]['id'];
+// BillingPlan: 'free' | 'pro'
+```
+
+`as const` keeps each plan's `id` as a literal (`'free'`, `'pro'`); `satisfies readonly Plan[]` enforces the shape without widening; `(typeof BILLING_PLANS)[number]['id']` extracts the union of `id`s. A future `User` type can declare `plan: BillingPlan` and the compiler refuses any string outside the frozen list.
+</details>
+
+---
+
+## Lesson 25.6b — Build, break, fix
+
+Open `src/lib/types.ts` and inside any concrete `Habit` literal you've written so far (the seed in `+page.svelte` is fine), set `category: 'travel'`. Save.
+
+The compiler refuses: `Type '"travel"' is not assignable to type 'HabitCategory | undefined'.` The `HabitCategory` type is the union of the six strings in `HABIT_CATEGORIES` — `'travel'` isn't in it. Restore to one of the legal values (or remove the field). The error vanishes.
+
+This is the loop you live in once you derive types from `as const` lists: the list is the single source of truth, and *every* misuse becomes a red squiggle the moment you save.
+
 ---
 
 ## Lesson 25.7 — Recurring concepts from earlier chapters
@@ -515,6 +554,17 @@ After Chapter 25 you can:
 - Read **`readonly T[]`** in function signatures and know it's a no-mutation guarantee.
 - Read **`obj satisfies Type`** vs **`obj: Type`** and pick correctly.
 - Read **`(typeof X)[number]`** and **`keyof typeof X`** as type-extraction patterns.
+
+---
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| `as const` | Keep array/object literals as their *exact* values (literals, not widened); make the structure `readonly`. |
+| `readonly` | Marker on a type or array signalling "no mutation allowed through this reference". Compile-time only. |
+| `satisfies` | Assert a value conforms to a type *without widening* — the value keeps its specific shape, the type is just a check. |
+| `(typeof X)[number]` | Type extraction: take the type of value `X` (e.g. an `as const` array) and produce the union of its element types. |
 
 ---
 
@@ -582,6 +632,8 @@ After any of these checks, TypeScript narrows.
 
 ## Lesson 26.4 — `parseHabit`
 
+> **Forward reference.** Chapter 27 will switch this return type to `Result<Habit, string>`. We start with `Habit | null` to keep this lesson focused on the parsing logic.
+
 Create `src/lib/parseHabit.ts`:
 
 ```ts
@@ -589,20 +641,32 @@ Create `src/lib/parseHabit.ts`:
 import type { Habit, HabitCategory } from '$lib/types';
 import { HABIT_CATEGORIES } from '$lib/types';
 
+function isHabitCategory(s: string): s is HabitCategory {
+  return (HABIT_CATEGORIES as readonly string[]).includes(s);
+}
+
 export function parseHabit(input: unknown): Habit | null {
-  if (typeof input !== 'object' || input === null) return null;
+  if (typeof input !== 'object' || input === null) {
+    return null;
+  }
   const obj = input as Record<string, unknown>;
 
-  if (typeof obj.id !== 'string') return null;
-  if (typeof obj.name !== 'string' || obj.name.trim() === '') return null;
-  if (typeof obj.createdAt !== 'number' || !Number.isFinite(obj.createdAt)) return null;
+  if (typeof obj.id !== 'string') {
+    return null;
+  }
+  if (typeof obj.name !== 'string' || obj.name.trim() === '') {
+    return null;
+  }
+  if (typeof obj.createdAt !== 'number' || !Number.isFinite(obj.createdAt)) {
+    return null;
+  }
 
   const description: string | undefined =
     typeof obj.description === 'string' ? obj.description : undefined;
 
   const category: HabitCategory | undefined =
-    typeof obj.category === 'string' && (HABIT_CATEGORIES as readonly string[]).includes(obj.category)
-      ? (obj.category as HabitCategory)
+    typeof obj.category === 'string' && isHabitCategory(obj.category)
+      ? obj.category
       : undefined;
 
   return {
@@ -614,6 +678,8 @@ export function parseHabit(input: unknown): Habit | null {
   };
 }
 ```
+
+The `isHabitCategory` predicate replaces what would otherwise be an `obj.category as HabitCategory` cast. Inside the ternary's `true` branch, TypeScript narrows `obj.category` from `string` to `HabitCategory` automatically — no `as` needed. **Predicates over casts** is the senior pattern (Bible rule).
 
 Read aloud, line by line: *"if input isn't an object, reject. Cast to a record of unknowns. Check id is a non-empty string. Check name. Check createdAt. Optionally parse description. Optionally parse category against the frozen list. Return the typed result."*
 
@@ -630,6 +696,8 @@ function isHabit(value: unknown): value is Habit {
 ```
 
 The `value is Habit` return type tells TypeScript: *"if this returns true, treat `value` as `Habit` afterward."*
+
+> **Forward reference.** Chapter 27 changes `parseHabit` to return `Result<Habit, string>` — a `Result` is never `null`, so this guard becomes `return parseHabit(value).ok;`. Keep that swap in mind when you reach Ch 27.4.
 
 > **type predicate** — a return type of the form `param is T`, asserting the parameter is `T` if the function returns true.
 
@@ -745,6 +813,8 @@ loadHabit(u); // ❌ Argument of type 'UserId' is not assignable to parameter of
 
 > **branded type** — a type that's structurally a primitive but nominally distinct via a phantom field.
 
+> **Senior gotcha.** Branded types are compile-time only — they disappear at runtime. When data crosses a boundary (DB query result, `JSON.parse`, devalue, `localStorage`), the brand is lost; the value is a plain `string` once again. Re-brand explicitly with `habitId(...)` at the boundary. The compiler can't remind you because the brand isn't there to check at runtime — *every* parsed value enters as a bare `string` and you decide where to re-brand.
+
 ---
 
 ## Lesson 27.2 — Wiring it into Streak
@@ -784,6 +854,8 @@ function makeHabit(name: string): Habit {
 ```
 
 And every place that takes an `id: string` becomes `id: HabitId`. The compiler walks you through the changes.
+
+**Branded types vs Drizzle's `string` returns.** Drizzle returns `string` from `$inferSelect`, not `HabitId` — the brand is purely a compile-time decoration that doesn't survive a DB round-trip. We'll wire a `parseDbHabit(row): Habit` boundary in Chapter 39 to re-brand at that exit point. For now, type the brand at every layer that *owns* the type (the store, the page, the client API), and accept that the DB row is the boundary where re-branding happens.
 
 ---
 
@@ -829,14 +901,57 @@ The error type is a union of *exact strings*, not a `string`. The compiler enfor
 ## Lesson 27.4 — Update `parseHabit`
 
 ```ts
-export function parseHabit(input: unknown): Result<Habit, string> {
-  if (typeof input !== 'object' || input === null) return err('not an object');
-  // ... existing checks now return err('reason') instead of null ...
-  return ok({ /* habit */ });
+// src/lib/parseHabit.ts
+import type { Habit, HabitCategory, Result } from '$lib/types';
+import { HABIT_CATEGORIES, habitId, ok, err } from '$lib/types';
+
+export type ParseError =
+  | 'not-object'
+  | 'no-id'
+  | 'no-name'
+  | 'invalid-timestamp';
+
+function isHabitCategory(s: string): s is HabitCategory {
+  return (HABIT_CATEGORIES as readonly string[]).includes(s);
+}
+
+export function parseHabit(input: unknown): Result<Habit, ParseError> {
+  if (typeof input !== 'object' || input === null) {
+    return err('not-object');
+  }
+  const obj = input as Record<string, unknown>;
+
+  if (typeof obj.id !== 'string' || obj.id === '') {
+    return err('no-id');
+  }
+  if (typeof obj.name !== 'string' || obj.name.trim() === '') {
+    return err('no-name');
+  }
+  if (typeof obj.createdAt !== 'number' || !Number.isFinite(obj.createdAt)) {
+    return err('invalid-timestamp');
+  }
+
+  const description: string | undefined =
+    typeof obj.description === 'string' ? obj.description : undefined;
+
+  const category: HabitCategory | undefined =
+    typeof obj.category === 'string' && isHabitCategory(obj.category)
+      ? obj.category
+      : undefined;
+
+  return ok({
+    id: habitId(obj.id),
+    name: obj.name,
+    createdAt: obj.createdAt,
+    description,
+    category,
+  });
 }
 ```
 
-Now callers know *why* parsing failed, not just *that* it did. Senior win.
+Now callers know *why* parsing failed, not just *that* it did. The error type is a closed union of exact strings — the compiler enforces handling each. Senior win.
+
+Note the re-brand at the exit boundary: `id: habitId(obj.id)`. We just validated `obj.id` is a non-empty string; re-branding it produces a `HabitId` that the rest of the program can treat as nominally distinct.
 
 ---
 
@@ -869,6 +984,61 @@ The function's *return type* tells the caller *exactly* what failures can happen
 **The English sentence first:**
 
 > *"Refactor `parseHabit` to return `Result<Habit, ParseError>` where `ParseError = 'not-object' | 'no-id' | 'no-name' | 'invalid-timestamp' | ...`."*
+
+<details>
+<summary>Worked answer</summary>
+
+```ts
+// src/lib/parseHabit.ts
+import type { Habit, HabitCategory, Result } from '$lib/types';
+import { HABIT_CATEGORIES, habitId, ok, err } from '$lib/types';
+
+export type ParseError =
+  | 'not-object'
+  | 'no-id'
+  | 'no-name'
+  | 'invalid-timestamp';
+
+function isHabitCategory(s: string): s is HabitCategory {
+  return (HABIT_CATEGORIES as readonly string[]).includes(s);
+}
+
+export function parseHabit(input: unknown): Result<Habit, ParseError> {
+  if (typeof input !== 'object' || input === null) {
+    return err('not-object');
+  }
+  const obj = input as Record<string, unknown>;
+
+  if (typeof obj.id !== 'string' || obj.id === '') {
+    return err('no-id');
+  }
+  if (typeof obj.name !== 'string' || obj.name.trim() === '') {
+    return err('no-name');
+  }
+  if (typeof obj.createdAt !== 'number' || !Number.isFinite(obj.createdAt)) {
+    return err('invalid-timestamp');
+  }
+
+  const description: string | undefined =
+    typeof obj.description === 'string' ? obj.description : undefined;
+
+  const category: HabitCategory | undefined =
+    typeof obj.category === 'string' && isHabitCategory(obj.category)
+      ? obj.category
+      : undefined;
+
+  return ok({
+    id: habitId(obj.id),
+    name: obj.name,
+    createdAt: obj.createdAt,
+    description,
+    category,
+  });
+}
+```
+
+Identical to Ch 27.4 — confirming you can produce it without peeking. Every check returns a *named* error; the success path re-brands `obj.id` into a `HabitId` at the boundary.
+</details>
 
 ---
 
@@ -906,7 +1076,7 @@ After Chapter 27 you can:
 
 ## Lesson 28.1 — Class basics
 
-A reactive class with `$state` fields *only compiles inside a `.svelte.ts` file*. The Svelte compiler treats that extension as runes-aware; in a plain `.ts` file, `$state` is undefined. Put this file at `src/lib/counter.svelte.ts`:
+A reactive class with `$state` fields *only compiles inside a `.svelte.ts` file* — `$state` only works in `.svelte` files and `.svelte.ts` modules. The Svelte compiler treats that extension as runes-aware; in a plain `.ts` file, `$state` is undefined. Every snippet in this chapter starts with a path comment so the extension is unmistakable. Put this file at `src/lib/counter.svelte.ts`:
 
 ```ts
 // src/lib/counter.svelte.ts
@@ -949,6 +1119,7 @@ In any `.svelte` file:
 ## Lesson 28.2 — Constructors and parameter properties
 
 ```ts
+// src/lib/counter.svelte.ts
 class Counter {
   value = $state(0);
 
@@ -960,9 +1131,12 @@ class Counter {
 const c = new Counter(5); // value starts at 5
 ```
 
+(Same `.svelte.ts` extension — `$state` only works in `.svelte` files and `.svelte.ts` modules; in plain `.ts`, the rune is undefined.)
+
 You can also use TypeScript's parameter properties for fields that *aren't* reactive:
 
 ```ts
+// src/lib/counter.svelte.ts
 class Counter {
   value = $state(0);
   constructor(public readonly initial: number = 0) {
@@ -973,6 +1147,22 @@ class Counter {
 
 `public readonly initial: number` declares-and-assigns in one line — `initial` is a non-reactive frozen field.
 
+> **Note on parameter properties.** `constructor(public readonly initial: number = 0)` is an older TypeScript pattern; some strict shops disable it. With `erasableSyntaxOnly` (TS 5.8+), parameter properties are forbidden because they emit *runtime* assignments — they aren't pure type syntax. The explicit-field form is the safe-everywhere alternative:
+>
+> ```ts
+> // src/lib/counter.svelte.ts
+> class Counter {
+>   value = $state(0);
+>   private initial: number;
+>   constructor(initial = 0) {
+>     this.initial = initial;
+>     this.value = initial;
+>   }
+> }
+> ```
+>
+> A bit more typing; portable across every strict-mode dial.
+
 > **A subtlety with `$state` in classes.** `$state(...)` must be on the *field declaration*, not assigned in the constructor body. `this.value = $state(0)` inside a constructor would assign a plain number to a non-reactive field. Always declare reactive fields at the class top: `value = $state(0)`. Then the constructor *reassigns* it (`this.value = initial`), which works because `value` is already reactive.
 
 ---
@@ -982,6 +1172,7 @@ class Counter {
 `#name` makes a field truly private:
 
 ```ts
+// src/lib/counter.svelte.ts
 class Counter {
   #value = $state(0);
 
@@ -991,6 +1182,74 @@ class Counter {
 ```
 
 External code can't access `c.#value`. Senior habit: when you want to enforce invariants, make state private and expose getters/methods.
+
+In a `.svelte` template, `{c.value}` reads the getter (no parens); reactivity tracks through it because the getter reads the rune. The compiled output sees a `$state` access inside `get value()` and sets up the dependency exactly as if you were reading the field directly.
+
+---
+
+## Lesson 28.3b — Read this code
+
+**Snippet 1 — predict the output.**
+
+```ts
+// src/lib/counter.svelte.ts
+export class Counter {
+  value = $state(0);
+  increment(): void {
+    this.value += 1;
+  }
+}
+```
+
+```svelte
+<script lang="ts">
+  import { Counter } from '$lib/counter.svelte';
+  const c = new Counter();
+  c.increment();
+  c.increment();
+  c.increment();
+</script>
+<p>{c.value}</p>
+```
+
+What renders?
+
+<details>
+<summary>Answer</summary>
+
+`3`. The class is instantiated once; `increment` is called three times in the same `<script>` block before the template renders. Because `value` is a `$state` field, the template tracks it — but in this snippet the increments happen *during component setup*, so by the time the markup renders, `c.value` is already `3`. The render shows `3`.
+</details>
+
+**Snippet 2 — does `$inspect` fire?**
+
+```ts
+// src/lib/counter.svelte.ts
+export class Counter {
+  #value = $state(0);
+  get value(): number { return this.#value; }
+  increment(): void { this.#value += 1; }
+}
+```
+
+```svelte
+<script lang="ts">
+  import { Counter } from '$lib/counter.svelte';
+  const c = new Counter();
+  $inspect(c.value);
+
+  setTimeout(() => c.increment(), 100);
+</script>
+```
+
+Does `$inspect` fire when `setTimeout` runs `c.increment()`?
+
+<details>
+<summary>Answer</summary>
+
+Yes. `$inspect(c.value)` reads through the getter, which reads the `$state` field `#value`. The reactive dependency is set up on `#value`, not on the getter. When `increment` mutates `#value` via `this.#value += 1`, the rune notifies dependents, and `$inspect` fires with the new value.
+
+The takeaway: getters that read a rune are *transparent* — the dependency tracks the rune, not the wrapper. Encapsulation costs nothing.
+</details>
 
 ---
 
@@ -1099,6 +1358,10 @@ function isToday(epochMs: number): boolean {
 }
 ```
 
+> **Minor friction.** `crypto.randomUUID()` returns a template-literal type like `` `${string}-${string}-${string}-${string}-${string}` ``. Casting via `habitId(...)` brands it; the compiler accepts because the template-literal type is assignable to `string`. The friction is unavoidable but local — it lives in `add()` and nowhere else.
+
+> **`new Date()` is non-reactive.** It's recomputed every read of `addedToday` but won't trigger updates by itself. If a habit was added at 23:59 and the user is still on the page at 00:01, the count won't tick down. For a strict "today" read, prefer caching the day-boundary timestamp at module load, or recompute on a `$derived` driven by a clock-tick state (e.g. `let now = $state(Date.now())` updated by an interval). For Streak's MVP this is acceptable; we'll revisit when the day-boundary becomes user-visible.
+
 ---
 
 ## Lesson 29.2 — Using it in the home page
@@ -1138,6 +1401,15 @@ This creates *one shared instance* across the entire process. On a server, that'
 Senior rule: **stores are instantiated per request / per component tree, never globally.** We'll formalise per-request stores via context in Chapter 32.
 
 > **SSR-singleton landmine** — sharing state across users by mistake when running on a server.
+
+**The right pattern**, sketched: call `new HabitStore()` *inside* a component or page (per-instance — every render gets a fresh store), or stash it in context (Chapter 32) so the component tree shares one instance per request without leaking across users. Don't `export const store = new HabitStore()` at module scope; module scope is the *process*, and on a server the process serves every user.
+
+```svelte
+<script lang="ts">
+  import { HabitStore } from '$lib/habits.svelte';
+  const store = new HabitStore(); // per-component-instance — safe.
+</script>
+```
 
 ---
 
@@ -1232,15 +1504,17 @@ Two senior choices in `applyBps`:
 1. **`cents(result)` round-trips through the validator** — if a future bug causes `result` to be non-integer, we throw at the boundary, not silently propagate a corrupt `Cents`.
 2. **No `as number` casts on `amount * bps`** — `Cents` *is* a `number` at runtime, so arithmetic compiles. The brand is type-only.
 
-The intermediate `amount * bps` can overflow `Number.MAX_SAFE_INTEGER` (~9.0×10¹⁵) at extreme values. For consumer pricing (max ~$1B in cents = 10¹¹), this is safe. For enterprise tiers we'd promote to `BigInt`:
+**Multiplication overflow risk.** For very large amounts × bps, plain `number` math can overflow `Number.MAX_SAFE_INTEGER` (~9.0×10¹⁵). We won't hit that on Streak (max amounts < $1M = 10⁸ cents), but production money code casts to `BigInt` for the intermediate, then clamps back:
 
 ```ts
 export function applyBpsBig(amount: Cents, bps: number): Cents {
-  const product = BigInt(amount) * BigInt(bps);
-  const rounded = (product + 5_000n) / 10_000n; // banker-style round
-  return cents(Number(rounded));
+  const intermediate = BigInt(amount) * BigInt(bps) / 10_000n;
+  const result = Number(intermediate);
+  return cents(result);
 }
 ```
+
+The `BigInt` intermediate cannot overflow; converting back to `number` at the end is safe as long as the final cents value fits in `Number.MAX_SAFE_INTEGER` (it does, for any realistic price).
 
 ---
 
@@ -1265,6 +1539,8 @@ splitCents(cents(100), 3);
 
 The remainder is distributed across the first `remainder` parts. Never lose a cent.
 
+**Unbrand for arithmetic, re-brand at the exit.** `total / n` works because `Cents` extends `number` — at runtime the brand is invisible, so arithmetic compiles. Conceptually, we *unbrand* `total` for arithmetic, then *re-brand* each output via `cents(...)`. The brand is a compile-time decoration; arithmetic happens on the underlying `number`. Always re-brand at the exit boundary — every value returned to a caller as `Cents` should pass through `cents(...)` so a future bug producing a non-integer throws at the closest possible site, not three hops downstream. (Some codebases write `(total as number)` to make the unbrand visually explicit; the cast is redundant since `Cents` is already a `number`, but it documents intent.)
+
 ---
 
 ## Lesson 30.5 — Wiring a demo
@@ -1288,6 +1564,8 @@ Create `src/routes/demo-money/+page.svelte`:
 
 Visit `http://localhost:5173/demo-money`. You should see clean, correct money. We'll delete this demo once Stripe is in (Ch 49) — for now it's the runtime evidence.
 
+> **Note.** `src/routes/demo-money/+page.svelte` lives outside the marketing/app split until Chapter 49 replaces this demo with the real Stripe flow. It's a temporary scratch route — it sits at the top of `src/routes/` rather than under a `(marketing)` or `(app)` group, because route groups are a Chapter-31 topic and we don't need them yet.
+
 ---
 
 ## Lesson 30.6 — Read this code
@@ -1308,6 +1586,38 @@ The senior fix: always integer cents.
 
 ---
 
+## Lesson 30.6b — Read this code (round two)
+
+**Snippet 1.**
+
+```ts
+splitCents(cents(101), 4);
+```
+
+Predict the output.
+
+<details>
+<summary>Answer</summary>
+
+`[26, 25, 25, 25]`. `base = Math.floor(101 / 4) = 25`; `remainder = 101 - 25 * 4 = 1`. The first `remainder` (= 1) parts get `base + 1 = 26`; the rest get `25`. Sum: `26 + 25 + 25 + 25 = 101`. No cent lost.
+</details>
+
+**Snippet 2.**
+
+```ts
+applyBps(cents(1000), 12500);
+```
+
+Predict the output.
+
+<details>
+<summary>Answer</summary>
+
+`1250`. `12500 bps = 125%`. `Math.round(1000 * 12500 / 10000) = Math.round(1250) = 1250`. Useful when you're applying a markup ≥100% (a price *plus* itself), not just a tax. The function doesn't assume bps ≤ 10000.
+</details>
+
+---
+
 ## Lesson 30.7 — Now you write it
 
 **The English sentence first:**
@@ -1322,10 +1632,17 @@ In `src/lib/money.ts` (add at the bottom):
 ```ts
 import { ok, err, type Result } from '$lib/types';
 
-export function parseCents(input: string): Result<Cents, 'invalid'> {
+export function parseCents(input: string): Result<Cents, 'invalid' | 'amount-too-large'> {
   const trimmed = input.trim();
-  if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) return err('invalid');
+  if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
+    return err('invalid');
+  }
   const [whole = '0', fraction = ''] = trimmed.split('.');
+  // Implicit cap: Number.MAX_SAFE_INTEGER / 100 ≈ 9 × 10^13 cents ≈ $90 trillion.
+  // 13 digits of `whole` keeps us safely below that ceiling for any realistic input.
+  if (whole.length > 13) {
+    return err('amount-too-large');
+  }
   const padded = (fraction + '00').slice(0, 2);
   const total = Number(whole) * 100 + Number(padded);
   return ok(cents(total));
@@ -1333,6 +1650,8 @@ export function parseCents(input: string): Result<Cents, 'invalid'> {
 ```
 
 The `[whole = '0', fraction = '']` defaults guard against `noUncheckedIndexedAccess` (Ch 7) — `split('.')` returns `string[]`, so each slot is `string | undefined`. We default both.
+
+The `whole.length > 13` guard prevents the silent precision loss of `Number(whole) * 100` overflowing `Number.MAX_SAFE_INTEGER` (~9 × 10¹⁵). Above $90 trillion you stop being a SaaS and start being a sovereign-debt instrument; reject explicitly.
 
 We'll write a property-based test for this in Chapter 58.
 </details>

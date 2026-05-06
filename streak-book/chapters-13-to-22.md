@@ -61,6 +61,8 @@ mkdir -p src/lib/components
   // For now we hardcode the habit. We'll meet $props in Chapter 14 and pass it in.
   // We also re-declare `Habit` locally here; Chapter 14 moves it to $lib/types so
   // every component shares one definition.
+  // (If you added `description?: string` in Chapter 9, add it here too —
+  //  Chapter 14 centralises this.)
   const habit: Habit = {
     id: 'demo',
     name: 'Demo habit',
@@ -71,7 +73,7 @@ mkdir -p src/lib/components
 <li>
   <div>
     <strong>{habit.name}</strong>
-    {#if habit.description}
+    {#if habit.description !== undefined}
       <p class="habit-desc">{habit.description}</p>
     {/if}
     <small>{formatRelativeTime(habit.createdAt)}</small>
@@ -86,6 +88,19 @@ mkdir -p src/lib/components
   .habit-desc { margin: 0.125rem 0; color: #666; font-size: 0.875rem; }
 </style>
 ```
+
+Read-aloud:
+
+| Line | Engineer-English |
+| --- | --- |
+| `<!-- src/lib/components/HabitRow.svelte -->` | comment naming the file's location |
+| `import { formatRelativeTime } from '$lib/formatRelativeTime';` | bring in our relative-time helper |
+| `type Habit = { id: string; name: string; description?: string; createdAt: number };` | local Habit shape — moves to `$lib/types.ts` in Chapter 14 |
+| `const habit: Habit = { id: 'demo', name: 'Demo habit', createdAt: Date.now() };` | placeholder data so we can render something |
+| `<strong>{habit.name}</strong>` | the habit's name in bold |
+| `{#if habit.description !== undefined}` | render the description block only when one exists |
+| `<small>{formatRelativeTime(habit.createdAt)}</small>` | "5 minutes ago"-style timestamp |
+| `<style> li { ... } </style>` | scoped CSS — only affects this component's `<li>` |
 
 This is a *self-contained* component. It has its own script, its own markup, its own CSS. Its CSS only affects elements inside it (Svelte scopes styles per component automatically).
 
@@ -111,11 +126,79 @@ And in markup, replace the contents of the `<ul>` with:
 </ul>
 ```
 
-(All habits will look identical because `HabitRow` doesn't accept the `habit` prop yet. That's Chapter 14.)
+**You'll see three identical 'Demo habit' rows — that's expected. Chapter 14 fixes it.** (All habits look identical because `HabitRow` doesn't accept the `habit` prop yet.)
 
 ---
 
-## Lesson 13.4 — Now you write it
+## Lesson 13.4 — Why we wrote it this way
+
+A few choices in this chapter look small but they're the load-bearing seniors-do-it-this-way decisions:
+
+- **PascalCase filenames** — `HabitRow.svelte`, not `habit-row.svelte`. Every editor, every linter, and every Svelte tutorial in 2026 uses PascalCase for components. Matching the convention makes your code scannable to anyone who reads it.
+- **Scoped CSS keeps components self-contained** — the `<style>` block in `HabitRow.svelte` cannot leak out and cannot be leaked into. You can drop the component into any page and trust the layout.
+- **Extract early instead of waiting for duplication** — the temptation is "I'll extract once I'm using this in two places." The senior habit is "extract as soon as the concept has a name." `HabitRow` *is a concept*. Naming it now means we can talk about it, change it, and reuse it without rummaging through `+page.svelte`.
+
+Footnote — preview: `$state` deeply proxies its argument so any nested mutation is reactive. For objects whose interiors don't change reactively (e.g. a config object you swap whole-cloth), we'll meet `$state.raw` later as the optimisation form.
+
+---
+
+## Lesson 13.5 — Read this code
+
+Two short snippets to test the chapter's mental model.
+
+**Snippet A — predicting `compact` output**
+
+```svelte
+<!-- HabitRow.svelte (a near-future version) -->
+<script lang="ts">
+  type Habit = { id: string; name: string; description?: string; createdAt: number };
+  let { habit, compact = false }: { habit: Habit; compact?: boolean } = $props();
+</script>
+
+<li>
+  <strong>{habit.name}</strong>
+  {#if !compact}
+    <small>{habit.createdAt}</small>
+  {/if}
+</li>
+```
+
+What renders for `<HabitRow {habit} compact={true} />` vs `<HabitRow {habit} compact={false} />`?
+
+<details>
+<summary>Answer</summary>
+
+- `compact={true}` — only the bold name. The `{#if !compact}` block is skipped.
+- `compact={false}` (or omitted, since `compact` defaults to `false`) — name *and* the `<small>` timestamp.
+
+The lesson: the *same component* renders different markup depending on its props. That's the whole reason components take props.
+</details>
+
+**Snippet B — what does this file expose?**
+
+```svelte
+<!-- EmptyState.svelte -->
+<div class="empty-state">
+  <h2>No habits yet</h2>
+  <p>Add your first one above.</p>
+</div>
+
+<style>
+  .empty-state { text-align: center; padding: 2rem; }
+</style>
+```
+
+If `+page.svelte` writes `<EmptyState class="my-class" />`, does the `my-class` style apply? What props does this component take?
+
+<details>
+<summary>Answer</summary>
+
+`EmptyState` accepts *no* props — there is no `$props()` call. Passing `class="my-class"` doesn't error, but the component ignores it (until Chapter 24's typed rest-prop forwarding lands). The component renders the same markup every time it's called. Senior takeaway: a component with no `$props()` is a *constant* in component-shape — handy for empty states, separators, and fixed pieces of chrome.
+</details>
+
+---
+
+## Lesson 13.6 — Now you write it
 
 **The English sentence first:**
 
@@ -160,7 +243,7 @@ import EmptyState from '$lib/components/EmptyState.svelte';
 
 ---
 
-## Lesson 13.5 — Recurring concepts from earlier chapters
+## Lesson 13.7 — Recurring concepts from earlier chapters
 
 - **`{#each}` keyed** (Ch 9) — the home page still iterates over `habits` by ID.
 - **`{#if cond}{:else}{/if}`** (Ch 6) — the empty-state branch.
@@ -169,7 +252,7 @@ import EmptyState from '$lib/components/EmptyState.svelte';
 
 ---
 
-## Lesson 13.6 — What you can now read in the wild
+## Lesson 13.8 — What you can now read in the wild
 
 After Chapter 13 you can:
 
@@ -220,7 +303,7 @@ Read aloud: *"declare a prop called `habit` of type Habit."*
 Two important rules:
 
 1. **You don't mutate props.** A child component should never reassign or modify its parent's data. (The `$bindable` exception is Chapter 18.)
-2. **Defaults go in destructuring.** `let { habit, compact = false } = $props<...>();`
+2. **Defaults go in destructuring.** `let { habit, compact = false }: { habit: Habit; compact?: boolean } = $props();`
 
 ---
 
@@ -228,7 +311,14 @@ Two important rules:
 
 Right now `Habit` is defined in three places: `+page.svelte`, `HabitRow.svelte`, and any future component that touches it. That's bad — if we add a field, we have to remember to update every copy.
 
-Move it to a shared module. Create `src/lib/types.ts`:
+The `$lib` convention this book uses, in one place:
+
+- **Components** live in `src/lib/components/` (PascalCase `.svelte` files).
+- **Utility functions** live in `src/lib/utils/` (camelCase `.ts` files).
+- **Type definitions** live in `src/lib/types.ts` (one shared module).
+- **Reactive state modules** (Chapter 26+) live at the top of `src/lib/` as `.svelte.ts` files.
+
+Move the type to a shared module. Create `src/lib/types.ts`:
 
 ```ts
 // src/lib/types.ts
@@ -239,6 +329,17 @@ export type Habit = {
   createdAt: number;
 };
 ```
+
+Read-aloud:
+
+| Line | Engineer-English |
+| --- | --- |
+| `// src/lib/types.ts` | comment: this is the canonical types module |
+| `export type Habit = { ... };` | declare and export a Habit type others can import |
+| `id: string;` | unique identifier — required |
+| `name: string;` | the human-readable label — required |
+| `description?: string;` | optional longer text — `?` means may be `undefined` |
+| `createdAt: number;` | epoch milliseconds (a `Date.now()` snapshot) — required |
 
 Then in any component:
 
@@ -264,7 +365,13 @@ In `+page.svelte`'s markup:
 {/each}
 ```
 
-Read aloud: *"render a HabitRow with `habit={habit}`."*
+Read-aloud:
+
+| Line | Engineer-English |
+| --- | --- |
+| `{#each habits as habit (habit.id)}` | for each habit, name the local variable `habit`; use `habit.id` as the key |
+| `<HabitRow {habit} />` | render a HabitRow, passing the `habit` prop (shorthand for `habit={habit}`) |
+| `{/each}` | close the loop |
 
 The `{habit}` is shorthand for `habit={habit}` — when the attribute name and the variable name match, you don't have to write both. Senior idiom.
 
@@ -288,6 +395,8 @@ let {
 
 `compact` defaults to `false` if the parent doesn't pass it. `onSelect` is optional — call sites with `onSelect={fn}` can pass it; others can omit.
 
+To call an optional callback from inside the child, use `onSelect?.(id)` — the optional-chaining call form. It calls the function only when it's defined, otherwise no-ops. The TS narrowing alternative — `if (onSelect !== undefined) { onSelect(id); }` — lands in Chapter 22+ as part of strict-mode patterns.
+
 ---
 
 ## Lesson 14.5 — Read this code
@@ -306,7 +415,7 @@ let {
   } = $props();
 </script>
 
-<button type="button" class="btn btn-{variant}" {onclick}>
+<button type="button" class={['btn', `btn-${variant}`]} {onclick}>
   {label}
 </button>
 ```
@@ -321,6 +430,8 @@ What props does this component take? Which are required?
 - `onclick: () => void` — required
 
 The variant is a *string union type* — only those three exact strings are allowed. Try to pass `variant="warning"` and TypeScript flags it.
+
+Note on `class={['btn', \`btn-${variant}\`]}` — that's Svelte 5's *array form* for `class`. Each entry is a class name; falsy entries (like `false` or `null`) are dropped automatically. It's the senior idiom because it composes cleanly with conditionals: `class={['btn', isActive && 'active', variant && \`btn-${variant}\`]}`. Older code uses `class="btn btn-{variant}"` interpolation — works, but doesn't scale to conditionals.
 </details>
 
 ---
@@ -352,7 +463,7 @@ The variant is a *string union type* — only those three exact strings are allo
 <li>
   <div>
     <strong>{habit.name}</strong>
-    {#if !compact && habit.description}
+    {#if !compact && habit.description !== undefined}
       <p class="habit-desc">{habit.description}</p>
     {/if}
     {#if !compact}
@@ -378,7 +489,7 @@ The variant is a *string union type* — only those three exact strings are allo
 
 After Chapter 14 you can:
 
-- Read **`let { x, y, z = default } = $props<{ x: T; y: U; z?: V }>()`** as a fully-typed prop declaration. *(Note: in Svelte 5.x, the more idiomatic form is the inline type annotation we used: `let { x, y, z = default }: { x: T; y: U; z?: V } = $props();` — both work; the inline form is preferred.)*
+- Read **`let { x, y, z = default }: { x: T; y: U; z?: V } = $props();`** as a fully-typed prop declaration — the **inline form** is the idiomatic Svelte 5.x style this book uses throughout. (You may see an older generic-call form `$props<{ x: T; ... }>()` in tutorials; the inline form reads better and is what TypeScript-strict codebases standardise on.)
 - Read **`import type { X } from '...'`** as type-only imports.
 - Read **`<Component {prop} />`** as the shorthand for `prop={prop}`.
 - Spot **components defining `type X` locally** as a refactor opportunity (move to a shared `$lib/types.ts`).
@@ -431,12 +542,23 @@ Add `onDelete` to `HabitRow`:
 <li>
   <div>
     <strong>{habit.name}</strong>
-    {#if habit.description}<p class="habit-desc">{habit.description}</p>{/if}
+    {#if habit.description !== undefined}<p class="habit-desc">{habit.description}</p>{/if}
     <small>{formatRelativeTime(habit.createdAt)}</small>
   </div>
   <button type="button" onclick={() => onDelete(habit.id)} aria-label="Remove {habit.name}">×</button>
 </li>
 ```
+
+Read-aloud:
+
+| Line | Engineer-English |
+| --- | --- |
+| `import type { Habit } from '$lib/types';` | bring in the shared Habit type — runtime sees nothing |
+| `let { habit, onDelete }: { habit: Habit; onDelete: (id: string) => void } = $props();` | declare two props: a `habit` object and a typed `onDelete` callback |
+| `<strong>{habit.name}</strong>` | render the habit's name |
+| `{#if habit.description !== undefined}` | render the description block only when defined |
+| `<button type="button" onclick={() => onDelete(habit.id)}` | a non-submit button that calls `onDelete` with this habit's id |
+| `aria-label="Remove {habit.name}"` | screen-reader label so the icon-only `×` has meaning |
 
 In `+page.svelte` (and confirm `removeHabit` takes an `id: string`):
 
@@ -495,29 +617,34 @@ If you see `createEventDispatcher` in old code, replace with a function prop the
 </script>
 
 {#if open}
-  <!-- For brevity this snippet uses click on a div for the backdrop;
-       a senior implementation uses a real <dialog> + showModal() (Ch 21)
-       and lets the backdrop click be handled via the dialog's `cancel` event,
-       so screen readers and keyboards work without extra wiring. -->
-  <div class="modal-backdrop" onclick={onClose} role="presentation">
-    <div class="modal-content" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
-      <button type="button" onclick={onClose} aria-label="Close">×</button>
-      <p>Modal content</p>
-    </div>
+  <!-- Teaching shape only. The senior implementation uses a real <dialog>
+       + showModal() (covered in Chapter 21) where the browser handles the
+       backdrop, focus trap, Escape key, and screen-reader semantics for free. -->
+  <button
+    type="button"
+    class="modal-backdrop"
+    onclick={onClose}
+    aria-label="Close modal"
+  ></button>
+  <div class="modal-content" role="dialog" aria-modal="true">
+    <button type="button" onclick={onClose} aria-label="Close">×</button>
+    <p>Modal content</p>
   </div>
 {/if}
 ```
 
-What's the `e.stopPropagation()` for?
+Why is the backdrop a `<button>` and not a `<div>`?
 
 <details>
 <summary>Answer</summary>
 
-It prevents the click on `.modal-content` from bubbling up to `.modal-backdrop` (which would also fire `onClose`). Without it, clicking *inside* the modal would close it — which the user almost never wants.
+Accessibility. A `<div onclick=...>` is invisible to keyboards and screen readers — there's no element to tab to, no role, no announcement. Putting the click handler on a `<button>` instead means: keyboard users can reach it with Tab, screen readers announce it as a button, Enter and Space activate it. Both buttons in this snippet (`type="button"`) are explicit non-submit buttons — Bible rule.
 
-> **event bubbling** — clicks on a child fire on every ancestor element too, by default. `stopPropagation()` cancels the bubble.
+> **a11y** — short for *accessibility*. Non-interactive elements with click handlers are an a11y violation: they look interactive but aren't reachable without a mouse.
 
-A senior habit when writing modals: think about both the click-the-backdrop-to-close and click-inside-doesn't-close behaviour explicitly.
+> **event bubbling** — clicks on a child fire on every ancestor element too, by default. (Used in fancier teaching examples; we sidestep it here by giving each interactive surface its own button.)
+
+The senior pattern is to skip ad-hoc div-modals entirely. A real `<dialog>` element (Chapter 21.4) gives you focus trap, Escape-to-close, scrim, and screen-reader semantics for free — none of this hand-rolling.
 </details>
 
 ---
@@ -558,6 +685,10 @@ We're deliberately *not* using `window.prompt`. Browser-native dialogs are unsty
   }
 
   function commit(): void {
+    if (!editing) {
+      return; // Escape already exited edit mode; the trailing onblur fires here too — ignore it
+    }
+
     const trimmed = draft.trim();
     if (trimmed !== '' && trimmed !== habit.name) {
       onRename(habit.id, trimmed);
@@ -570,8 +701,12 @@ We're deliberately *not* using `window.prompt`. Browser-native dialogs are unsty
   }
 
   function onKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Enter') commit();
-    if (event.key === 'Escape') cancel();
+    if (event.key === 'Enter') {
+      commit();
+    }
+    if (event.key === 'Escape') {
+      cancel();
+    }
   }
 </script>
 
@@ -588,7 +723,7 @@ We're deliberately *not* using `window.prompt`. Browser-native dialogs are unsty
     {:else}
       <strong ondblclick={startEdit} title="Double-click to rename">{habit.name}</strong>
     {/if}
-    {#if habit.description}<p class="habit-desc">{habit.description}</p>{/if}
+    {#if habit.description !== undefined}<p class="habit-desc">{habit.description}</p>{/if}
     <small>{formatRelativeTime(habit.createdAt)}</small>
   </div>
   <button type="button" onclick={() => onDelete(habit.id)} aria-label="Remove {habit.name}">×</button>
@@ -607,10 +742,11 @@ function renameHabit(id: string, newName: string): void {
 <HabitRow {habit} onDelete={removeHabit} onRename={renameHabit} />
 ```
 
-Three senior touches in there:
+Four senior touches in there:
 - **Cancel via Escape** — every editable field on the web should support it; users learn this once and expect it everywhere.
 - **No-op on identical text** — if the user double-clicks but doesn't change anything, we don't fire `onRename`. Saves a server round-trip later (Ch 41).
 - **`aria-label` on the input** — when the editing state appears, screen readers know what's being edited.
+- **`if (!editing) { return; }` guard at the top of `commit`** — Escape sets `editing = false`, which removes the input from the DOM, which fires `onblur`, which calls `commit` *again*. Without the guard, `commit` would run twice and overwrite the cancel. The guard makes the order-of-events safe.
 
 `habits.map` is the immutable update — return a new object when the ID matches, original otherwise.
 
@@ -634,6 +770,7 @@ After Chapter 15 you can:
 
 - Read **callback props** named `on<Verb>` and explain the data-down events-up flow.
 - Recognise **`createEventDispatcher`** in old code as a refactor target.
+- Spot a Svelte 4 **`dispatch('foo', payload)`** call site and recognise it as the modern **`onFoo(payload)`** callback prop.
 - Read **event bubbling** and **`stopPropagation()`** in modal-like UIs.
 - Read **inline-edit patterns** (toggle between display and `<input>`) as the senior alternative to `window.prompt` / `window.confirm` / `window.alert` (which are banned in this book — unstyled, ignore dark mode, break on touch).
 
@@ -658,8 +795,8 @@ After Chapter 15 you can:
 A **derived** value is one computed from other reactive state. When the dependencies change, the derived value automatically recomputes.
 
 ```ts
-let count: number = $state(0);
-let doubled: number = $derived(count * 2);
+let count = $state(0);
+const doubled = $derived(count * 2);
 ```
 
 Read aloud: *"let `doubled` be derived as `count * 2`."*
@@ -683,10 +820,15 @@ let searchQuery: string = $state('');
 function isAddedToday(epochMs: number): boolean {
   const habitDate = new Date(epochMs);
   const today = new Date();
-  return habitDate.getDate() === today.getDate() &&
-         habitDate.getMonth() === today.getMonth() &&
-         habitDate.getFullYear() === today.getFullYear();
+  return habitDate.toDateString() === today.toDateString();
 }
+
+// Equivalent, more verbose, sometimes seen in older codebases:
+//   return habitDate.getDate() === today.getDate() &&
+//          habitDate.getMonth() === today.getMonth() &&
+//          habitDate.getFullYear() === today.getFullYear();
+// The `toDateString()` one-liner is the senior idiom — it returns a string like
+// "Wed May 06 2026", so two dates in the same calendar day produce equal strings.
 
 const visibleHabits: Habit[] = $derived(
   habits.filter((h) => h.name.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -719,13 +861,29 @@ When the derivation needs setup or a loop:
 
 ```ts
 const summary: string = $derived.by(() => {
-  if (habits.length === 0) return 'No habits yet.';
-  if (habits.length === 1) return `Tracking 1 habit.`;
+  if (habits.length === 0) {
+    return 'No habits yet.';
+  }
+  if (habits.length === 1) {
+    return `Tracking 1 habit.`;
+  }
   return `Tracking ${habits.length} habits.`;
 });
 ```
 
 Same as `$derived` but takes a function. Use whichever reads cleaner.
+
+A second case where multi-line is genuinely needed — pipelines with intermediate `const` variables:
+
+```ts
+const recentTopHabits: Habit[] = $derived.by(() => {
+  const filtered = habits.filter((h) => h.name.toLowerCase().includes(searchQuery.toLowerCase()));
+  const sorted = filtered.toSorted((a, b) => b.createdAt - a.createdAt);
+  return sorted.slice(0, 10);
+});
+```
+
+Three steps, each with a name. You *could* chain it as one expression, but breaking it into named intermediates makes the pipeline readable: filter, then sort, then take ten. (Note: `Array.prototype.toSorted` is the immutable cousin of `sort` — it doesn't mutate the input. Senior idiom.)
 
 ---
 
@@ -740,6 +898,8 @@ $effect(() => {
   total = items.reduce((sum, item) => sum + item.amount, 0);
 });
 ```
+
+This also flirts with the infinite-loop trap from Chapter 17 — `$effect` writes to state, and if anything reads `total` *inside the same effect* (or another effect that reads it and writes back), the effect re-fires. The fix isn't to be careful; it's to use the right rune.
 
 This works but it's wrong. The correct way:
 
@@ -763,11 +923,11 @@ Reasons:
 ```svelte
 <script lang="ts">
   let prices: number[] = $state([10, 20, 30]);
-  let taxRate: number = $state(0.08);
+  let taxRate = $state(0.08);
 
-  const subtotal: number = $derived(prices.reduce((s, p) => s + p, 0));
-  const tax: number = $derived(subtotal * taxRate);
-  const total: number = $derived(subtotal + tax);
+  const subtotal = $derived(prices.reduce((s, p) => s + p, 0));
+  const tax = $derived(subtotal * taxRate);
+  const total = $derived(subtotal + tax);
 </script>
 
 <p>Subtotal: ${subtotal}</p>
@@ -791,28 +951,32 @@ This *cascading-derived* pattern is one of the things that makes Svelte 5 so ple
 
 **The English sentence first:**
 
-> *"Add a derived `longestRunningHabit: Habit | undefined` — the habit with the smallest `createdAt`. Display 'Longest streak: NAME' when it exists; nothing when there are no habits."*
+> *"Add a derived `oldestHabit: Habit | undefined` — the habit with the smallest `createdAt` (i.e. the earliest creation date). Display 'Oldest habit: NAME' when it exists; nothing when there are no habits."*
+
+(Naming note: "longest streak" is a *consecutive-completion* concept that we'll meet for real once habits have completion data in Part VII. "Oldest by creation" is the right name for what this derivation actually computes.)
 
 <details>
 <summary>Worked answer</summary>
 
 ```ts
-const longestRunningHabit: Habit | undefined = $derived.by(() => {
+const oldestHabit: Habit | undefined = $derived.by(() => {
   const [first, ...rest] = habits;
-  if (first === undefined) return undefined;
+  if (first === undefined) {
+    return undefined;
+  }
   return rest.reduce((oldest, h) => h.createdAt < oldest.createdAt ? h : oldest, first);
 });
 ```
 
-Read aloud: *"the longest-running habit is the one with the smallest createdAt. Pull off the first habit; if there isn't one, return undefined; otherwise reduce the rest, keeping whichever is older."*
+Read aloud: *"the oldest habit is the one with the smallest createdAt. Pull off the first habit; if there isn't one, return undefined; otherwise reduce the rest, keeping whichever was created earlier."*
 
 The destructure `const [first, ...rest] = habits` is critical — it lets us hand `first` to `reduce` as the initial accumulator (a real `Habit`, not `undefined`), which keeps the types clean. We *never* reach for `habits[0]!` (the non-null assertion is banned, Bible rule #3) because there's always a clean alternative.
 
 In markup:
 
 ```svelte
-{#if longestRunningHabit}
-  <small>Longest streak: {longestRunningHabit.name}</small>
+{#if oldestHabit !== undefined}
+  <small>Oldest habit: {oldestHabit.name}</small>
 {/if}
 ```
 </details>
@@ -890,6 +1054,17 @@ Update `+page.svelte`:
 <input type="text" bind:this={inputElement} bind:value={newHabit} placeholder="Add a new habit..." />
 ```
 
+Read-aloud:
+
+| Line | Engineer-English |
+| --- | --- |
+| `let inputElement: HTMLInputElement | undefined = $state();` | reactive ref for the DOM node — undefined until mounted |
+| `$effect(() => { ... });` | run this body when its read dependencies appear or change |
+| `inputElement?.focus();` | call `.focus()` only if the element is defined — optional-chain call form |
+| `bind:this={inputElement}` | Svelte directive — bind the rendered element into our variable |
+| `bind:value={newHabit}` | two-way bind the input's text to `newHabit` |
+| `placeholder="Add a new habit..."` | greyed-out hint text shown when empty |
+
 `bind:this={inputElement}` is Chapter 21's lesson previewed — it gets the DOM node into a variable. `inputElement?.focus()` calls `.focus()` *if* the element exists. The `$effect` fires when the component mounts (and the element is ready), and *would* re-fire if `inputElement` ever changed (it doesn't, in this case).
 
 ---
@@ -931,6 +1106,17 @@ $effect(() => {
 
 The latter doesn't re-fire when `count` changes — the read is inside `setTimeout`'s callback, which runs asynchronously. Senior gotcha.
 
+The fix — capture the value synchronously *first*, then use the captured copy inside the async callback:
+
+```ts
+$effect(() => {
+  const c = count; // synchronous read — establishes `count` as a dependency
+  setTimeout(() => console.log(c), 100);
+});
+```
+
+Now the effect re-fires when `count` changes; the captured `c` is the value *at the moment the effect ran*. That's almost always what you want for logging, debounced searches, and "snapshot" patterns.
+
 ---
 
 ## Lesson 17.5 — The infinite-loop trap
@@ -944,13 +1130,38 @@ $effect(() => {
 
 `$effect` runs, reassigns `x`, which triggers `$effect` again, which reassigns `x`, ... Svelte 5 catches this at runtime and throws an `effect_update_depth_exceeded` error after a few iterations, so your dev server doesn't burn — but the page goes red and the lesson is loud.
 
+How to spot it in the wild: open the browser console; look for the red `effect_update_depth_exceeded` error; click through to the source line. That's the signature — same error message, every time.
+
 Rule: **don't write to state inside `$effect` if the effect depends on that state.** If you find yourself wanting to, you almost certainly want `$derived`.
 
 ---
 
 ## Lesson 17.6 — Build, break, fix
 
-Try the infinite-loop deliberately for a few seconds — Svelte will warn loudly. Restore. The discomfort is the lesson.
+Try the infinite-loop deliberately for a few seconds — Svelte will warn loudly. The discomfort is the lesson.
+
+**Build.** In `+page.svelte`'s script, add this snippet temporarily:
+
+```ts
+let trap = $state(0);
+$effect(() => {
+  trap += 1;
+});
+```
+
+**Break.** Save. Open the browser tab. Open the console (F12 → Console). You'll see something like:
+
+```
+Uncaught Svelte error: effect_update_depth_exceeded
+Maximum update depth exceeded. This can happen when a reactive block or effect repeatedly sets a new value.
+    at <component> (+page.svelte:N:M)
+```
+
+The line/column points at the `$effect` body. The page may also turn red or hang briefly — Svelte 5's runtime stops you before it fully locks up the tab.
+
+**Fix.** Delete the snippet. Save. Reload. The error goes away.
+
+**Verify.** Refresh once more. The console should be clean. If `trap += 1` is still there in any form, the error returns. The reproduction is deterministic — no flakiness.
 
 ---
 
@@ -961,7 +1172,10 @@ Try the infinite-loop deliberately for a few seconds — Svelte will warn loudly
   let query: string = $state('');
 
   $effect(() => {
-    if (query.length < 3) return;
+    if (query.length < 3) {
+      return;
+    }
+
     console.log('searching for', query);
   });
 </script>
@@ -974,7 +1188,7 @@ When does the effect fire?
 <details>
 <summary>Answer</summary>
 
-Whenever `query` changes — every keystroke. The `if (query.length < 3) return;` is an early-exit, but the effect *still ran*. The body is re-executed; we just bail early.
+Whenever `query` changes — every keystroke. The `if (query.length < 3) { return; }` is an early-exit, but the effect *still ran*. The body is re-executed; we just bail early.
 
 For real search, you'd debounce — wait for typing to pause before firing. We'll meet debouncing as we need it.
 </details>
@@ -992,7 +1206,10 @@ For real search, you'd debounce — wait for typing to pause before firing. We'l
 
 ```ts
 $effect(() => {
-  if (searchQuery.trim().length < 3) return;
+  if (searchQuery.trim().length < 3) {
+    return;
+  }
+
   console.log('searching for', searchQuery);
 });
 ```
@@ -1056,6 +1273,16 @@ When you want a child component to participate in two-way binding (parent passes
 <input {type} bind:value {placeholder} />
 ```
 
+Read-aloud:
+
+| Token | Engineer-English |
+| --- | --- |
+| `{type}` | shorthand for `type={type}` — set the input's `type` attribute from the prop |
+| `bind:value` | two-way binding — the input's value tracks the `value` prop, *and* edits propagate back |
+| `{placeholder}` | shorthand for `placeholder={placeholder}` — the greyed-out hint text |
+
+The shorthand form `{x}` (where attribute name and variable name match) is the senior idiom; spelling it out as `x={x}` is allowed but noisier.
+
 The parent uses it with `bind:value`:
 
 ```svelte
@@ -1079,6 +1306,8 @@ Most of the time, callback props are better:
 ```
 
 The senior heuristic: `$bindable` for *form inputs* (the parent and child genuinely co-own the value); callback props for everything else.
+
+Footnote — what's bindable from the parent side: `$bindable` props can be passed a `$derived` value (the child reads it like any other prop), but the parent *can't* `bind:` to a `$derived` — `$derived` is read-only. If the parent wants two-way binding, the parent's value has to be `$state`, not `$derived`. Try it the wrong way and TypeScript and the Svelte compiler both complain.
 
 ---
 
@@ -1111,11 +1340,17 @@ Create `src/lib/components/TextInput.svelte` (above), then use it:
   }: { value?: number; min?: number; max?: number } = $props();
 
   function increment(): void {
-    if (value >= max) return;
+    if (value >= max) {
+      return;
+    }
+
     value += 1;
   }
   function decrement(): void {
-    if (value <= min) return;
+    if (value <= min) {
+      return;
+    }
+
     value -= 1;
   }
 </script>
@@ -1170,7 +1405,7 @@ Senior takeaway: `$bindable` doesn't mean "the child owns the state." It means "
 
 - **Callback props** (Ch 15) — the *default* tool; `$bindable` is the *exception*.
 - **Defaults on destructure** (Ch 10) — `$bindable('')` provides a default.
-- **Guard clauses** (Ch 2) — `NumberStepper`'s `if (value >= max) return;`.
+- **Guard clauses** (Ch 2) — `NumberStepper`'s `if (value >= max) { return; }`.
 
 ---
 
@@ -1215,10 +1450,14 @@ $inspect(searchQuery, habits.length);
 You can customise the log:
 
 ```ts
-$inspect(searchQuery).with((type, value) => {
-  if (type === 'update') console.log('search →', value);
+$inspect(searchQuery).with((kind, value) => {
+  if (kind === 'update') {
+    console.log('search →', value);
+  }
 });
 ```
+
+(We call the parameter `kind`, not `type`, to avoid shadowing the TypeScript `type` keyword — small senior touch that prevents reader confusion.)
 
 And you can trace what *caused* a derived/effect to re-run:
 
@@ -1266,6 +1505,14 @@ $inspect(habits);
 
 Click × again. Watch the console — you'll see `habits` change to a 1-element array. Read the trace. The single remaining element is the one you tried to delete. *That's the symptom.* Look at `removeHabit`'s comparison. `===` instead of `!==`. Fix.
 
+Now grep `filter` across your codebase:
+
+```bash
+grep -rn "\.filter(" src/
+```
+
+Read every match. Confirm every other filter uses the correct comparison. The same one-character bug can be hiding in any filter you've written; the senior habit after fixing one is sweeping for siblings.
+
 ---
 
 ## Lesson 19.4 — Reading TypeScript errors fluently
@@ -1280,7 +1527,7 @@ src/routes/+page.svelte:42:5 - Argument of type 'string | undefined' is not assi
 Decode it:
 - **`src/routes/+page.svelte:42:5`** — file, line 42, column 5.
 - **The error in plain English** — "you passed something that might be `undefined` to a function expecting a `string`."
-- **The fix** — narrow the value first (`if (x === undefined) return;`) or provide a fallback (`x ?? ''`).
+- **The fix** — narrow the value first (`if (x === undefined) { return; }`) or provide a fallback (`x ?? ''`).
 
 Senior habit: read the error *out loud, slowly*. The TypeScript compiler is a tutor; rushing past errors is throwing away free help.
 
@@ -1313,6 +1560,14 @@ Now type "rea" in the search box. Open the console. Each keystroke logs a trace 
   dependencies: ['searchQuery', 'habits'],
   changed: ['searchQuery'],
 }
+```
+
+Concretely, three keystrokes produce three traces — one per character:
+
+```
+trace: { changed: ['searchQuery'] }   // typed 'r'
+trace: { changed: ['searchQuery'] }   // typed 'e'
+trace: { changed: ['searchQuery'] }   // typed 'a'
 ```
 
 The first line names *every* reactive value the derivation read; the `changed` line names which one(s) just updated. For our case: typing only changes `searchQuery`; `habits` is stable.
@@ -1391,6 +1646,15 @@ When a parent puts content *between* a component's opening and closing tags, tha
 </div>
 ```
 
+Read-aloud:
+
+| Line | Engineer-English |
+| --- | --- |
+| `import type { Snippet } from 'svelte';` | bring in the `Snippet` type — type-only, no runtime cost |
+| `let { children }: { children: Snippet } = $props();` | declare a `children` prop typed as a Snippet (no params) |
+| `<div class="card">` | the component's CSS chrome |
+| `{@render children()}` | render the caller's content here, like calling a function |
+
 ```svelte
 <Card>
   <h2>Hello</h2>
@@ -1424,9 +1688,9 @@ You can have several snippets:
 </script>
 
 <div class="card">
-  {#if header}<div class="card-header">{@render header()}</div>{/if}
+  {#if header !== undefined}<div class="card-header">{@render header()}</div>{/if}
   <div class="card-body">{@render children()}</div>
-  {#if footer}<div class="card-footer">{@render footer()}</div>{/if}
+  {#if footer !== undefined}<div class="card-footer">{@render footer()}</div>{/if}
 </div>
 
 <style>
@@ -1449,6 +1713,13 @@ Used as:
 
 Read aloud: *"a Card. Its header is the title. Its body is the list. Its footer is the count."*
 
+A note on the `<div class="card-header">` choice. We use `<div>` rather than the semantic `<header>` element here — and that's deliberate. The choice is a *layering* question:
+
+- The component (`Card.svelte`) provides the **CSS chrome** — padding, border, background colour. That layer doesn't know what's *inside* the slot.
+- The caller provides the **semantic content** — usually starting with a heading (`<h2>`, `<h3>`) which is itself a landmark.
+
+If the component used `<header>`, every page that nested a `Card` inside another `Card` would create nested `<header>` landmarks — confusing for screen readers. By keeping the component layer as `<div class="card-header">` and letting the caller decide whether the content inside is a `<header>`, an `<h2>`, a plain `<span>`, or whatever, the responsibilities stay clean. Component CSS != snippet content.
+
 ---
 
 ## Lesson 20.4 — Snippets with parameters
@@ -1467,12 +1738,16 @@ Read aloud: *"a Card. Its header is the title. Its body is the list. Its footer 
 
 Snippets can be exported from `<script module>` and imported elsewhere too — like component-shaped utilities for repeated markup.
 
+A note on typing: snippets are typed *in-place* — no separate `type Field = ...` alias is needed. Svelte 5's compiler accepts the TypeScript-typed snippet args directly, exactly the way you'd type a function. The `(label: string, value: string)` syntax above is the snippet's signature, end of story.
+
 ---
 
 ## Lesson 20.5 — Read this code
 
+> **Teaching shape — do not actually use this in production code.** The `unknown[]` / `Snippet<[unknown]>` form below loses all type safety at the call site (the caller has to cast). Chapter 24 shows the **typed/generic version** with `<T>` parameters that flow through to both `items` and `item`. We're showing this here only to introduce the `Snippet<[T]>` syntax. If you're tempted to copy this as-is into real code, use the generic form from Ch 24 instead.
+
 ```svelte
-<!-- DataList.svelte -->
+<!-- DataList.svelte — TEACHING SHAPE; the generic version is in Ch 24 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
   let {
@@ -1487,7 +1762,7 @@ Snippets can be exported from `<script module>` and imported elsewhere too — l
 </script>
 
 {#if items.length === 0}
-  {#if empty}{@render empty()}{:else}<p>Empty</p>{/if}
+  {#if empty !== undefined}{@render empty()}{:else}<p>Empty</p>{/if}
 {:else}
   <ul>
     {#each items as i}<li>{@render item(i)}</li>{/each}
@@ -1500,7 +1775,7 @@ What does this component do?
 <details>
 <summary>Answer</summary>
 
-It's a generic list renderer. Caller passes `items` (any array) and an `item` snippet (how to render each one). Optional `empty` snippet for the empty state. We'll meet a typed version with generics in Chapter 24.
+It's a generic list renderer. Caller passes `items` (any array) and an `item` snippet (how to render each one). Optional `empty` snippet for the empty state. As-typed it accepts `unknown[]` — useful for *teaching*, dangerous for *shipping*; the caller has no compile-time guarantee that `item` matches the shape of items. The fix is generics — Chapter 24.
 </details>
 
 ---
@@ -1633,6 +1908,20 @@ $effect(() => {
 });
 ```
 
+Read-aloud:
+
+| Line | Engineer-English |
+| --- | --- |
+| `let listEl: HTMLUListElement | undefined = $state();` | reactive ref for the `<ul>` DOM node |
+| `let lastCount = 0;` | plain variable (not `$state`) — bookkeeping for previous length |
+| `$effect(() => { ... });` | run when read dependencies change |
+| `const count = habits.length;` | snapshot today's length — establishes `habits` as a dep |
+| `if (count > lastCount && listEl !== undefined)` | only act when the list grew *and* the DOM node is mounted |
+| `const last = listEl.lastElementChild;` | grab the most-recently-added row |
+| `if (last instanceof HTMLElement)` | narrow `Element | null` to `HTMLElement` so `.scrollIntoView` is callable |
+| `last.scrollIntoView({ behavior: 'smooth', block: 'center' });` | smooth-scroll it into view, centred |
+| `lastCount = count;` | update bookkeeping for next run |
+
 In markup:
 
 ```svelte
@@ -1646,6 +1935,8 @@ In markup:
 Save. Add a habit — the page scrolls smoothly to it. Delete one — *no* scroll. Search-filter — also no scroll. (Start with three habits and add a few to see it; with a short list you don't need to scroll at all.)
 
 The `lastCount` tracking is one of the few legitimate `$effect`-with-state-write patterns: we're storing a *previous-value* so we can detect a *transition* (grew vs shrank). It's reading `habits.length` (a dependency) and writing `lastCount` (which is *not* read again inside the effect's same run), so no infinite loop.
+
+The rule, said plainly: **non-reactive bookkeeping variables go *outside* `$state` — they don't trigger re-renders, and they don't appear as dependencies anywhere.** `lastCount` here is intentional: it's a closure variable for previous-value tracking, not application state. If it were `$state`, every component watching it would re-render on every list change, and the effect would risk re-firing on its own write. Keep state for *what the UI shows*; keep plain variables for *what the code remembers*.
 
 > **`scrollIntoView({ behavior, block })`** — DOM method: scroll the element into view with options.
 >
@@ -1698,13 +1989,20 @@ let lastDeletedIndex: number | null = $state(null);
 
 function removeHabit(id: HabitId): void {
   const idx = habits.findIndex((h) => h.id === id);
-  if (idx >= 0) lastDeletedIndex = idx;
+  if (idx >= 0) {
+    lastDeletedIndex = idx;
+  }
+
   habits = habits.filter((h) => h.id !== id);
 }
 
 $effect(() => {
-  if (lastDeletedIndex === null) return;
-  if (listEl === undefined) return;
+  if (lastDeletedIndex === null) {
+    return;
+  }
+  if (listEl === undefined) {
+    return;
+  }
 
   // After delete, the *previous* habit now sits at the deleted index − 1
   // (or 0 if we deleted the first one).
@@ -1712,7 +2010,9 @@ $effect(() => {
   const target = listEl.children[targetIndex];
   if (target instanceof HTMLElement) {
     const button = target.querySelector('button[aria-label^="Remove"]');
-    if (button instanceof HTMLElement) button.focus();
+    if (button instanceof HTMLElement) {
+      button.focus();
+    }
   }
   lastDeletedIndex = null;
 });
@@ -1794,6 +2094,7 @@ We *deliberately* don't use `Math.random()` to trigger failures. A flaky save ma
 let forceNextFail = $state(false);
 
 async function fakeSave(name: string): Promise<void> {
+  console.log('saving', name); // dev visibility — replaced by a real fetch in Part VI
   await new Promise((r) => setTimeout(r, 1200));
   if (forceNextFail) {
     forceNextFail = false; // reset so the toggle is one-shot
@@ -1804,7 +2105,9 @@ async function fakeSave(name: string): Promise<void> {
 
 async function addHabit(): Promise<void> {
   const trimmed = newHabit.trim();
-  if (trimmed === '') return;
+  if (trimmed === '') {
+    return;
+  }
 
   saveState = { status: 'loading' };
   try {
@@ -1825,6 +2128,18 @@ async function handleSubmit(event: SubmitEvent): Promise<void> {
 }
 ```
 
+Read-aloud (`fakeSave`):
+
+| Line | Engineer-English |
+| --- | --- |
+| `async function fakeSave(name: string): Promise<void>` | declare an async function that takes a name and returns a Promise of nothing |
+| `console.log('saving', name);` | dev visibility — confirms the call site fired |
+| `await new Promise((r) => setTimeout(r, 1200));` | pause for 1.2s — simulates network round-trip |
+| `if (forceNextFail) { forceNextFail = false; throw ... }` | one-shot failure toggle — fail this save then reset |
+| `// success — no return` | the implicit `Promise<void>` resolution |
+
+The `err instanceof Error ? err.message : 'Unknown'` line in `addHabit` is a TypeScript narrowing pattern. `try`/`catch` types `err` as `unknown` (since anything can be thrown), so we can't read `err.message` directly. `instanceof Error` *narrows* `err` to `Error` inside the true branch — only then is `err.message` typed-accessible. The fallback string handles the rare case where someone throws a string or a plain object.
+
 Several new ideas:
 
 > **`async`** — marks a function as asynchronous. Returns a Promise.
@@ -1834,6 +2149,8 @@ Several new ideas:
 > **`Promise<T>`** — a value that will eventually be `T` (or throw an error).
 >
 > **`try { ... } catch (err) { ... }`** — handle thrown errors gracefully.
+>
+> **`instanceof`** narrowing — `err instanceof Error` checks the runtime class *and* tells TypeScript the value is an `Error` inside the true branch.
 
 We'll deepen async in Part VI. Today the wiring is the lesson.
 
@@ -1848,7 +2165,11 @@ We'll deepen async in Part VI. Today the wiring is the lesson.
     {saveState.status === 'loading' ? 'Saving...' : 'Add'}
   </button>
 </form>
+```
 
+Aside on `||` here: `||` between two **booleans** is correct — it's logical-OR, exactly what we want for "disabled when saving *or* empty." The foot-gun is using `||` for *missing-value defaults* (e.g. `name || 'Anon'` returns `'Anon'` for empty strings — usually wrong; `name ?? 'Anon'` is the senior form). See Chapter 3.6. Booleans, `||`. Defaults, `??`.
+
+```svelte
 <label class="dev-toggle">
   <input type="checkbox" bind:checked={forceNextFail} />
   Force the next save to fail
@@ -1935,22 +2256,32 @@ async function trySave(name: string): Promise<void> {
 
 async function addHabit(): Promise<void> {
   const trimmed = newHabit.trim();
-  if (trimmed === '') return;
+  if (trimmed === '') {
+    return;
+  }
+
   await trySave(trimmed);
-  if (saveState.status === 'success') newHabit = '';
+  if (saveState.status === 'success') {
+    newHabit = '';
+  }
 }
 ```
 
-In markup, the error block gains a Retry button:
+In markup, the error block gains a Retry button — disabled while another save is in flight:
 
 ```svelte
 {#if saveState.status === 'error'}
   <p class="error">{saveState.message}</p>
-  <button type="button" onclick={() => trySave(saveState.name)}>
+  <button
+    type="button"
+    onclick={() => trySave(saveState.name)}
+  >
     Retry
   </button>
 {/if}
 ```
+
+(There's no need to disable Retry while saving — when `saveState.status === 'loading'`, the `{#if saveState.status === 'error'}` branch isn't rendered at all, so the button doesn't exist to be clicked. Discriminated unions doing the work for us.)
 
 Senior touches: (1) `trySave` is the *single* save path, called from both the form and the retry button — no duplication. (2) The discriminator carries `name` only on the error variant; if we tried to read `saveState.name` while idle, the compiler refuses. That's the discriminated union doing its job.
 </details>
@@ -1985,7 +2316,7 @@ After Part III you can:
 
 ## End-of-chapter checkpoint
 
-- [ ] *Add* shows a spinner. Untoggled, success; toggle "Force the next save to fail", click *Add*, see the error.
+- [ ] *Add* shows a spinner. Toggle "Force the next save to fail" and click *Add*; the error renders. Untoggle; click *Add*; success.
 - [ ] You read the four-state pattern aloud.
 - [ ] You feel why "two booleans" is wrong.
 

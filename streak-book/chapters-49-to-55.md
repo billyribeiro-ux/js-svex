@@ -26,13 +26,13 @@ import Stripe from 'stripe';
 import { STRIPE_SECRET_KEY } from '$env/static/private';
 
 export const stripe = new Stripe(STRIPE_SECRET_KEY, {
-  apiVersion: '2026-04-30', // pin to the version your account is on; bump after testing
+  apiVersion: '2026-04-30.acacia', // pin the dated + named form; bump after testing
   maxNetworkRetries: 2,
   timeout: 10_000, // 10s — Bible rule
 });
 ```
 
-> **`apiVersion`** pins your code to a specific Stripe API release. Bump it deliberately after reading the changelog and running tests; otherwise Stripe will use your dashboard's "default" version, which can shift under you.
+> **`apiVersion`** pins your code to a specific Stripe API release. As of the May 2026 SDK, versions are dated *and* named (e.g. `'2026-04-30.acacia'`); the name suffix is the release codename. Stripe ties API versions to TS SDK versions; check the SDK changelog and pin both. Bump deliberately after reading the changelog and running tests; otherwise Stripe will use your dashboard's "default" version, which can shift under you.
 
 ---
 
@@ -71,10 +71,10 @@ export const actions: Actions = {
   upgrade: async (event) => {
     const user = requireUser(event);
 
-    let [sub] = await db.select().from(subscriptions).where(eq(subscriptions.userId, user.id)).limit(1);
+    const [sub] = await db.select().from(subscriptions).where(eq(subscriptions.userId, user.id)).limit(1);
 
     let stripeCustomerId = sub?.stripeCustomerId;
-    if (!stripeCustomerId) {
+    if (stripeCustomerId === null || stripeCustomerId === undefined) {
       const customer = await stripe.customers.create(
         { email: user.email, metadata: { userId: user.id } },
         { idempotencyKey: `customer:${user.id}` },
@@ -106,6 +106,8 @@ export const actions: Actions = {
 ```
 
 `idempotencyKey` on every mutating Stripe call. Bible rule. We also defensively check `session.url !== null` — Stripe's type allows `null`, even though every Checkout Session in practice has a URL.
+
+The hourly bucket (`Math.floor(Date.now() / 3_600_000)`) is intentional for double-click protection — if the user clicks *Upgrade* twice in quick succession, both calls hit the same key and Stripe returns the cached session. The trade-off: if a user starts checkout, abandons, and retries 30 minutes later within the same hour, they get the same session URL (which Stripe will accept). For explicit retry semantics, vary the key with a sequence number stored in the session row.
 
 ---
 
@@ -179,6 +181,19 @@ import { eq } from 'drizzle-orm';
 import { STRIPE_WEBHOOK_SECRET } from '$env/static/private';
 import { logger } from '$lib/logger';
 
+/**
+ * Extract a Stripe customer ID from an event payload field.
+ *
+ * Throws when `value` is null. Callers MUST only pass values from events
+ * where `customer` is guaranteed non-null:
+ *   - `checkout.session.completed`
+ *   - `customer.subscription.created` / `.updated` / `.deleted`
+ *   - `invoice.payment_failed` / `.payment_succeeded`
+ *
+ * For events where `customer` can legitimately be null (e.g. some
+ * `customer.deleted` edge cases), this throw is wrong — handle that path
+ * separately rather than routing through this helper.
+ */
 function customerIdFrom(value: string | Stripe.Customer | Stripe.DeletedCustomer | null): string {
   if (typeof value === 'string') return value;
   if (value === null) throw new Error('Stripe event missing customer');
@@ -189,6 +204,9 @@ function periodEndOf(sub: Stripe.Subscription): Date {
   // Stripe moved current_period_end to the item level in 2024+.
   // Take the latest period_end across items as the subscription's effective period end.
   const ends = sub.items.data.map((item) => item.current_period_end);
+  if (ends.length === 0) {
+    throw new Error('subscription has no items with current_period_end');
+  }
   const max = Math.max(...ends);
   return new Date(max * 1000);
 }
@@ -291,11 +309,13 @@ export const POST: RequestHandler = async ({ request }) => {
 };
 ```
 
-The five events above cover the canonical Stripe **dunning state machine**: subscriptions move `active → past_due → canceled` over multiple weeks if a card fails, and we want our DB to reflect that without manual reconciliation.
+The events above cover the canonical Stripe **dunning state machine**: subscriptions move `active → past_due → unpaid → canceled` over multiple weeks if a card fails, and we want our DB to reflect that without manual reconciliation. The dunning states are `past_due`, `unpaid`, `canceled`; `trial_will_end` is a courtesy ping, not dunning. We log it for observability and let the subsequent `customer.subscription.updated` event do the real work.
 
 > **dunning** *(noun)* — the polite-collection process for failed payments. Stripe retries cards up to 4 times over 3 weeks (per your dunning settings). The webhook stream tells you which state the user is currently in.
 
 Configure Stripe dashboard → Settings → Subscriptions and emails → Smart Retries: 4 attempts over ~3 weeks; on final failure, Stripe fires `customer.subscription.deleted` and we drop the user to free.
+
+**Important sequence — dedupe vs transaction.** The dedupe insert (`onConflictDoNothing`) MUST happen *outside* the transaction that processes the body, OR happen *inside* the transaction with the body. We've placed dedupe BEFORE the transaction, which means a thrown error during the body rolls back the body but keeps the dedupe row — correct exactly-once semantics, since Stripe's retry will see the dedupe row and skip. The trade-off: if our handler crashes hard (process killed mid-flight), the dedupe row may be there but the body partial. Webhook retries don't help because the dedupe says "seen." The runbook is to manually re-process by deleting the dedupe row and re-triggering via Stripe CLI. Most production systems accept this trade-off.
 
 ---
 
@@ -307,7 +327,7 @@ We don't trust the webhook payload's `current_period_end` — it could be stale 
 
 ## Lesson 50.4 — `pnpm test:webhook:duplicate`
 
-Stripe ships a helper, `stripe.webhooks.generateTestHeaderString`, that signs a raw payload exactly like Stripe would. We use it to build a test that hits the real handler against a real Postgres.
+Stripe ships a helper, `stripe.webhooks.generateTestHeaderString`, that signs a raw payload exactly like Stripe would. We use it to build a test that hits the real handler against a real Postgres. (Pinned as of the May 2026 SDK; verify on upgrade — Stripe occasionally renames internal helpers.)
 
 ```ts
 // tests/integration/stripe-webhook.dedupe.test.ts
@@ -319,7 +339,7 @@ import { sql } from 'drizzle-orm';
 import { STRIPE_WEBHOOK_SECRET } from '$env/static/private';
 
 const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:4173';
-const stripe = new Stripe('sk_test_dummy', { apiVersion: '2026-04-30' });
+const stripe = new Stripe('sk_test_dummy', { apiVersion: '2026-04-30.acacia' });
 
 const TEST_USER = '00000000-0000-0000-0000-000000000099';
 
@@ -359,6 +379,8 @@ describe('stripe webhook dedup', () => {
 ```
 
 Run with `pnpm preview` in one terminal and `pnpm test:integration` in another (both pointed at the test database). The runtime evidence is `events.length === 1` after two identical POSTs.
+
+We bypass `stripe.subscriptions.retrieve` in this test by using `customer.subscription.deleted`, which carries the subscription in the event payload. For `checkout.session.completed`, the handler calls `retrieve` — that path needs a separate mock or live test.
 
 ---
 
@@ -414,11 +436,13 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import * as v from 'valibot';
 import { R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET } from '$env/static/private';
 import { requireUser } from '$lib/auth';
+import { logger } from '$lib/logger';
 
 const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/avif'] as const;
 const MAX_BYTES = 5 * 1024 * 1024;
 
 const PresignSchema = v.object({
+  // Spread the readonly tuple if your Valibot version complains: v.picklist([...ALLOWED_MIME]).
   contentType: v.picklist(ALLOWED_MIME),
   size: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(MAX_BYTES)),
 });
@@ -437,7 +461,10 @@ export const POST: RequestHandler = async (event) => {
   const user = requireUser(event);
   const raw: unknown = await event.request.json();
   const parsed = v.safeParse(PresignSchema, raw);
-  if (!parsed.success) error(400, 'Invalid request');
+  if (!parsed.success) {
+    logger.warn({ issues: parsed.issues }, 'invalid presign request');
+    throw error(400, 'Invalid request');
+  }
   const { contentType, size } = parsed.output;
 
   const key = `users/${user.id}/${crypto.randomUUID()}`;
@@ -460,11 +487,102 @@ Two boundary-discipline pieces:
 
 The client then `fetch(url, { method: 'PUT', body: file })` directly to R2.
 
+**R2 credentials rotation.** The S3 client reads credentials at module init from `$env/static/private`. On a deployed server, key rotation requires a redeploy to pick up new credentials. The rotation runbook (Ch 57) covers this; the alternative — re-reading via `$env/dynamic/private` per request — adds latency we don't need on a fintech-shaped flow with low rotation frequency.
+
 ---
 
 ## Lesson 51.3 — Magic-number MIME validation
 
-After upload, on a confirmation endpoint, fetch the `HEAD` and read the first bytes — confirm the content-type matches the declared MIME. Don't trust the client's claim.
+After upload, on a confirmation endpoint, fetch the first bytes from R2 and assert the file's binary signature matches its declared MIME. Don't trust the client's claim — a malicious client could upload an HTML file declared as `image/png`, and a permissive viewer would render it.
+
+```ts
+// src/lib/uploads/sniff.ts
+const SIGNATURES: ReadonlyArray<{ mime: string; bytes: ReadonlyArray<number | null>; offset?: number }> = [
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  { mime: 'image/png', bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] },
+  // JPEG: FF D8 FF (variants share the first 3 bytes)
+  { mime: 'image/jpeg', bytes: [0xff, 0xd8, 0xff] },
+  // WebP: "RIFF" .... "WEBP" — bytes 0..3 = RIFF, bytes 8..11 = WEBP
+  { mime: 'image/webp', bytes: [0x52, 0x49, 0x46, 0x46, null, null, null, null, 0x57, 0x45, 0x42, 0x50] },
+];
+
+export function sniffMime(prefix: Uint8Array): string | null {
+  for (const sig of SIGNATURES) {
+    const match = sig.bytes.every((b, i) => b === null || prefix[i] === b);
+    if (match) {
+      return sig.mime;
+    }
+  }
+  return null;
+}
+```
+
+Wire it into a `POST /api/uploads/confirm` endpoint that runs after the direct PUT succeeds:
+
+```ts
+// src/routes/api/uploads/confirm/+server.ts
+import type { RequestHandler } from './$types';
+import { json, error } from '@sveltejs/kit';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import * as v from 'valibot';
+import { R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET } from '$env/static/private';
+import { requireUser } from '$lib/auth';
+import { sniffMime } from '$lib/uploads/sniff';
+
+const s3 = new S3Client({
+  region: 'auto',
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+  requestHandler: new NodeHttpHandler({ connectionTimeout: 5_000, requestTimeout: 10_000 }),
+});
+
+const ConfirmSchema = v.object({
+  key: v.string(),
+  declaredMime: v.picklist(['image/jpeg', 'image/png', 'image/webp']),
+});
+
+export const POST: RequestHandler = async (event) => {
+  const user = requireUser(event);
+  const raw: unknown = await event.request.json();
+  const parsed = v.safeParse(ConfirmSchema, raw);
+  if (!parsed.success) {
+    throw error(400, 'Invalid request');
+  }
+  const { key, declaredMime } = parsed.output;
+
+  if (!key.startsWith(`users/${user.id}/`)) {
+    throw error(403, 'Not your upload');
+  }
+
+  // Read the first 12 bytes via Range request — cheap, no full download.
+  const head = await s3.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key, Range: 'bytes=0-11' }));
+  const body = head.Body;
+  if (body === undefined) {
+    throw error(404, 'Object not found');
+  }
+  const chunks: Array<Uint8Array> = [];
+  for await (const chunk of body as AsyncIterable<Uint8Array>) {
+    chunks.push(chunk);
+  }
+  const total = chunks.reduce((acc, c) => acc + c.length, 0);
+  const prefix = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    prefix.set(c, offset);
+    offset += c.length;
+  }
+
+  const actualMime = sniffMime(prefix);
+  if (actualMime === null || actualMime !== declaredMime) {
+    throw error(415, 'File contents do not match declared type');
+  }
+
+  return json({ ok: true });
+};
+```
+
+Two things to note: (1) we use `Range: bytes=0-11` so we don't pay to download the whole file just to inspect 12 bytes; (2) the namespace check `key.startsWith(\`users/${user.id}/\`)` prevents a logged-in attacker from confirming someone else's upload.
 
 ---
 
@@ -551,7 +669,7 @@ When the list reorders, items glide to their new positions. Swap a habit's index
 
 ## Lesson 52.3 — `svelte/motion` — `Tween`, `Spring`
 
-Svelte 5 provides runes-style classes (`Tween`, `Spring`) alongside the legacy stores (`tweened`, `spring`). The class form is preferred for new code:
+As of Svelte 5.x (May 2026), `Spring` is exported as a class with `current`, `target`, and `set()`. The class form is preferred for new code; the legacy `spring()` factory still exists alongside it for backwards compatibility. Svelte 5 provides runes-style classes (`Tween`, `Spring`) and the legacy stores (`tweened`, `spring`):
 
 ```svelte
 <script lang="ts">
@@ -575,12 +693,25 @@ The number bounces toward its target. `display.current` is the live value; `disp
 
 ```ts
 // src/lib/motion.svelte.ts
-let _reduced = $state(typeof window === 'undefined' ? false : window.matchMedia('(prefers-reduced-motion: reduce)').matches);
-if (typeof window !== 'undefined') {
-  window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', (e) => _reduced = e.matches);
+import { browser } from '$app/environment';
+
+let _reduced = $state(browser ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false);
+if (browser) {
+  window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', (e) => {
+    _reduced = e.matches;
+  });
 }
-export const prefersReducedMotion = { get value() { return _reduced; } };
+export const prefersReducedMotion = {
+  get value(): boolean {
+    return _reduced;
+  },
+};
 ```
+
+Two things worth flagging:
+
+- **`import { browser } from '$app/environment'`** — matches the senior pattern from Ch 38; preferred over hand-rolled `typeof window` checks because it's tree-shaken at build time and avoids the temptation to reach for `window` accidentally inside the SSR branch.
+- **Module-scope `$state` and Ch 29's SSR-singleton rule.** Ch 29 banned per-request mutable state at module scope on the server (one bucket would be shared across every request). This `_reduced` is fine because: (a) on the server, `browser` is `false`, the listener never runs, and `_reduced` is the constant `false` for everyone; (b) in the browser, this module is loaded once per tab, set once via `addEventListener`, and the "singleton" is bounded by browser lifetime, not request lifetime. Safe.
 
 In components:
 
@@ -602,9 +733,27 @@ Senior habit. WCAG-grade.
 
 ```ts
 // src/lib/actions/intersect.ts
+// Fires `callback` every time the element scrolls into view. The callback
+// will fire repeatedly if the element scrolls in/out. For "fire once on
+// first intersection" use the once-only variant below.
 export function intersect(node: HTMLElement, callback: () => void): { destroy: () => void } {
   const obs = new IntersectionObserver((entries) => {
-    if (entries[0]?.isIntersecting) callback();
+    if (entries[0]?.isIntersecting) {
+      callback();
+    }
+  }, { threshold: 0.1 });
+  obs.observe(node);
+  return { destroy: () => obs.disconnect() };
+}
+
+// Once-only variant: unobserve after the first match. Use this for analytics
+// "saw this element" events where re-firing would inflate counts.
+export function intersectOnce(node: HTMLElement, callback: () => void): { destroy: () => void } {
+  const obs = new IntersectionObserver((entries) => {
+    if (entries[0]?.isIntersecting) {
+      callback();
+      obs.unobserve(node);
+    }
   }, { threshold: 0.1 });
   obs.observe(node);
   return { destroy: () => obs.disconnect() };
@@ -615,22 +764,30 @@ export function intersect(node: HTMLElement, callback: () => void): { destroy: (
 <div use:intersect={() => console.log('visible!')}>...</div>
 ```
 
+Pick `intersect` for "lazy-load images as they scroll in" (you want repeats if the user scrolls back up); pick `intersectOnce` for "fire a 'viewed-pricing' analytic event" (you want exactly one).
+
 ---
 
 ## Lesson 52.6 — `{@attach}` directive
 
-In Svelte 5.x as of May 2026, `{@attach}` is a successor to actions for some cases:
+In Svelte 5.x as of May 2026, `{@attach}` is a successor to actions for some cases. The current syntax is `{@attach attachmentFn}` where `attachmentFn(node)` returns either `void` or a cleanup function:
 
 ```svelte
-<div {@attach (node) => {
-  // setup
-  return () => { /* cleanup */ };
-}}>
+<script lang="ts">
+  function setup(node: HTMLElement): () => void {
+    // setup
+    return () => {
+      // cleanup
+    };
+  }
+</script>
+
+<div {@attach setup}>
   ...
 </div>
 ```
 
-Use it when the lifetime is bound to render rather than the DOM element being long-lived.
+Use it when the lifetime is bound to render rather than the DOM element being long-lived. (Pin to current docs; Svelte 5's attachment API is one of the surfaces the team is still iterating on.)
 
 ---
 
@@ -673,22 +830,26 @@ After Chapter 52 you can:
 // src/lib/validation/formAction.ts
 import { fail } from '@sveltejs/kit';
 import * as v from 'valibot';
-import type { RequestEvent } from '@sveltejs/kit';
+import type { Action, RequestEvent } from '@sveltejs/kit';
 
 export function formAction<T>(
   schema: v.GenericSchema<unknown, T>,
   handler: (input: T, event: RequestEvent) => Promise<{ success?: boolean; redirect?: string } | void>,
-) {
+): Action {
   return async (event: RequestEvent) => {
     const data = await event.request.formData();
     const obj: Record<string, unknown> = {};
-    for (const [k, v] of data.entries()) obj[k] = v;
+    for (const [k, val] of data.entries()) {
+      obj[k] = val;
+    }
     const parsed = v.safeParse(schema, obj);
     if (!parsed.success) {
       const fieldErrors: Record<string, string> = {};
       for (const issue of parsed.issues) {
         const key = issue.path?.[0]?.key ?? 'form';
-        if (typeof key === 'string') fieldErrors[key] = issue.message;
+        if (typeof key === 'string') {
+          fieldErrors[key] = issue.message;
+        }
       }
       return fail(400, { fieldErrors });
     }
@@ -696,6 +857,11 @@ export function formAction<T>(
   };
 }
 ```
+
+Two boundary-discipline pieces in this snippet:
+
+- **Loop variable named `val`, not `v`** — `v` is already imported as the Valibot namespace at the top of the file. Reusing the name shadows it inside the loop body and makes future edits ("oh, I'll just call `v.something()` here") fail in confusing ways. Always rename.
+- **Explicit return type annotation `: Action`** — matches SvelteKit's `Action` shape and makes the inferred form actions type-checked at the page level. Without it, the returned function's type is structurally compatible but isn't the *named* type SvelteKit's tooling expects.
 
 Used as:
 
@@ -715,11 +881,13 @@ export const actions = {
 
 ## Lesson 53.2 — Function bindings for normalization
 
+As of Svelte 5.x (May 2026), function-form bindings use the comma-separated getter/setter syntax inside the binding expression:
+
 ```svelte
 <input bind:value={() => email, (v) => email = v.toLowerCase().trim()} />
 ```
 
-The `email` value is always normalized as the user types.
+The `email` value is always normalized as the user types. (Earlier 5.0 betas used an array-tuple form `[() => email, (v) => ...]`; that has been replaced — pin to the comma form for new code.)
 
 ---
 
@@ -799,6 +967,90 @@ After Chapter 53 you can:
 
 ---
 
+## Lesson 53.8 — Read this code
+
+**Snippet 1.** Will the form below block submission with an empty email field if JavaScript is disabled in the browser?
+
+```svelte
+<form method="POST" action="?/signup">
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" required bind:value={user.email} />
+  <button type="submit">Sign up</button>
+</form>
+```
+
+*Answer.* **Yes.** Native HTML5 form validation works without JavaScript. The `required` attribute is enforced by the browser before the form posts; an empty value pops the browser's native "Please fill out this field" tooltip and the POST never leaves the page. `bind:value` is a Svelte enhancement layered on top — when JS is off, it's inert, but `name="email"` still sends the value as form data and `required` still gates submission. This is the whole point of progressive enhancement: the form works at every layer of capability. The lesson: every input that's required server-side should also have `required` client-side; you get free a11y-grade error UX without writing a line of JS.
+
+**Snippet 2.** What renders, and what's the bug?
+
+```svelte
+<script lang="ts">
+  let { form } = $props();
+</script>
+
+<input name="age" aria-invalid={form?.fieldErrors?.age ? 'true' : 'false'} />
+{#if form?.fieldErrors?.age}
+  <p>{form.fieldErrors.age}</p>
+{/if}
+```
+
+*Answer.* The bug is **`aria-invalid="false"` instead of `undefined`** when there's no error. ARIA semantics: `aria-invalid="false"` *explicitly* declares the field as valid, which screen readers may announce ("entry is valid"). For an untouched, never-validated field, that's a lie — we don't know if it's valid yet. Use `aria-invalid={form?.fieldErrors?.age ? 'true' : undefined}` so the attribute is omitted (= "no judgement made") rather than asserting validity. Also missing: `aria-describedby` linking the error `<p id="age-error">` to the input. Compare against Lesson 53.3 — the snippet above is what people *almost* write; the ARIA-correct version is what you ship.
+
+---
+
+## Lesson 53.9 — Now you write it
+
+**Task.** Build a `<NumberInput>` component with native HTML5 validation (`min`, `max`, `step`) plus `aria-invalid` wiring that flips on when the value is out of range. Bonus: render an error `<p>` linked via `aria-describedby` when the value is invalid.
+
+*Worked answer.*
+
+```svelte
+<!-- src/lib/components/NumberInput.svelte -->
+<script lang="ts">
+  let {
+    value = $bindable(0),
+    min,
+    max,
+    step = 1,
+    label,
+    name,
+  }: {
+    value?: number;
+    min: number;
+    max: number;
+    step?: number;
+    label: string;
+    name: string;
+  } = $props();
+
+  const id = $derived(`num-${name}`);
+  const errorId = $derived(`${id}-error`);
+  const outOfRange = $derived(value < min || value > max);
+  const errorText = $derived(outOfRange ? `Must be between ${min} and ${max}.` : null);
+</script>
+
+<label for={id}>{label}</label>
+<input
+  {id}
+  {name}
+  type="number"
+  {min}
+  {max}
+  {step}
+  bind:value
+  required
+  aria-invalid={errorText !== null ? 'true' : undefined}
+  aria-describedby={errorText !== null ? errorId : undefined}
+/>
+{#if errorText !== null}
+  <p id={errorId} class="error">{errorText}</p>
+{/if}
+```
+
+Key moves: (1) `bind:value` with `$bindable` so a parent can two-way bind; (2) `aria-invalid` only set when there's a real error (not `'false'` for valid); (3) `aria-describedby` linked to a unique error ID derived from `name`; (4) the native `min`/`max`/`step` attributes do the heavy lifting — the `outOfRange` derivation is just for our visual + screen-reader error. With JS off, the browser's native validation still catches out-of-range submits.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] `formAction` is used by every form in the app.
@@ -855,6 +1107,8 @@ Used per page:
 <SEO title="Pricing" description="Streak Pro at $9/month — habits that stick." image="/og/pricing.png" />
 ```
 
+> **Create `static/og-default.png`** (1200×630 PNG, the OpenGraph reference resolution). The default image is referenced from the `<SEO>` component; without the file, social previews show a broken image when a page doesn't pass an explicit `image` prop. Ship the default at the start, override per-page where you have something better.
+
 ---
 
 ## Lesson 54.2 — Sitemap as `+server.ts`
@@ -899,13 +1153,24 @@ Sitemap: ${url.origin}/sitemap.xml
 
 ```svelte
 <script lang="ts">
-  // Build the JSON-LD payload, then escape any `</` that would close the script tag prematurely.
+  // Build the JSON-LD payload, then escape every character that could break out
+  // of an inline <script> or be misread by an HTML parser. Five replacements:
+  //  - `<`  → `<` : prevents `</script>` from closing the tag prematurely.
+  //  - `>`  → `>` : symmetry; protects against `]]>` / lazy CDATA parsers.
+  //  - `&`  → `&` : prevents HTML entity injection (e.g. `&lt;` re-decoded).
+  //  - U+2028 → ` ` : JS treats line-separator as a newline; breaks JSON.
+  //  - U+2029 → ` ` : same for paragraph-separator.
   const ldJson = JSON.stringify({
     '@context': 'https://schema.org',
     '@type': 'Product',
     name: 'Streak Pro',
     offers: { '@type': 'Offer', price: '9.00', priceCurrency: 'USD' },
-  }).replace(/</g, '\\u003c');
+  })
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/ /g, '\\u2028')
+    .replace(/ /g, '\\u2029');
 </script>
 
 <svelte:head>
@@ -913,7 +1178,7 @@ Sitemap: ${url.origin}/sitemap.xml
 </svelte:head>
 ```
 
-Two safety pieces: (1) the JSON content is *our own* (no user input), so injection isn't a concern *yet*; (2) the `replace(/</g, '\\u003c')` defends against future content (e.g. a user-generated product name) sneaking a `</script>` into the payload and breaking out of the tag. Senior habit.
+Why all five: even if the JSON content is *our own* today (no user input, no injection concern *yet*), the moment a user-supplied product name lands in this payload — a SKU description, a referral note, a partner-supplied OG title — a single `</script>` or stray `&lt;` smuggled in would break out of the tag. The five replacements are the standard hardening for inline JSON in HTML; copy them as a unit, never just `<`. Senior habit.
 
 ---
 
@@ -950,6 +1215,36 @@ After Chapter 54 you can:
 
 ---
 
+## Lesson 54.8 — Read this code
+
+**Snippet 1.** A layout sets a `<title>` and a page sets a different `<title>`. Which one wins?
+
+```svelte
+<!-- src/routes/+layout.svelte -->
+<svelte:head>
+  <title>Streak — habits that stick</title>
+</svelte:head>
+
+<!-- src/routes/pricing/+page.svelte -->
+<svelte:head>
+  <title>Pricing | Streak</title>
+</svelte:head>
+```
+
+*Answer.* **The page wins** for `<title>` (and for any `<svelte:head>` element keyed by tag name, like `<title>`, plus elements with the same `name` for `<meta>`). SvelteKit's `<svelte:head>` follows a "page-overrides-layout" rule for duplicate keys — exactly what you want, because the most specific component (the page) usually has the most accurate metadata. Order of execution in the rendered HTML reflects this: layout `<head>` content is emitted first, then the page's, and browsers honour the *last* `<title>` they see. The lesson: it's safe to set a generic `<title>` in your root layout as a fallback; pages that override it just work.
+
+**Snippet 2.** What URL does this `og:image` resolve to when crawled by Slack/Twitter from `https://streak.app/blog/post-1`?
+
+```svelte
+<svelte:head>
+  <meta property="og:image" content="og/post-1.png" />
+</svelte:head>
+```
+
+*Answer.* **It depends — and that's the bug.** A relative URL like `og/post-1.png` is resolved against the page's URL, so against `https://streak.app/blog/post-1` it would resolve to `https://streak.app/blog/og/post-1.png` — almost certainly a 404 unless you happen to have that path. Worse: many social-media crawlers follow stricter rules than browsers and refuse to resolve relative URLs at all, treating the field as missing. **Always use absolute URLs for `og:image`** (and for `og:url`, `twitter:image`, and `<link rel="canonical">`): either a leading `/og/post-1.png` (root-relative) for crawlers that handle it, or, safer, the fully-qualified `https://streak.app/og/post-1.png` built from `page.url.origin`. The `<SEO>` component in Lesson 54.1 takes the easy path — relative `image="/og-default.png"` — which is fine for *most* crawlers; harden by prefixing `page.url.origin` if you see broken previews.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] `<SEO>` is used on every marketing page.
@@ -975,27 +1270,58 @@ After Chapter 54 you can:
 
 import { build, files, version } from '$service-worker';
 
+declare const self: ServiceWorkerGlobalScope;
+
 const CACHE = `streak-${version}`;
 const ASSETS = [...build, ...files];
 
 self.addEventListener('install', (e) => {
-  (e as ExtendableEvent).waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)));
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)));
 });
 
 self.addEventListener('activate', (e) => {
-  (e as ExtendableEvent).waitUntil(
+  e.waitUntil(
     caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))),
   );
 });
 
-self.addEventListener('fetch', (event) => {
-  const e = event as FetchEvent;
-  if (e.request.method !== 'GET') return;
+self.addEventListener('fetch', (e) => {
+  if (e.request.method !== 'GET') {
+    return;
+  }
   e.respondWith(
     caches.match(e.request).then((cached) => cached ?? fetch(e.request)),
   );
 });
 ```
+
+The `declare const self: ServiceWorkerGlobalScope;` at the top, paired with the `/// <reference lib="webworker" />` directive, gives TypeScript the right global types — `e: ExtendableEvent` for `install`/`activate`, `e: FetchEvent` for `fetch` — without any `as` casts. Bible rule: `as` is a smell; type the global instead.
+
+**Cache TTL — why we get away with cache-first.** The handler above is *cache-first with no TTL* — once an asset is in the cache, it stays there until `activate` evicts the old `CACHE` key. That sounds dangerous (stale forever) but it's safe here for one specific reason: the cache key is `streak-${version}` and `version` changes on every deploy. New deploy → new cache key → `activate` deletes the old cache → fresh fetches. The strategy is "rebuild the SW on every deploy" not "expire entries." For marketing pages this is ideal: instant offline render, no per-asset TTL bookkeeping, predictable invalidation tied to your deploy cadence. **For user data, never cache** — if you reach `/api/habits` from inside the SW, return `fetch(e.request)` unconditionally. If you ever need a finer-grained policy (e.g. "cache marketing for 1 hour even within the same deploy"), upgrade to **stale-while-revalidate**:
+
+```ts
+self.addEventListener('fetch', (e) => {
+  if (e.request.method !== 'GET') {
+    return;
+  }
+  e.respondWith(
+    caches.match(e.request).then((cached) => {
+      const network = fetch(e.request).then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE).then((c) => c.put(e.request, copy));
+        return res;
+      });
+      if (cached !== undefined) {
+        e.waitUntil(network);
+        return cached;
+      }
+      return network;
+    }),
+  );
+});
+```
+
+That gives instant cached response *and* a background refresh for next time. The trade-off: you serve one stale response per refresh window. For a fintech-shaped flow this is a non-starter on data routes; for marketing it's fine.
 
 ---
 
@@ -1018,13 +1344,22 @@ You can also override per-link with `<a href="..." data-sveltekit-preload-data="
 
 ## Lesson 55.3 — Lighthouse run
 
-After running `pnpm build && pnpm preview`:
+First add the dev dependency:
 
 ```bash
+pnpm add -D lighthouse
+```
+
+Then run against a production build:
+
+```bash
+pnpm build && pnpm preview
 pnpm exec lighthouse http://localhost:4173/ --view
 ```
 
 (Or use Chrome dev tools' Lighthouse panel against `http://localhost:5173/` in dev — note dev mode reports lower scores because Vite ships unminified.) Aim for 100/100/100/100 on production builds. Fix what's red. The marketing pages should hit it easily; the app pages have a lower ceiling because of auth and JS-heavy interactivity.
+
+> **CI note.** `lighthouse` needs Chrome installed; on CI you can either pull in the `puppeteer` runtime (which ships its own headless Chromium) or skip Lighthouse there entirely and run it locally before each release. We do the latter for Streak — Lighthouse on a slow GitHub Actions runner produces noisy scores; a fast laptop run pre-deploy is the truer signal.
 
 ---
 
