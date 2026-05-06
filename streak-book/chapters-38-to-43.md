@@ -43,13 +43,14 @@ But `JSON.parse` returns `unknown` to us morally — we don't trust the shape. R
 
 ```ts
 // src/lib/storage.svelte.ts
+import { browser } from '$app/environment';
 import { parseHabits } from '$lib/parseHabit';
 import type { Habit } from '$lib/types';
 
 const KEY = 'streak.habits.v1';
 
 export function loadHabits(): Habit[] {
-  if (typeof localStorage === 'undefined') return []; // SSR safety
+  if (!browser) return []; // SSR safety
   const raw = localStorage.getItem(KEY);
   if (raw === null) return [];
   try {
@@ -60,14 +61,14 @@ export function loadHabits(): Habit[] {
 }
 
 export function saveHabits(habits: Habit[]): void {
-  if (typeof localStorage === 'undefined') return;
+  if (!browser) return;
   localStorage.setItem(KEY, JSON.stringify(habits));
 }
 ```
 
-The `typeof localStorage === 'undefined'` check is for **SSR safety** — `localStorage` doesn't exist on the server. SvelteKit runs `+page.svelte` on the server during SSR; without this guard, the page would crash there.
+The `import { browser } from '$app/environment'` is **SvelteKit's canonical SSR safety primitive** — `browser` is `true` only in the browser, `false` during SSR or server-side rendering. Use it instead of `typeof localStorage === 'undefined'`; it's typed, intentional, and reads better.
 
-> **SSR safety** — code that may run on both server and client must check for browser-only globals.
+> **`$app/environment`** — exports `browser`, `dev`, `building`, `version`. The senior way to gate browser-only or build-only code.
 
 ---
 

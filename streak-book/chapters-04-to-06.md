@@ -544,7 +544,7 @@ Update `+page.svelte`:
 <!-- src/routes/+page.svelte -->
 <script lang="ts">
   let habitsLoggedToday = $state(0);
-  let userName: string | null = $state(null);
+  let userName = $state('');
 
   const days: string[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
@@ -581,7 +581,7 @@ Update `+page.svelte`:
   }
 </script>
 
-<h1>Welcome back, {userName ?? 'friend'}.</h1>
+<h1>Welcome back, {userName.trim() === '' ? 'friend' : userName}.</h1>
 
 <label>
   Your name

@@ -522,16 +522,19 @@ A senior habit when writing modals: think about both the click-the-backdrop-to-c
 
 **The English sentence first:**
 
-> *"Add an `onRename: (id: string, newName: string) => void` callback prop to `HabitRow`. When the user double-clicks the habit name, prompt them with `window.prompt('New name?', habit.name)` and call `onRename(habit.id, newName)` if they entered a non-empty string."*
+> *"Add an `onRename: (id: string, newName: string) => void` callback prop to `HabitRow`. When the user double-clicks the habit name, the name swaps to an editable input; pressing Enter (or blurring) commits the new name; pressing Escape cancels."*
 
-(`window.prompt` is a quick way to get input — we'll use a real dialog component in Chapter 53.)
+We're deliberately *not* using `window.prompt`. Browser-native dialogs are unstyled, ignore your dark mode, and break flow on touch devices. The senior pattern is *inline editing* — swap the display element for an input, in place. This is the same pattern Notion, Linear, and Things use.
 
 <details>
-<summary>Worked answer (sketch)</summary>
+<summary>Worked answer</summary>
 
 ```svelte
 <!-- HabitRow.svelte -->
 <script lang="ts">
+  import { formatRelativeTime } from '$lib/formatRelativeTime';
+  import type { Habit } from '$lib/types';
+
   let {
     habit,
     onDelete,
@@ -542,16 +545,50 @@ A senior habit when writing modals: think about both the click-the-backdrop-to-c
     onRename: (id: string, newName: string) => void;
   } = $props();
 
-  function handleRename(): void {
-    const next: string | null = window.prompt('New name?', habit.name);
-    if (next === null) return; // user cancelled
-    const trimmed: string = next.trim();
-    if (trimmed === '') return;
-    onRename(habit.id, trimmed);
+  let editing = $state(false);
+  let draft = $state('');
+
+  function startEdit(): void {
+    draft = habit.name;
+    editing = true;
+  }
+
+  function commit(): void {
+    const trimmed = draft.trim();
+    if (trimmed !== '' && trimmed !== habit.name) {
+      onRename(habit.id, trimmed);
+    }
+    editing = false;
+  }
+
+  function cancel(): void {
+    editing = false;
+  }
+
+  function onKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Enter') commit();
+    if (event.key === 'Escape') cancel();
   }
 </script>
 
-<strong ondblclick={handleRename}>{habit.name}</strong>
+<li>
+  <div>
+    {#if editing}
+      <input
+        type="text"
+        bind:value={draft}
+        onblur={commit}
+        onkeydown={onKeydown}
+        aria-label="Rename {habit.name}"
+      />
+    {:else}
+      <strong ondblclick={startEdit} title="Double-click to rename">{habit.name}</strong>
+    {/if}
+    {#if habit.description}<p class="habit-desc">{habit.description}</p>{/if}
+    <small>{formatRelativeTime(habit.createdAt)}</small>
+  </div>
+  <button type="button" onclick={() => onDelete(habit.id)} aria-label="Remove {habit.name}">×</button>
+</li>
 ```
 
 In `+page.svelte`:
@@ -566,7 +603,14 @@ function renameHabit(id: string, newName: string): void {
 <HabitRow {habit} onDelete={removeHabit} onRename={renameHabit} />
 ```
 
-Note the `habits.map` immutable update — for each habit, return a new object if the ID matches, otherwise return the original.
+Three senior touches in there:
+- **Cancel via Escape** — every editable field on the web should support it; users learn this once and expect it everywhere.
+- **No-op on identical text** — if the user double-clicks but doesn't change anything, we don't fire `onRename`. Saves a server round-trip later (Ch 41).
+- **`aria-label` on the input** — when the editing state appears, screen readers know what's being edited.
+
+`habits.map` is the immutable update — return a new object when the ID matches, original otherwise.
+
+We'll meet the `<input>`-ref autofocus trick (so the cursor lands inside the field when editing starts) in Ch 21 with `bind:this`.
 </details>
 
 ---
@@ -587,7 +631,7 @@ After Chapter 15 you can:
 - Read **callback props** named `on<Verb>` and explain the data-down events-up flow.
 - Recognise **`createEventDispatcher`** in old code as a refactor target.
 - Read **event bubbling** and **`stopPropagation()`** in modal-like UIs.
-- Read **`window.prompt()`** as a (placeholder) input dialog.
+- Read **inline-edit patterns** (toggle between display and `<input>`) as the senior alternative to `window.prompt` / `window.confirm` / `window.alert` (which are banned in this book — unstyled, ignore dark mode, break on touch).
 
 ---
 
@@ -626,7 +670,7 @@ When `count` changes, `doubled` updates. You read it as a normal value: `console
 
 ## Lesson 16.2 — Wiring it into Streak
 
-Replace the inline `habits.filter(...)` in markup with a named derived:
+You met `$derived` as a preview in Ch 11.6 — `visibleHabits` is already a derived value from the search box. Now we add a *second* derived for the "X added today" indicator, plus the helper that powers it:
 
 ```ts
 // in +page.svelte script
@@ -1625,10 +1669,17 @@ let saveState: SaveState = $state({ status: 'idle' });
 
 ## Lesson 22.2 — Simulating latency
 
+We *deliberately* don't use `Math.random()` to trigger failures. A flaky save makes debugging painful: the user clicks Add, gets *Saving…* for 1.2s, sees an error, refreshes, can't reproduce. **Random failures are a testing antipattern.** Instead we put a "Force fail next save" toggle on the page; the reader controls when failure happens.
+
 ```ts
+let forceNextFail = $state(false);
+
 async function fakeSave(name: string): Promise<void> {
   await new Promise((r) => setTimeout(r, 1200));
-  if (Math.random() < 0.2) throw new Error('Network error (simulated)');
+  if (forceNextFail) {
+    forceNextFail = false; // reset so the toggle is one-shot
+    throw new Error('Network error (simulated)');
+  }
   // success — no return
 }
 
@@ -1679,6 +1730,11 @@ We'll deepen async in Part VI. Today the wiring is the lesson.
   </button>
 </form>
 
+<label class="dev-toggle">
+  <input type="checkbox" bind:checked={forceNextFail} />
+  Force the next save to fail
+</label>
+
 {#if saveState.status === 'error'}
   <p class="error">{saveState.message}</p>
 {/if}
@@ -1686,9 +1742,10 @@ We'll deepen async in Part VI. Today the wiring is the lesson.
 
 ```css
 .error { color: #c00; padding: 0.5rem; background: #fee; border-radius: 0.25rem; }
+.dev-toggle { display: block; margin: 0.5rem 0; color: #888; font-size: 0.875rem; }
 ```
 
-Save. Click *Add*. The button reads "Saving..." for 1.2 seconds. About 20% of the time, you get a red error.
+Save. Click *Add* — *Saving…* for 1.2 seconds, then success. Tick the toggle; click *Add* again — failure, with the inline error. The toggle resets itself after firing, so the next save succeeds again. *Deterministic*. You're in control.
 
 ---
 

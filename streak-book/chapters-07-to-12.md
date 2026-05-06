@@ -1248,6 +1248,48 @@ Returns `true` if the array contains the exact value. Works for primitives (`str
 
 ---
 
+## Lesson 11.5b — `array.reduce(fn, initial)` — the heavy lifter
+
+`map` returns an array of the same length. `filter` returns a subset. `reduce` returns *one thing* — a single value computed from every element.
+
+```ts
+const total: number = [1, 2, 3, 4].reduce((sum, n) => sum + n, 0);
+// total is 10
+```
+
+Read aloud: *"start with sum equal to zero. For each number, the new sum is the old sum plus the number. After the last number, return the final sum."*
+
+The first argument to `reduce` is the **accumulator function** `(acc, item) => nextAcc`. The second argument is the **initial value** of the accumulator — pass it explicitly always. (Without an initial, JavaScript uses the first element, which surprises you when the array is empty or when you want a different *type* than the elements.)
+
+> **`array.reduce(fn, initial)`** — fold a list down to one value. The most powerful array method; also the one beginners fear. The mental model: *"keep an accumulator; for each item, update it; return what you have at the end."*
+
+Three useful shapes:
+
+```ts
+// 1. Sum of cents — typed accumulator different from element type would still work because both are number.
+const totalCents = habits.reduce((sum, _h) => sum + 1, 0); // count, but you'd use .length for this
+
+// 2. Find the oldest habit.
+const oldest = habits.reduce(
+  (oldest, h) => (h.createdAt < oldest.createdAt ? h : oldest),
+  habits[0]!, // ❌ banned — see Ch 7. Use a destructure default instead, or `if (habits.length === 0)` early-return.
+);
+
+// 3. Group by category — accumulator is an object, very different shape from elements.
+const byCategory = habits.reduce<Record<string, Habit[]>>((acc, habit) => {
+  const key = habit.category ?? 'uncategorised';
+  acc[key] ??= [];
+  acc[key].push(habit);
+  return acc;
+}, {});
+```
+
+The `reduce<Record<string, Habit[]>>(...)` form is *generic call notation* — we pin the accumulator's type because TS can't infer it from `{}` alone. You'll see this in the wild; remember it.
+
+We meet `reduce` in real use in Ch 16 (computing totals from `$derived`) and Ch 30 (`splitCents` for refunds).
+
+---
+
 ## Lesson 11.6 — Wiring it into Streak
 
 We add a search box that filters the visible habits. Update the script:
@@ -1255,21 +1297,24 @@ We add a search box that filters the visible habits. Update the script:
 ```ts
 let searchQuery: string = $state('');
 
-// We'll handle the filtering inline in markup with a simple expression for now.
-// In Chapter 16 we'll move it to $derived.
+const visibleHabits = $derived(
+  habits.filter((h) => h.name.toLowerCase().includes(searchQuery.toLowerCase()))
+);
 ```
 
-And in markup, replace the `{#each}` loop's source:
+> **`$derived(expression)`** *(preview — full coverage Ch 16)* — a Svelte 5 rune that computes a value from other reactive state and recomputes when those dependencies change. Read it as *"`visibleHabits` is whatever you'd get by running this filter every time, but Svelte tracks the work for you."* The `expression` form (one line) is shown here; the multi-line `$derived.by(() => { ... })` form lands in Ch 16.
+
+In markup:
 
 ```svelte
 <input type="search" bind:value={searchQuery} placeholder="Search habits..." />
 
-{#each habits.filter((h) => h.name.toLowerCase().includes(searchQuery.toLowerCase())) as habit (habit.id)}
+{#each visibleHabits as habit (habit.id)}
   <!-- ...row... -->
 {/each}
 ```
 
-Read aloud: *"filter habits to those whose name (lowercase) contains the query (lowercase)."*
+Read aloud: *"the visible habits are those whose name (lowercase) contains the query (lowercase). For each visible habit, render a row."*
 
 Save (`Cmd+S` / `Ctrl+S`). Type *"read"* — only the *Read 20 minutes* habit appears. Clear the search — all habits return.
 
@@ -1277,7 +1322,7 @@ Save (`Cmd+S` / `Ctrl+S`). Type *"read"* — only the *Read 20 minutes* habit ap
 >
 > **`<input type="search">`** — an input meant for search queries. Browsers render an X-to-clear button and apply slightly different styling. Behaves the same as `type="text"` for binding.
 
-This inline filter expression in `{#each}` is fine for now; in Chapter 16 we'll move it to a `$derived` so it's named and testable.
+We *could* have written the filter inline inside `{#each}` — and many tutorials do — but pulling it into a named `$derived` makes the value searchable, testable, and self-documenting. Senior habit: name your derived values.
 
 ---
 
@@ -1327,22 +1372,17 @@ If the search were for `'David'`, `found` would be `undefined`, `found?.name` wo
 <details>
 <summary>Worked answer</summary>
 
-In script:
-
-```ts
-// just inline expressions for now; we'll formalise as $derived later
-```
-
-In markup:
+We already have `visibleHabits` as a `$derived` from Lesson 11.6, so the indicator is just `visibleHabits.length` vs `habits.length`. In markup:
 
 ```svelte
 {#if searchQuery.trim() !== ''}
-  {@const visibleCount = habits.filter((h) => h.name.toLowerCase().includes(searchQuery.toLowerCase())).length}
-  <small>Showing {visibleCount} of {habits.length}</small>
+  <small>Showing {visibleHabits.length} of {habits.length}</small>
 {/if}
 ```
 
-`{@const}` is a Svelte-template directive that creates a local constant inside the markup, scoped to the surrounding block. Useful when you need to compute a value once and reuse it. We'll meet it again.
+The fact that we already had a named derived value made this a one-liner. That's what *naming* derived values buys you: every later read is free.
+
+> **`{@const}`** — a Svelte-template directive that creates a local constant scoped to a block (e.g. inside an `{#each}` body). Useful for ad-hoc computations you don't want to elevate into a top-level `$derived`. We won't need it for this exercise but you'll see it in the wild.
 </details>
 
 ---
@@ -1366,6 +1406,7 @@ After Chapter 11 you can:
 - Read **`xs.find((x) => pred(x))`** — first match or undefined; remember to narrow.
 - Read **`xs.some(pred)`** / **`xs.every(pred)`** — boolean reductions.
 - Read **`xs.filter(...).map(...)`** chains and trace data flow.
+- Read **`xs.reduce(fn, initial)`** as a fold and tell the accumulator type from the initial value.
 - Read **`{@const x = expr}`** as a local constant in markup.
 
 ---
@@ -1380,6 +1421,7 @@ After Chapter 11 you can:
 | `array.some(pred)` | Boolean: any matches? |
 | `array.every(pred)` | Boolean: all match? |
 | `array.includes(v)` | Boolean: value present? (primitives) |
+| `array.reduce(fn, init)` | Fold a list to one value via an accumulator. |
 | predicate | A boolean-returning function. |
 | `.toLowerCase()` | Lowercase copy of a string. |
 | `%` | Modulo (remainder) operator. |

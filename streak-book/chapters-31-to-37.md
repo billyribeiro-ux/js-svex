@@ -342,12 +342,12 @@ export const load: PageLoad = async ({ params }) => {
     { id: habitId('demo-2'), name: 'Read 20 minutes', createdAt: Date.now() },
   ];
   const habit = fakeHabits.find((h) => h.id === params.id);
-  if (habit === undefined) error(404, { message: 'Habit not found' });
+  if (habit === undefined) throw error(404, { message: 'Habit not found' });
   return { habit };
 };
 ```
 
-> **`error(status, message)`** *throws internally* — you don't need `throw error(...)`. The function's TypeScript return type is `never`, so the compiler knows nothing after it executes.
+> **`error(status, message)`** is documented to be used as `throw error(...)`. The helper does throw internally (its return type is `never`), so a bare `error(...)` works at runtime — but writing `throw` makes the control-flow visible in the source. Senior habit, and consistent with `throw redirect(...)`. We use `throw` everywhere.
 
 ```svelte
 <!-- src/routes/habits/[id]/+page.svelte -->
