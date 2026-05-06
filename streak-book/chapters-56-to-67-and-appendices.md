@@ -1427,7 +1427,9 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: 'tests/e2e',
   fullyParallel: true,
-  retries: process.env.CI ? 2 : 0,
+  // We deliberately set retries to 0. Two retries hides flakes; the senior bar is
+  // "every test is deterministic." If a test flakes once, we fix it, not retry it.
+  retries: 0,
   workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? 'github' : 'list',
 
@@ -1639,27 +1641,58 @@ axe is *automated* a11y testing — it catches about 30% of WCAG violations. The
 
 ## Lesson 60.7 — Visual regression
 
+Visual tests are notoriously flaky if you don't control four things:
+
+1. **Viewport size** — different runners default differently.
+2. **Animations** — running animations make screenshots non-deterministic.
+3. **Font loading** — first render before fonts swap looks different.
+4. **Dynamic dates** — relative timestamps ("2 minutes ago") move on every run.
+
+A senior visual test pins all four:
+
 ```ts
 // tests/e2e/visual.spec.ts
 import { test, expect } from '@playwright/test';
 
-test('home matches snapshot', async ({ page }) => {
-  await page.goto('/');
-  await expect(page).toHaveScreenshot('home.png', {
-    maxDiffPixelRatio: 0.01, // tolerate up to 1% pixel diff (anti-aliasing, etc.)
-    fullPage: true,
+test.describe('visual regression', () => {
+  test.beforeEach(async ({ page }) => {
+    // 1. Pin viewport.
+    await page.setViewportSize({ width: 1280, height: 800 });
+    // 2. Disable animations + reduce motion.
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    // 4. Pin Date.now() so relative-time strings are deterministic.
+    await page.addInitScript(() => {
+      const FIXED = new Date('2026-05-05T12:00:00Z').valueOf();
+      Date.now = () => FIXED;
+    });
   });
-});
 
-test('pricing matches snapshot', async ({ page }) => {
-  await page.goto('/pricing');
-  await expect(page).toHaveScreenshot('pricing.png', { maxDiffPixelRatio: 0.01, fullPage: true });
+  test('home matches snapshot', async ({ page }) => {
+    await page.goto('/');
+    // 3. Wait for fonts to load before screenshotting.
+    await page.evaluate(() => document.fonts.ready);
+    await expect(page).toHaveScreenshot('home.png', {
+      maxDiffPixelRatio: 0.01,
+      fullPage: true,
+    });
+  });
+
+  test('pricing matches snapshot', async ({ page }) => {
+    await page.goto('/pricing');
+    await page.evaluate(() => document.fonts.ready);
+    await expect(page).toHaveScreenshot('pricing.png', {
+      maxDiffPixelRatio: 0.01,
+      fullPage: true,
+    });
+  });
 });
 ```
 
 First run with `pnpm exec playwright test --update-snapshots` creates the baseline images. Subsequent runs compare. When a CSS change shifts the layout, the test fails *and* writes a diff image to `test-results/` you can inspect.
 
 > **visual regression** — automated detection of pixel-level layout/color changes between runs.
+>
+> **The four stability levers** — pin viewport, disable animations, wait for fonts, freeze time. Forgetting any one produces a flaky test, and a flaky test is worse than no test (it teaches the team to ignore failures).
 
 ---
 
@@ -2953,24 +2986,35 @@ export async function createPat(userId: string, name: string): Promise<{ token: 
   return { token, id: row.id };
 }
 
-export async function findUserByPat(token: string): Promise<string | null> {
+export async function findUserByPat(token: string): Promise<{ userId: string; scopes: string[] } | null> {
   if (!token.startsWith(PREFIX)) return null;
   const hash = sha256(token);
-  const [row] = await db.select({ userId: personalAccessTokens.userId })
+  const now = new Date();
+  const [row] = await db.select({
+    userId: personalAccessTokens.userId,
+    scopes: personalAccessTokens.scopes,
+    lastUsedAt: personalAccessTokens.lastUsedAt,
+  })
     .from(personalAccessTokens)
     .where(and(
       eq(personalAccessTokens.hashedToken, hash),
-      // either no expiry, or expiry in the future
+      or(
+        isNull(personalAccessTokens.expiresAt),
+        gt(personalAccessTokens.expiresAt, now),
+      ),
     ))
     .limit(1);
   if (row === undefined) return null;
 
-  // touch lastUsedAt asynchronously (don't block the request on it)
-  void db.update(personalAccessTokens)
-    .set({ lastUsedAt: new Date() })
-    .where(eq(personalAccessTokens.hashedToken, hash));
+  // Touch lastUsedAt at most once per minute to avoid hammering the row's lock under high QPS.
+  const ONE_MIN = 60_000;
+  if (row.lastUsedAt === null || now.getTime() - row.lastUsedAt.getTime() > ONE_MIN) {
+    void db.update(personalAccessTokens)
+      .set({ lastUsedAt: now })
+      .where(eq(personalAccessTokens.hashedToken, hash));
+  }
 
-  return row.userId;
+  return { userId: row.userId, scopes: row.scopes };
 }
 ```
 
@@ -3045,41 +3089,60 @@ const CreateBody = v.object({
   description: v.optional(v.pipe(v.string(), v.maxLength(500))),
 });
 
-async function authUser(request: Request): Promise<string | Response> {
+async function authUser(request: Request, requiredScope?: string): Promise<{ userId: string; scopes: string[] } | Response> {
   const auth = request.headers.get('authorization');
   if (auth === null || !auth.startsWith('Bearer ')) {
     return problem(401, 'Unauthorized', 'Missing Bearer token');
   }
   const token = auth.slice(7);
-  const userId = await findUserByPat(token);
-  if (userId === null) return problem(401, 'Unauthorized', 'Invalid token');
-  return userId;
+  const result = await findUserByPat(token);
+  if (result === null) return problem(401, 'Unauthorized', 'Invalid or expired token');
+  if (requiredScope !== undefined && !result.scopes.includes(requiredScope)) {
+    return problem(403, 'Forbidden', `Missing scope: ${requiredScope}`);
+  }
+  return result;
 }
 
 export const GET: RequestHandler = async ({ request, url }) => {
-  const userId = await authUser(request);
-  if (userId instanceof Response) return userId;
+  const auth = await authUser(request, 'habits:read');
+  if (auth instanceof Response) return auth;
+  const { userId } = auth;
 
+  // Cursor pagination tie-broken by id — handles equal-millisecond inserts.
   const cursor = url.searchParams.get('cursor');
-  const cursorTime = cursor !== null ? Number(cursor) : null;
-  if (cursorTime !== null && !Number.isFinite(cursorTime)) {
-    return problem(400, 'Bad Request', 'Invalid cursor');
+  let cursorTs: Date | null = null;
+  let cursorId: string | null = null;
+  if (cursor !== null) {
+    const [tsStr, id] = cursor.split(':', 2);
+    const ts = Number(tsStr);
+    if (!Number.isFinite(ts) || id === undefined) {
+      return problem(400, 'Bad Request', 'Invalid cursor');
+    }
+    cursorTs = new Date(ts);
+    cursorId = id;
   }
 
-  const where = cursorTime !== null
-    ? and(eq(habits.userId, userId), lt(habits.createdAt, new Date(cursorTime)))
+  // (created_at, id) < (cursor.ts, cursor.id) — Postgres row comparison.
+  // For two rows with identical timestamps, id breaks the tie deterministically.
+  const where = cursorTs !== null && cursorId !== null
+    ? and(
+        eq(habits.userId, userId),
+        sql`(${habits.createdAt}, ${habits.id}) < (${cursorTs}, ${cursorId})`,
+      )
     : eq(habits.userId, userId);
 
   const rows = await db.select()
     .from(habits)
     .where(where)
-    .orderBy(desc(habits.createdAt))
+    .orderBy(desc(habits.createdAt), desc(habits.id))
     .limit(PAGE_SIZE + 1);
 
   const hasMore = rows.length > PAGE_SIZE;
   const page = hasMore ? rows.slice(0, PAGE_SIZE) : rows;
   const last = page[page.length - 1];
-  const nextCursor = hasMore && last ? String(last.createdAt.getTime()) : null;
+  const nextCursor = hasMore && last !== undefined
+    ? `${last.createdAt.getTime()}:${last.id}`
+    : null;
 
   return json({
     data: page,
@@ -3088,8 +3151,9 @@ export const GET: RequestHandler = async ({ request, url }) => {
 };
 
 export const POST: RequestHandler = async ({ request }) => {
-  const userId = await authUser(request);
-  if (userId instanceof Response) return userId;
+  const auth = await authUser(request, 'habits:write');
+  if (auth instanceof Response) return auth;
+  const { userId } = auth;
 
   const raw: unknown = await request.json();
   const parsed = v.safeParse(CreateBody, raw);
@@ -3102,6 +3166,18 @@ export const POST: RequestHandler = async ({ request }) => {
 
   return json({ id: result.value.id }, { status: 201 });
 };
+```
+
+Three senior touches in the cursor logic:
+
+1. **Composite cursor `<ts>:<id>`** — two habits inserted in the same millisecond are rare in practice but real. A pure timestamp cursor loses one when paginating across the boundary. Row comparison `(created_at, id) < (cursor)` is Postgres's idiomatic fix.
+2. **Scope check on the PAT** — `'habits:read'` for GET, `'habits:write'` for POST. Without this, every PAT is admin.
+3. **`isNull(expiresAt) OR expiresAt > now`** in `findUserByPat` — expired tokens are rejected, not just lurking in the table.
+
+Add `or` and `isNull` to your Drizzle imports:
+
+```ts
+import { and, eq, gt, lt, desc, isNull, or, sql } from 'drizzle-orm';
 ```
 
 Read aloud:
@@ -3952,9 +4028,13 @@ If any of these is hand-wavy, the implementation will be hand-wavy too. The seni
 
 > **Streak Freezes — Pro feature.**
 >
-> Pro users get one streak freeze per calendar month: a one-day skip that doesn't break their streak. The home screen shows the count of remaining freezes for the current month. Consuming a freeze is a deliberate user action — confirm dialog and audit row. The reset to 1 happens at 00:00 UTC on the first of every month. Safe under concurrent consumption (a user clicking twice cannot consume two freezes). Roll out behind a feature flag. Fully observable.
+> Pro users get one streak freeze per calendar month: a one-day skip that doesn't break their streak. The home screen shows the count of remaining freezes for the current month. Consuming a freeze is a deliberate user action — confirm dialog and audit row. The reset to 1 happens at the start of each calendar month, in **the user's local timezone** (not server UTC). Safe under concurrent consumption (a user clicking twice cannot consume two freezes). Roll out behind a feature flag. Fully observable.
 
 Estimated effort: 6–10 hours of focused work.
+
+> **The timezone trap, named.** Read the brief twice — the word "calendar month" is doing real work. A user in Tokyo sees the calendar flip to February at 00:00 JST, which is **15:00 UTC the previous day**. If your reset cron fires at 00:00 UTC, the Tokyo user gets a "new month" freeze 9 hours after their February-1 morning has already started. This is a UX bug *and* an unfairness bug (Pacific users effectively get a longer month). A senior brief surfaces this; a senior implementation handles it.
+>
+> Two valid approaches: (a) store `users.timezone` (e.g. `"Asia/Tokyo"`) and reset per-user when their local clock crosses month-boundary — usually via a more frequent cron (e.g. hourly) that checks per-user; (b) compute "remaining freezes" *on read* from `freeze_consumed_at` timestamps relative to the user's local month, no reset cron needed. Option (b) is usually cleaner. Defend your choice in ADR-003.
 
 ---
 
@@ -4483,12 +4563,17 @@ TOOLING
  4. Svelte 5 runes only — no export let, no $:, no on:click, no <slot>.
 
 IDIOMS
- 5. += not = x + 1. === not ==. const by default. ?? not ||.
-    ?. over manual null checks. Early returns. type="button" always.
- 6. Engineer-English read-aloud on every snippet.
- 7. Every example is load-bearing.
- 8. English sentence first, code second.
- 9. No comment lies.
+ 5a. += not = x + 1.
+ 5b. === not ==.
+ 5c. const by default; let only when reassignment is real.
+ 5d. ?? not || for nullish defaults.
+ 5e. ?. over manual null checks.
+ 5f. Early returns over nested if.
+ 5g. type="button" on every <button> not inside a submit-form.
+ 6.  Engineer-English read-aloud on every snippet.
+ 7.  Every example is load-bearing.
+ 8.  English sentence first, code second.
+ 9.  No comment lies.
 
 CORRECTNESS
 10. Money is integer cents end-to-end. No floats.

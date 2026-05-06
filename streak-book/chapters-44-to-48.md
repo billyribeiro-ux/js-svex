@@ -124,7 +124,7 @@ export const actions: Actions = {
     cookies.set('session', token, {
       httpOnly: true,
       secure: true,
-      sameSite: 'strict',
+      sameSite: 'lax',
       path: '/',
       maxAge: 60 * 60 * 24 * 30,
     });
@@ -168,29 +168,183 @@ The `dummyHash` line: by always running `verifyPassword`, we avoid a timing leak
 | Account enumeration | Generic "invalid email or password." Same response for both. |
 | Brute force | Rate-limit `/login` per IP and per email (Ch 48). |
 | Credential stuffing | Rate-limit + (later) hCaptcha after N failures. |
-| CSRF | SvelteKit's `csrf.checkOrigin` (default on); `sameSite: strict` cookies. |
+| CSRF | SvelteKit's `csrf.checkOrigin` (default on); `sameSite: 'lax'` cookies. |
 | XSS → token theft | `httpOnly` cookies. Tokens never readable by JS. |
 | Replay | Short session lifetimes; "fresh" flag for sensitive actions. |
 
----
-
-## Lesson 44.7 — Recurring concepts from earlier chapters
-
-- **`+page.server.ts` actions** (Ch 41) — login is just another named (or default) action.
-- **Atomic INSERT** (Ch 42) — `createSession` is single-row insert; safe.
-- **`drizzle-orm`** (Ch 39) — `.where(eq(users.email, email))`.
-- **`fail(400, ...)`** (Ch 41) — generic error response; never enumerate.
+> **Why `sameSite: 'lax'` instead of `'strict'`?** Strict mode strips the cookie on *any* cross-site navigation — including a user clicking a verification link from their email or a password-reset link. The session would not travel; the user would land logged out. Lax sends the cookie on top-level GET navigations from external origins (links, address bar) but blocks it on cross-site POSTs, which is the actual CSRF threat. Lax is the senior default for session cookies; reach for strict only on cookies guarding *additional* high-value actions (e.g. a separate "reauth" cookie that gates `/admin/*`).
 
 ---
 
-## Lesson 44.8 — What you can now read in the wild
+## Lesson 44.7 — Forgot password / password reset
+
+The single largest auth flow we haven't built yet. Three steps:
+
+1. User submits their email at `/forgot-password`.
+2. Server *unconditionally* responds with "if that email is registered, we sent a link" (account-enumeration mitigation), then *conditionally* mints a single-use token and emails the user.
+3. User clicks the link `/reset-password/[token]`, sets a new password, all their existing sessions are revoked.
+
+Schema additions:
+
+```ts
+// schema.ts additions
+export const passwordResets = pgTable('password_resets', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  hashedToken: text('hashed_token').notNull().unique(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  consumedAt: timestamp('consumed_at', { withTimezone: true }),
+});
+```
+
+Note: we store the **hash** of the token, not the token itself. If the DB leaks, the leaked rows can't be used to reset accounts. The token is shown to the user once, embedded in the email link.
+
+Reset-request action:
+
+```ts
+// src/routes/(auth)/forgot-password/+page.server.ts
+import type { Actions } from './$types';
+import { db } from '$lib/db/client';
+import { users, passwordResets } from '$lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { randomBytes, createHash } from 'node:crypto';
+import { logger } from '$lib/logger';
+
+const RESET_LIFETIME_MS = 15 * 60 * 1000; // 15 minutes — short, reset is high-value
+
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
+
+export const actions: Actions = {
+  default: async ({ request }) => {
+    const data = await request.formData();
+    const email = String(data.get('email') ?? '').trim().toLowerCase();
+
+    // Always respond identically — prevents account enumeration.
+    // The work happens or doesn't, but the user can't tell.
+    const [user] = await db.select({ id: users.id, email: users.email })
+      .from(users)
+      .where(eq(users.email, email))
+      .limit(1);
+
+    if (user !== undefined) {
+      const rawToken = randomBytes(32).toString('base64url');
+      const hashedToken = sha256(rawToken);
+      const expiresAt = new Date(Date.now() + RESET_LIFETIME_MS);
+
+      await db.insert(passwordResets).values({
+        userId: user.id,
+        hashedToken,
+        expiresAt,
+      });
+
+      // In dev we log to console; Ch 64 wires real email via Resend.
+      logger.info({ email: user.email }, 'password.reset.requested');
+      console.log(`Reset link: http://localhost:5173/reset-password/${rawToken}`);
+    }
+
+    return { success: true };
+  },
+};
+```
+
+Reset-consume action — atomic, single-use, revokes all sessions:
+
+```ts
+// src/routes/(auth)/reset-password/[token]/+page.server.ts
+import type { Actions, PageServerLoad } from './$types';
+import { error, redirect } from '@sveltejs/kit';
+import { db } from '$lib/db/client';
+import { passwordResets, sessions, users } from '$lib/db/schema';
+import { and, eq, gt, isNull } from 'drizzle-orm';
+import { hashPassword } from '$lib/passwords';
+import { createHash } from 'node:crypto';
+
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
+
+export const load: PageServerLoad = async ({ params }) => {
+  const hashedToken = sha256(params.token);
+  const [reset] = await db.select()
+    .from(passwordResets)
+    .where(and(
+      eq(passwordResets.hashedToken, hashedToken),
+      gt(passwordResets.expiresAt, new Date()),
+      isNull(passwordResets.consumedAt),
+    ))
+    .limit(1);
+
+  if (reset === undefined) throw error(400, 'Reset link is invalid or has expired.');
+  return { tokenValid: true };
+};
+
+export const actions: Actions = {
+  default: async ({ request, params, cookies }) => {
+    const data = await request.formData();
+    const password = String(data.get('password') ?? '');
+    if (password.length < 12) {
+      throw error(400, 'Password must be at least 12 characters.');
+    }
+
+    const hashedToken = sha256(params.token);
+    const passwordHash = await hashPassword(password);
+
+    // Atomic consume — Bible rule #11.
+    // UPDATE returns 0 rows if the token was already consumed by a parallel request.
+    const consumed = await db.update(passwordResets)
+      .set({ consumedAt: new Date() })
+      .where(and(
+        eq(passwordResets.hashedToken, hashedToken),
+        gt(passwordResets.expiresAt, new Date()),
+        isNull(passwordResets.consumedAt),
+      ))
+      .returning({ userId: passwordResets.userId });
+
+    if (consumed.length === 0) throw error(400, 'Reset link is invalid or has expired.');
+    const userId = consumed[0]!.userId;
+
+    // Update the password and revoke all the user's existing sessions atomically.
+    await db.transaction(async (tx) => {
+      await tx.update(users).set({ passwordHash }).where(eq(users.id, userId));
+      await tx.delete(sessions).where(eq(sessions.userId, userId));
+    });
+
+    cookies.delete('session', { path: '/' });
+    throw redirect(303, '/login?reset=ok');
+  },
+};
+```
+
+Three senior touches:
+
+1. **The reset action uses an atomic UPDATE-RETURNING** to consume the token. Two parallel clicks of the same link → only one succeeds. Bible rule #11.
+2. **All the user's sessions are revoked on reset.** If the password was reset because it leaked, every session minted with the old password is now untrusted; nuke them.
+3. **Account-enumeration discipline holds.** The `forgot-password` action returns `{ success: true }` whether the email exists or not. Same response code, same response body. The attacker can't distinguish.
+
+> **token hashing at rest** *(noun)* — store `sha256(token)`, never the token itself. The token is high-entropy, so SHA-256 is enough (no Argon2 needed — that's for human-typed passwords).
+
+---
+
+## Lesson 44.8 — Recurring concepts from earlier chapters
+
+- **`+page.server.ts` actions** (Ch 41) — login + forgot-password + reset are all named actions.
+- **Atomic INSERT and atomic UPDATE-RETURNING** (Ch 42) — sessions, reset consume.
+- **`drizzle-orm`** (Ch 39) — every query goes through it.
+- **`fail(400, ...)` / generic responses** (Ch 41) — never enumerate.
+
+---
+
+## Lesson 44.9 — What you can now read in the wild
 
 After Chapter 44 you can:
 
 - Read the **session schema** (token, expiresAt, fresh).
-- Read **secure cookie flags** (`httpOnly`, `secure`, `sameSite`, `path`, `maxAge`) and explain each.
+- Read **secure cookie flags** (`httpOnly`, `secure`, `sameSite: 'lax'`, `path`, `maxAge`) and explain each.
 - Read **`crypto.timingSafeEqual`** as the constant-time-comparison primitive.
-- Spot **account-enumeration** as a vulnerability and identify the `dummyHash`+generic-error mitigation.
+- Read a **password-reset flow** with hashed-at-rest tokens, atomic consume, session revocation.
+- Spot **account-enumeration** as a vulnerability and identify the `dummyHash` + identical-response mitigation.
 - Recite the threat model out loud.
 
 ---
@@ -198,6 +352,8 @@ After Chapter 44 you can:
 ## End-of-chapter checkpoint
 
 - [ ] Login form sets a session cookie.
+- [ ] Forgot-password generates a logged reset link.
+- [ ] Reset-password consumes the token atomically and revokes existing sessions.
 - [ ] You can articulate the threat model out loud.
 
 ---
@@ -398,10 +554,15 @@ parentPort!.on('message', async (msg: { id: string; op: 'hash' | 'verify'; data:
 ```ts
 // src/lib/passwords/index.ts
 import { Worker } from 'node:worker_threads';
-import { fileURLToPath } from 'node:url';
 import os from 'node:os';
+// Vite's `?worker` import returns a constructor that produces a Worker
+// running the bundled module. Works in dev (`pnpm dev`) and production builds.
+// Without `?worker`, you'd be loading a `.ts` file at runtime — broken on Node.
+import HashWorker from './worker.ts?worker';
 
-type WorkerMessage = { id: string; ok: true; result: string | boolean } | { id: string; ok: false; error: string };
+type WorkerMessage =
+  | { id: string; ok: true; result: string | boolean }
+  | { id: string; ok: false; error: string };
 type DispatchOp = 'hash' | 'verify';
 type DispatchData = string | { plain: string; hash: string };
 
@@ -409,25 +570,36 @@ interface PendingCall {
   id: string;
   resolve: (v: string | boolean) => void;
   reject: (e: Error) => void;
+  timer: NodeJS.Timeout;
 }
 
 const POOL_SIZE = Math.max(1, os.cpus().length - 1);
+const QUEUE_TIMEOUT_MS = 5_000; // Bible rule #13 — queued requests time out
 
 const pool: Worker[] = [];
-const queue: PendingCall[] = [];
+const queue = new Map<string, PendingCall>();
 
 function ensurePool(): void {
   if (pool.length > 0) return;
   for (let i = 0; i < POOL_SIZE; i += 1) {
-    const w = new Worker(fileURLToPath(import.meta.resolve('./worker.ts')));
+    const w = new HashWorker();
     w.on('message', (msg: WorkerMessage) => {
-      const idx = queue.findIndex((q) => q.id === msg.id);
-      if (idx === -1) return;
-      const pending = queue[idx];
+      const pending = queue.get(msg.id);
       if (pending === undefined) return;
-      queue.splice(idx, 1);
+      clearTimeout(pending.timer);
+      queue.delete(msg.id);
       if (msg.ok) pending.resolve(msg.result);
       else pending.reject(new Error(msg.error));
+    });
+    w.on('error', (err) => {
+      // A worker crashed. Reject every in-flight call routed to it.
+      // (We don't track per-worker routing here for brevity; in production,
+      // you'd map jobs → workers and only reject affected ones.)
+      for (const [id, pending] of queue) {
+        clearTimeout(pending.timer);
+        pending.reject(err);
+        queue.delete(id);
+      }
     });
     pool.push(w);
   }
@@ -439,13 +611,22 @@ function dispatch<T extends string | boolean>(op: DispatchOp, data: DispatchData
   ensurePool();
   return new Promise<T>((resolve, reject) => {
     const id = crypto.randomUUID();
-    queue.push({
+    const timer = setTimeout(() => {
+      queue.delete(id);
+      reject(new Error('hash worker timed out'));
+    }, QUEUE_TIMEOUT_MS);
+
+    queue.set(id, {
       id,
       resolve: (v) => resolve(v as T),
       reject,
+      timer,
     });
+
     const worker = pool[nextWorker];
     if (worker === undefined) {
+      clearTimeout(timer);
+      queue.delete(id);
       reject(new Error('worker pool empty'));
       return;
     }
@@ -463,7 +644,13 @@ export function verifyPassword(plain: string, hash: string): Promise<boolean> {
 }
 ```
 
-The actual production version would handle worker crashes, queue timeouts (the Bible's `connect_timeout` rule applied: queued requests should time out if no worker responds in N seconds), graceful shutdown, and a max queue depth so a worker-pool stampede can't OOM the process. We're showing the core mechanism; the production-hardening version goes in `src/lib/passwords/index.ts` once the security review (Ch 48) flags it.
+Three production-grade fixes from the first version:
+
+1. **`import HashWorker from './worker.ts?worker'`** — Vite's `?worker` query produces a Worker constructor that loads the *bundled* module. Without `?worker`, you'd be telling Node "load this `.ts` file at runtime," which fails outside dev. The previous form used `import.meta.resolve` and would have shipped broken in production.
+2. **`QUEUE_TIMEOUT_MS = 5_000`** with a per-call `setTimeout` — Bible rule #13 applied. A wedged worker can't hold a request thread forever.
+3. **`worker.on('error', ...)`** rejects in-flight calls on worker crashes. Without this, a segfaulting Argon2 binding would leak promises forever.
+
+Things still left for a real production version: per-worker job routing (so one crash only fails its own jobs), a max queue depth to refuse new work under stampede, graceful shutdown on `SIGTERM`. These all matter at scale; we'd add them when the security review (Ch 48) demands.
 
 ---
 
@@ -653,6 +840,8 @@ Forget once, gate forever. Every page under `(app)/admin/` is protected.
 
 ## Lesson 47.4 — Impersonation safely
 
+There's a foot-gun a beginner implementation always hits: if you set the impersonation token as the regular `session` cookie, you've **overwritten the admin's own session cookie**. When the admin clicks "End impersonation," there's no admin cookie to return to — they're logged out. The fix is to use a **second cookie** (`session_impersonation`) and teach `handle` to prefer it when present.
+
 Schema additions:
 
 ```ts
@@ -663,12 +852,12 @@ export const sessions = pgTable('sessions', {
 });
 ```
 
-Action:
+Action — the impersonation session goes into a *separate* cookie:
 
 ```ts
 // src/routes/(app)/admin/users/[id]/impersonate/+page.server.ts
 import type { Actions } from './$types';
-import { redirect } from '@sveltejs/kit';
+import { redirect, error } from '@sveltejs/kit';
 import { db } from '$lib/db/client';
 import { sessions, users } from '$lib/db/schema';
 import { eq } from 'drizzle-orm';
@@ -682,7 +871,7 @@ export const actions: Actions = {
     const admin = requireRole(event, 'admin');
     const targetId = event.params.id;
     const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
-    if (target === undefined) redirect(303, '/admin/users');
+    if (target === undefined) throw error(404, 'User not found');
 
     const token = newSessionToken();
     await withAudit(event, 'user.impersonate.start', 'user', target.id, async (tx) => {
@@ -695,19 +884,72 @@ export const actions: Actions = {
       });
     });
 
-    event.cookies.set('session', token, {
-      httpOnly: true, secure: true, sameSite: 'strict', path: '/',
+    // Set as a SECOND cookie — the admin's `session` cookie is preserved.
+    event.cookies.set('session_impersonation', token, {
+      httpOnly: true, secure: true, sameSite: 'lax', path: '/',
       maxAge: Math.floor(IMPERSONATION_LIFETIME_MS / 1000),
     });
-    redirect(303, '/dashboard');
+    throw redirect(303, '/dashboard');
   },
 };
 ```
 
-In the layout, show a banner when impersonating:
+`handle` (in `+hooks.server.ts`) prefers the impersonation cookie when present:
+
+```ts
+const authHandle: Handle = async ({ event, resolve }) => {
+  const impersonationToken = event.cookies.get('session_impersonation');
+  const sessionToken = event.cookies.get('session');
+
+  // Prefer the impersonation token if present; the admin remains identified
+  // via the `impersonatorId` field on the impersonation session row.
+  const token = impersonationToken ?? sessionToken;
+
+  if (token !== undefined) {
+    const rows = await db.select({
+      user: users,
+      impersonatorId: sessions.impersonatorId,
+    })
+      .from(sessions)
+      .innerJoin(users, eq(sessions.userId, users.id))
+      .where(and(eq(sessions.token, token), gt(sessions.expiresAt, new Date())))
+      .limit(1);
+
+    if (rows[0] !== undefined) {
+      event.locals.user = rows[0].user;
+      event.locals.impersonatorId = rows[0].impersonatorId ?? null;
+    }
+  }
+
+  return resolve(event);
+};
+```
+
+End-impersonation action — deletes only the impersonation session, clears only the impersonation cookie:
+
+```ts
+// src/routes/(app)/admin/end-impersonation/+server.ts
+import type { RequestHandler } from './$types';
+import { redirect } from '@sveltejs/kit';
+import { db } from '$lib/db/client';
+import { sessions } from '$lib/db/schema';
+import { eq } from 'drizzle-orm';
+
+export const POST: RequestHandler = async ({ cookies, locals }) => {
+  const token = cookies.get('session_impersonation');
+  if (token !== undefined) {
+    await db.delete(sessions).where(eq(sessions.token, token));
+  }
+  cookies.delete('session_impersonation', { path: '/' });
+  // The admin's `session` cookie is untouched — they're back in admin context.
+  throw redirect(303, '/admin/users');
+};
+```
+
+In the layout, show a banner when `event.locals.impersonatorId` is set:
 
 ```svelte
-{#if data.user.impersonatorId}
+{#if data.impersonatorId !== null}
   <div class="impersonation-banner">
     Impersonating {data.user.email}.
     <form method="POST" action="/admin/end-impersonation">
@@ -717,9 +959,22 @@ In the layout, show a banner when impersonating:
 {/if}
 ```
 
-The end-impersonation action deletes only this session (not the admin's original session) and clears the cookie.
+The principle: *separate cookie + handle prefers it + visible banner + audit at start and end + atomic delete on exit*. Without all five, impersonation becomes a backdoor.
 
-The principle is *fresh short-lived session + visible banner + audit row at start and end*. Without all three, impersonation becomes a backdoor.
+Update `App.Locals` accordingly:
+
+```ts
+declare global {
+  namespace App {
+    interface Locals {
+      user?: { id: string; email: string; role: 'user' | 'admin' };
+      impersonatorId?: string | null;
+      requestId: string;
+      log: import('pino').Logger;
+    }
+  }
+}
+```
 
 ---
 
@@ -947,11 +1202,28 @@ After Part VII you can:
 
 ---
 
+## Lesson 48.9 — What we deliberately didn't build (and what to add when you need it)
+
+The auth system shipped here is *honest*: passwords, sessions, RBAC, audit, rate limits, headers. It's the floor. Senior teams add these on top, in roughly this order:
+
+- **Multi-factor authentication (TOTP)** — second factor at login, especially for admins. Store an encrypted shared secret per user; verify a 6-digit code via `otpauth` lib. Enforce on `requireRole('admin')`.
+- **Passkeys / WebAuthn** — the May 2026 default for any new auth system. Better security and better UX than passwords. Libraries: `@simplewebauthn/server` + `@simplewebauthn/browser`. Lets the user log in with Touch ID / Face ID / a hardware key and skip passwords entirely.
+- **SSO / OAuth (Google, GitHub, Microsoft)** — for B2B audiences who'd refuse to create another password. Use `arctic` (TS-first OAuth helper); pair with the existing session table.
+- **Account deletion + GDPR data export** — a `/settings/danger-zone` route that exports all user data as a downloadable JSON, then 30-day soft-delete window before hard delete (with cascading deletes on habits/sessions/audit-log-with-anonymized-actor).
+- **Account-lockout after N failed attempts** — separate from rate-limiting. After 10 failed logins for `user@x.com` (over any IP), the account locks for 15 minutes. A `users.failed_login_attempts INTEGER` + `users.locked_until TIMESTAMP` columns + atomic UPDATE.
+- **Session forensics** — `sessions.user_agent`, `sessions.ip_address`, `sessions.last_seen_at` columns + a `/settings/sessions` page where the user can see and revoke every active session ("log out of all other devices").
+- **Push-style audit alerts** — when a sensitive action happens (password change, MFA disabled, new device login), email the user immediately so a real account-takeover is visible to them within seconds.
+
+None of these are exotic; all of them are normal for a real fintech-shaped app. Each is roughly 2–4 hours of work + tests. Ship them when the threat model justifies them, not before.
+
+---
+
 ## End-of-chapter checkpoint
 
 - [ ] Rate-limiting is live on `/login` and `/signup`.
 - [ ] Security headers are set in `handle`.
 - [ ] `pnpm security:headers` passes.
 - [ ] You wrote the review document.
+- [ ] You can name three things in 48.9 that should land before public beta.
 
 End of Part VII. Next: money, polish, every Svelte primitive.

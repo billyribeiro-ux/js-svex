@@ -177,6 +177,7 @@ import { db } from '$lib/db/client';
 import { subscriptions, webhookEvents } from '$lib/db/schema';
 import { eq } from 'drizzle-orm';
 import { STRIPE_WEBHOOK_SECRET } from '$env/static/private';
+import { logger } from '$lib/logger';
 
 function customerIdFrom(value: string | Stripe.Customer | Stripe.DeletedCustomer | null): string {
   if (typeof value === 'string') return value;
@@ -234,12 +235,51 @@ export const POST: RequestHandler = async ({ request }) => {
         .where(eq(subscriptions.stripeCustomerId, customerId));
     }
 
+    if (event.type === 'customer.subscription.updated') {
+      // Plan change, past_due transitions, cancellation scheduled — keep DB in sync.
+      const sub = event.data.object;
+      const customerId = customerIdFrom(sub.customer);
+      await tx.update(subscriptions)
+        .set({
+          status: sub.status,
+          currentPeriodEnd: periodEndOf(sub),
+          plan: sub.status === 'active' || sub.status === 'trialing' ? 'pro' : 'free',
+        })
+        .where(eq(subscriptions.stripeCustomerId, customerId));
+    }
+
     if (event.type === 'customer.subscription.deleted') {
       const sub = event.data.object;
       const customerId = customerIdFrom(sub.customer);
       await tx.update(subscriptions)
         .set({ plan: 'free', status: 'cancelled' })
         .where(eq(subscriptions.stripeCustomerId, customerId));
+    }
+
+    if (event.type === 'invoice.payment_failed') {
+      // First failed renewal → status moves to 'past_due'. Stripe will retry per
+      // your dunning settings; meanwhile we keep the user as Pro (grace period)
+      // but flag the status so the UI can show a banner.
+      const invoice = event.data.object;
+      const customerId = customerIdFrom(invoice.customer);
+      await tx.update(subscriptions)
+        .set({ status: 'past_due' })
+        .where(eq(subscriptions.stripeCustomerId, customerId));
+    }
+
+    if (event.type === 'invoice.payment_succeeded') {
+      // Successful renewal — clear past_due if set.
+      const invoice = event.data.object;
+      const customerId = customerIdFrom(invoice.customer);
+      await tx.update(subscriptions)
+        .set({ status: 'active' })
+        .where(eq(subscriptions.stripeCustomerId, customerId));
+    }
+
+    if (event.type === 'customer.subscription.trial_will_end') {
+      // 3 days before trial ends — Stripe nudges us. We log; UI can prompt.
+      // (No DB write needed; the subscription's status will update on its own.)
+      logger.info({ customerId: customerIdFrom(event.data.object.customer) }, 'stripe.trial.ending');
     }
 
     await tx.update(webhookEvents)
@@ -250,6 +290,12 @@ export const POST: RequestHandler = async ({ request }) => {
   return text('ok');
 };
 ```
+
+The five events above cover the canonical Stripe **dunning state machine**: subscriptions move `active → past_due → canceled` over multiple weeks if a card fails, and we want our DB to reflect that without manual reconciliation.
+
+> **dunning** *(noun)* — the polite-collection process for failed payments. Stripe retries cards up to 4 times over 3 weeks (per your dunning settings). The webhook stream tells you which state the user is currently in.
+
+Configure Stripe dashboard → Settings → Subscriptions and emails → Smart Retries: 4 attempts over ~3 weeks; on final failure, Stripe fires `customer.subscription.deleted` and we drop the user to free.
 
 ---
 
