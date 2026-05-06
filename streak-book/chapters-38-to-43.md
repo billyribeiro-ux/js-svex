@@ -73,7 +73,9 @@ The `typeof localStorage === 'undefined'` check is for **SSR safety** — `local
 
 ## Lesson 38.4 — Wiring with `$effect`
 
-Inside the `HabitStore` (or the page):
+Two separate edits.
+
+**1. In `src/lib/habits.svelte.ts`** — initialise from storage:
 
 ```ts
 import { loadHabits, saveHabits } from '$lib/storage.svelte';
@@ -85,23 +87,50 @@ export class HabitStore {
 }
 ```
 
-And separately, an effect that saves:
+**2. In `+page.svelte`** (or wherever the store is consumed) — save on every change:
 
-```ts
-$effect(() => {
-  saveHabits(store.habits);
-});
+```svelte
+<script lang="ts">
+  import { getHabitStore } from '$lib/contexts';
+  const store = getHabitStore();
+
+  $effect(() => {
+    // saveHabits is read; touching `store.habits` makes this effect track it.
+    saveHabits(store.habits);
+  });
+</script>
 ```
+
+`$effect` only runs inside a component or inside `$effect.root` — *not* at module scope, *not* inside class fields or methods. That's why it lives in the consuming `+page.svelte`, not in the store class.
 
 Read aloud: *"whenever the habits change, save them."* This is one of the *legitimate* uses of `$effect` — synchronising state to an external store (here: `localStorage`).
 
-Save. Add habits. Refresh the browser. They're still there.
+Save (`Cmd+S` / `Ctrl+S`). Add habits. Refresh the browser. They're still there.
 
 ---
 
 ## Lesson 38.5 — Build, break, fix
 
 Open dev tools → Application → Local Storage → your origin. Edit the JSON to be malformed. Refresh. Your `parseHabits` rejects the bad data; the list resets to empty. The boundary parser catches the bad input. Senior win.
+
+---
+
+## Lesson 38.6 — Recurring concepts from earlier chapters
+
+- **`parseHabits`** (Ch 26) — the same boundary parser, now wrapping `JSON.parse`.
+- **`$effect` for legitimate side effects** (Ch 17) — syncing state to an external store is exactly the right use.
+- **`HabitStore`** (Ch 29) — initialised from storage instead of empty.
+
+---
+
+## Lesson 38.7 — What you can now read in the wild
+
+After Chapter 38 you can:
+
+- Read **`localStorage.getItem` / `setItem` / `removeItem` / `clear`**.
+- Read **`JSON.stringify` / `JSON.parse`** and know the round-trip data-loss class.
+- Read **`typeof localStorage === 'undefined'`** as the SSR-safety guard.
+- Spot **untrusted JSON entering the program** as a parser-shaped boundary.
 
 ---
 
@@ -218,14 +247,28 @@ Notes:
 
 ## Lesson 39.4 — Generate and run the migration
 
+Add convenience scripts to `package.json`:
+
+```json
+{
+  "scripts": {
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio"
+  }
+}
+```
+
+Then:
+
 ```bash
-pnpm exec drizzle-kit generate
+pnpm db:generate
 ```
 
 This creates `drizzle/0000_*.sql`. Inspect it. Apply it:
 
 ```bash
-pnpm exec drizzle-kit migrate
+pnpm db:migrate
 ```
 
 Confirm:
@@ -233,6 +276,8 @@ Confirm:
 ```bash
 psql streak_dev -c "\d habits"
 ```
+
+`pnpm db:studio` opens a browser-based DB explorer — handy for sanity checks.
 
 ---
 
@@ -253,6 +298,25 @@ Read the plan. At first there's no `user_id` index, so the planner does a sequen
 ## Lesson 39.6 — The forward-only rule
 
 Once a migration is committed and applied, **never edit it**. Schema changes ship as new migrations. `IF NOT EXISTS` on every `CREATE`. `CREATE INDEX CONCURRENTLY` requires `-- no-transaction`. Bible rule #18.
+
+---
+
+## Lesson 39.7 — Recurring concepts from earlier chapters
+
+- **`type` declarations** (Ch 9) — Drizzle's `$inferSelect` / `$inferInsert` give you typed row shapes.
+- **`as const`** (Ch 25) — `enum: ['user', 'admin']` narrows to a literal union.
+- **Forward-only rule** (Bible #18) — applied to migrations from day one.
+
+---
+
+## Lesson 39.8 — What you can now read in the wild
+
+After Chapter 39 you can:
+
+- Read a Drizzle schema with `pgTable`, `uuid`, `text`, `timestamp`, `integer`, `boolean`.
+- Read `references(() => other.id, { onDelete: 'cascade' })` for foreign keys.
+- Read `EXPLAIN ANALYZE` output and tell sequential scan from index scan.
+- Spot a missing `withTimezone: true` on a timestamp column.
 
 ---
 
@@ -289,31 +353,35 @@ export const db = drizzle(client);
 
 `max: 10` is the pool size. `connect_timeout: 10` is the Bible rule applied — never let a hung handshake hang a request.
 
-`+page.server.ts`:
+`+page.server.ts` (lives at `(app)/dashboard/+page.server.ts` per Ch 37's split):
 
 ```ts
-// src/routes/(app)/+page.server.ts
+// src/routes/(app)/dashboard/+page.server.ts
 import type { PageServerLoad } from './$types';
 import { db } from '$lib/db/client';
 import { habits } from '$lib/db/schema';
 import { eq, desc } from 'drizzle-orm';
 
+const DEMO_USER_ID = '00000000-0000-0000-0000-000000000001'; // a real UUID we seed below
+
 export const load: PageServerLoad = async ({ locals }) => {
-  // For now we fake locals.user. Real auth in Part VII.
-  const userId = 'demo-user';
+  // For now we use a hardcoded demo user. Real `locals.user` in Part VII.
+  const userId = DEMO_USER_ID;
 
   const rows = await db.select().from(habits).where(eq(habits.userId, userId)).orderBy(desc(habits.createdAt));
   return { habits: rows };
 };
 ```
 
-For now you'll need to insert a demo user manually:
+Seed the demo user once:
 
 ```sql
-INSERT INTO users (id, email, password_hash) VALUES ('demo-user'::uuid, 'demo@example.com', 'fake');
+INSERT INTO users (id, email, password_hash)
+VALUES ('00000000-0000-0000-0000-000000000001', 'demo@example.com', 'fake')
+ON CONFLICT (id) DO NOTHING;
 ```
 
-(Adjust the cast — UUIDs are not arbitrary strings. Use a real UUID. Or seed via a `pnpm db:seed` script.)
+(Real UUID — `'demo-user'` would have failed the UUID type check. Better in a real app: a `pnpm db:seed` script that uses `crypto.randomUUID()` and writes the chosen ID into a dev-only `.env.seed`.)
 
 ---
 
@@ -334,6 +402,25 @@ Server-only secrets are imported via `$env/static/private`. Try to import it fro
 **The English sentence first:**
 
 > *"Add a `/stats` route's server load that returns counts per month using SQL `date_trunc('month', created_at)`."*
+
+---
+
+## Lesson 40.5 — Recurring concepts from earlier chapters
+
+- **`+page.server.ts`** (Ch 31's split, formal coverage now) — server-only `load`.
+- **`$env/static/private`** (Ch 31, Bible rule #19) — secrets safe at build time.
+- **DB pool timeouts** — Bible rule #13 applied.
+
+---
+
+## Lesson 40.6 — What you can now read in the wild
+
+After Chapter 40 you can:
+
+- Read **`+page.server.ts`** with `PageServerLoad` and `Actions`.
+- Read **DB pool config** (`max`, `idle_timeout`, `connect_timeout`) and explain each.
+- Tell which env-var quadrant a given import comes from (private/public × static/dynamic).
+- Read **`devalue`-serialised** load output and know what survives the wire.
 
 ---
 
@@ -448,20 +535,29 @@ import { HabitInputSchema } from '$lib/validation/schemas';
 
 addHabit: async ({ request }) => {
   const data = await request.formData();
+  // FormData.get returns string | File | null; we only accept strings.
+  const rawName = data.get('name');
+  const rawDesc = data.get('description');
+
   const parsed = safeParse(HabitInputSchema, {
-    name: data.get('name'),
-    description: data.get('description') || undefined,
+    name: typeof rawName === 'string' ? rawName : '',
+    description: typeof rawDesc === 'string' && rawDesc !== '' ? rawDesc : undefined,
   });
   if (!parsed.success) {
-    return fail(400, { fieldErrors: parsed.issues.reduce((acc, i) => ({ ...acc, [i.path?.[0]?.key ?? 'form']: i.message }), {}) });
+    const fieldErrors: Record<string, string> = {};
+    for (const issue of parsed.issues) {
+      const key = issue.path?.[0]?.key;
+      if (typeof key === 'string') fieldErrors[key] = issue.message;
+    }
+    return fail(400, { fieldErrors });
   }
   // parsed.output is HabitInput
-  await db.insert(habits).values({ userId, ...parsed.output });
+  await db.insert(habits).values({ userId: DEMO_USER_ID, ...parsed.output });
   return { success: true };
 },
 ```
 
-Cleaner. Faster to write. Same boundary safety.
+Cleaner. Faster to write. Same boundary safety. The explicit `typeof rawName === 'string'` checks beat `|| undefined` (Bible rule #5: never `||` for nullish defaults), and the imperative `for ... of` reduce avoids `acc` spread allocations on every issue.
 
 ---
 
@@ -470,6 +566,26 @@ Cleaner. Faster to write. Same boundary safety.
 In dev tools, *Settings* → *Disable JavaScript*. Reload. Add a habit. Watch the page reload after submit. **It still works.** That's progressive enhancement.
 
 Re-enable JS. Same flow now feels instant.
+
+---
+
+## Lesson 41.5 — Recurring concepts from earlier chapters
+
+- **`+page.server.ts`** (Ch 40) — actions live alongside the load.
+- **Boundary parser** (Ch 26) — Valibot replaces hand-rolled `parseHabit` for form input.
+- **`use:enhance`** — progressive-enhancement primitive.
+- **Bible rule #5** — explicit `typeof === 'string'` instead of `||`.
+
+---
+
+## Lesson 41.6 — What you can now read in the wild
+
+After Chapter 41 you can:
+
+- Read **`export const actions: Actions = { ... } satisfies Actions`** with named actions.
+- Read **`fail(400, { ... })`**, **`redirect(303, '/...')`**, **`error(500, '...')`** and pick the right one.
+- Read **`<form method="POST" action="?/named" use:enhance>`** and run the JS-disabled test mentally.
+- Read a Valibot schema and explain what passes/fails.
 
 ---
 
@@ -592,50 +708,108 @@ Bible rule: never write the audit *after* a "best-effort" log call. Either it's 
 
 ## Lesson 42.5 — Integration test against real Postgres
 
-Set up a separate test DB. In `vitest.config.ts`:
+For an integration test, the form-action callback isn't directly callable. **Extract the logic into a pure async function** that the action *and* the test can both call:
 
 ```ts
-import { defineConfig } from 'vitest/config';
+// src/lib/habits-server.ts
+import { db } from '$lib/db/client';
+import { habits, users } from '$lib/db/schema';
+import { and, eq, lt, sql } from 'drizzle-orm';
+import { ok, err, type Result } from '$lib/types';
 
-export default defineConfig({
-  test: {
-    setupFiles: ['./tests/setup.ts'],
-  },
-});
+const MAX_HABITS = 50;
+
+export async function addHabitForUser(
+  userId: string,
+  name: string,
+): Promise<Result<{ id: string }, 'limit-reached'>> {
+  return db.transaction(async (tx) => {
+    const updated = await tx.update(users)
+      .set({ habitsCount: sql`${users.habitsCount} + 1` })
+      .where(and(eq(users.id, userId), lt(users.habitsCount, MAX_HABITS)))
+      .returning({ count: users.habitsCount });
+
+    if (updated.length === 0) return err('limit-reached');
+
+    const [inserted] = await tx.insert(habits).values({ userId, name }).returning({ id: habits.id });
+    if (inserted === undefined) throw new Error('insert returned no rows'); // genuine programmer error
+    return ok({ id: inserted.id });
+  });
+}
 ```
+
+The action becomes a thin wrapper:
 
 ```ts
-// tests/setup.ts
-import { execSync } from 'node:child_process';
-beforeAll(() => execSync('pnpm db:test:reset'));
+addHabit: async ({ request }) => {
+  // ... parse name ...
+  const result = await addHabitForUser(DEMO_USER_ID, parsed.output.name);
+  if (!result.ok) return fail(400, { error: `Habit limit (${MAX_HABITS}) reached` });
+  return { success: true };
+},
 ```
 
-The test:
+Now the integration test:
 
 ```ts
 // tests/integration/addHabit.atomic.test.ts
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { db } from '$lib/db/client';
+import { users, habits } from '$lib/db/schema';
+import { sql } from 'drizzle-orm';
+import { addHabitForUser } from '$lib/habits-server';
 
-describe('addHabit atomic', () => {
+const TEST_USER = '00000000-0000-0000-0000-000000000099';
+
+beforeEach(async () => {
+  await db.execute(sql`TRUNCATE habits, users RESTART IDENTITY CASCADE`);
+  await db.insert(users).values({
+    id: TEST_USER,
+    email: 'test@example.com',
+    passwordHash: 'fake',
+    habitsCount: 49, // one slot left
+  });
+});
+
+describe('addHabitForUser atomic', () => {
   it('rejects concurrent inserts at the limit', async () => {
-    // seed user with 49/50 habits
-    // ...
-    const promises = Array.from({ length: 10 }, () => addHabit('demo-user', 'concurrent'));
-    const results = await Promise.allSettled(promises);
-    const successes = results.filter((r) => r.status === 'fulfilled');
+    const promises = Array.from({ length: 10 }, () => addHabitForUser(TEST_USER, 'concurrent'));
+    const results = await Promise.all(promises);
+    const successes = results.filter((r) => r.ok);
     expect(successes.length).toBe(1); // only one slot left
   });
 });
 ```
 
-Bible rule #5 in action: never mock the DB.
+Bible rule #5 in action: never mock the DB. The test runs against a real `streak_test` Postgres; concurrent calls hit the atomic UPDATE; exactly one wins.
+
+> **A note on `auditLog`** referenced in Lesson 42.4: that table lands formally in Chapter 47 (audit log + RBAC). For Chapter 42, the *pattern* of "mutation + audit inside one transaction" is what matters; you can stub `tx.insert(auditLog)` for now or wait until Ch 47 to wire it up.
+
+---
+
+## Lesson 42.6 — Recurring concepts from earlier chapters
+
+- **`Result<T, E>`** (Ch 27) — `addHabitForUser` returns one.
+- **The TOCTOU rule** — Bible rule #11 applied as the cornerstone of every read-modify-write.
+- **Truncate-before-each** — fast test isolation pattern (formal coverage Ch 59).
+
+---
+
+## Lesson 42.7 — What you can now read in the wild
+
+After Chapter 42 you can:
+
+- Read **`UPDATE … SET … WHERE … RETURNING …`** as the atomic conditional update.
+- Read **`db.transaction(async (tx) => { ... })`** and explain the rollback semantics.
+- Spot a **SELECT-then-UPDATE** in a code review and replace it.
+- Write an **integration test** against a real Postgres with truncate-before-each isolation.
 
 ---
 
 ## End-of-chapter checkpoint
 
 - [ ] You added `habits_count` and the atomic UPDATE.
+- [ ] You extracted `addHabitForUser` as a testable pure-async function.
 - [ ] You wrote the concurrent-insert integration test.
 - [ ] It runs against a real Postgres.
 
@@ -653,38 +827,47 @@ Bible rule #5 in action: never mock the DB.
 <script lang="ts">
   import { enhance, applyAction } from '$app/forms';
   import { invalidate } from '$app/navigation';
+  import { toast } from '$lib/toast.svelte';
+  import type { PageProps } from './$types';
+
+  let { data }: PageProps = $props();
 
   let pendingDeletes: Set<string> = $state(new Set());
+
+  const visibleHabits = $derived(
+    data.habits.filter((h) => !pendingDeletes.has(h.id))
+  );
 </script>
 
-<form method="POST" action="?/deleteHabit" use:enhance={({ formData }) => {
-  const id = String(formData.get('id'));
-  pendingDeletes = new Set([...pendingDeletes, id]);
+<ul>
+  {#each visibleHabits as habit (habit.id)}
+    <li>
+      {habit.name}
+      <form method="POST" action="?/deleteHabit" use:enhance={({ formData }) => {
+        const id = String(formData.get('id'));
+        pendingDeletes = new Set([...pendingDeletes, id]);
 
-  return async ({ result }) => {
-    pendingDeletes = new Set([...pendingDeletes].filter((p) => p !== id));
-    if (result.type === 'failure' || result.type === 'error') {
-      // surface error via toast (Ch 43 introduces toast)
-      await applyAction(result);
-    } else {
-      await invalidate('streak:habits');
-    }
-  };
-}}>
-  <input type="hidden" name="id" value={habit.id} />
-  <button type="submit" aria-label="Delete">×</button>
-</form>
+        return async ({ result }) => {
+          pendingDeletes = new Set([...pendingDeletes].filter((p) => p !== id));
+          if (result.type === 'failure' || result.type === 'error') {
+            toast.show('Couldn\'t delete habit. Please try again.', 'error');
+            await applyAction(result);
+          } else {
+            await invalidate('streak:habits');
+          }
+        };
+      }}>
+        <input type="hidden" name="id" value={habit.id} />
+        <button type="submit" aria-label="Delete {habit.name}">×</button>
+      </form>
+    </li>
+  {/each}
+</ul>
 ```
 
-The visible list filters out `pendingDeletes`:
+Click ×; the row vanishes immediately because `pendingDeletes` filters it out of `visibleHabits`. The fetch happens in the background. On failure: a toast appears and the row comes back. On success: `invalidate('streak:habits')` re-runs the load, the row is gone for real.
 
-```ts
-const visibleHabits: Habit[] = $derived(
-  data.habits.filter((h) => !pendingDeletes.has(h.id))
-);
-```
-
-Click ×; the row vanishes immediately. The fetch happens in the background. On failure, the row comes back.
+> **`enhance`** runs the inner callback synchronously (the optimistic update) and then *returns* an async finalisation function. That's the shape `({ formData }) => async ({ result, update }) => { ... }`. Read it as: *"on submit, run the optimistic update; on response, run the reconciliation."*
 
 ---
 
@@ -728,6 +911,30 @@ Render in layout:
   {/each}
 </div>
 ```
+
+---
+
+## Lesson 43.4 — Recurring concepts from earlier chapters
+
+Part VI's spine, in one place:
+
+- **`localStorage` first, DB second** (Ch 38 → 40) — persistence felt before networked.
+- **Boundary parsing** at every input edge (Ch 26, 31, 38, 41).
+- **Atomic UPDATE-RETURNING** (Ch 42) — the cornerstone of safe mutations.
+- **Form actions + `use:enhance`** (Ch 41) — progressive enhancement.
+- **The CLS landmine** (Ch 22, named again here).
+
+---
+
+## Lesson 43.5 — What you can now read in the wild
+
+After Part VI you can:
+
+- Read a `+page.server.ts` with `load` + `actions` + Drizzle queries.
+- Spot a **SELECT-then-UPDATE TOCTOU** in code review.
+- Spot a **CLS-flash** optimistic-update bug (loading flag flipped during a mutation that already has its own optimistic representation).
+- Write an integration test that hits a real Postgres with truncate-before-each isolation.
+- Tell which `+page.*` / `+server.ts` file does what, and why.
 
 ---
 
