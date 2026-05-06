@@ -26,7 +26,7 @@ For our book the rule is simple:
 
 - **Default to single quotes (`'...'`).** Cleanest visually, matches our Prettier config.
 - **Use backticks (`` `...` ``) when you need to interpolate a value or write a multi-line string.** That's the new one — see the next lesson.
-- **Use double quotes (`"..."`) inside JSX-like attributes or inside a string that already contains a single quote.** *"It's nice"* needs `"It's nice"` or `'It\'s nice'`. Pick the one that needs no escaping.
+- **Use double quotes (`"..."`) inside HTML attributes (Svelte markup is HTML-shaped) or inside a string that already contains a single quote.** *"It's nice"* needs `"It's nice"` or `'It\'s nice'`. Pick the one that needs no escaping.
 
 You'll meet senior code that mixes them; that's fine. The codebase's Prettier config will pick one default and force it. Ours picks single.
 
@@ -47,7 +47,9 @@ Read aloud:
 | Line | Read aloud as |
 |---|---|
 | `const name: string = 'Billy';` | *"Let `name` be the string 'Billy', and don't reassign it."* |
-| `const greeting: string = \`Welcome back, ${name}.\`;` | *"Let `greeting` be the text 'Welcome back, ' followed by the value of `name`, followed by a period."* |
+| `` const greeting: string = `Welcome back, ${name}.`; `` | *"Let `greeting` be the text 'Welcome back, ' followed by the value of `name`, followed by a period."* |
+
+*(The backslashes you may see around backticks in this table are markdown's escape characters — the real code uses just `` ` ``.)*
 
 > **template literal** *(noun)* — a string written with backticks (`` ` ``) that supports `${expression}` interpolation and multi-line text. The most flexible string syntax. Engineers use them constantly.
 >
@@ -101,7 +103,7 @@ For the rest of this book we'll usually use `null` for *"absent on purpose"* and
 Now the punchline Chapter 3 set up.
 
 ```ts
-const name: string | null = $state(null);
+let name: string | null = $state(null);
 const greeting: string = `Welcome back, ${name ?? 'friend'}.`;
 ```
 
@@ -155,7 +157,7 @@ We'll use `?.` reflexively from now on. Without it, you'd be writing `name === n
 
 Today's job in code. We'll add a name field, an input bound to it, and a greeting.
 
-A small TypeScript subtlety first. We *want* to model "the user's name might be missing" as `string | null`. But `<input type="text">` always has a `string` value (an empty input is `''`, never `null`). Binding `string | null` to a text input would fight TypeScript. So we bind a plain `string` and treat the empty string as "not set" *only at the display boundary* (the `{userName.trim() === '' ? 'friend' : userName}` line below).
+A small TypeScript subtlety first. We *want* to model "the user's name might be missing" as `string | null`. But `<input type="text">` always has a `string` value (an empty input is `''`, never `null`). **Svelte 5's `bind:value` on a text input typed-checks the bound variable as `string`** — pass it a `string | null` and the compiler refuses with "Type 'null' is not assignable to type 'string'." So we bind a plain `string` and treat the empty string as "not set" *only at the display boundary* (the `{userName.trim() === '' ? 'friend' : userName}` line below).
 
 This is a real-world pattern: **the data model and the input model are sometimes different shapes, and you convert at the edge.** The lessons on `null`, `??`, and `?.` you just learned still apply everywhere else in the book — Chapter 9 onward you'll see them with real `string | null` shapes from the database.
 
@@ -164,8 +166,8 @@ Update `src/routes/+page.svelte`:
 ```svelte
 <!-- src/routes/+page.svelte -->
 <script lang="ts">
-  let habitsLoggedToday = $state(0);
-  let userName = $state('');
+  let habitsLoggedToday: number = $state(0);
+  let userName: string = $state('');
 
   function logHabit(): void {
     habitsLoggedToday += 1;
@@ -319,11 +321,18 @@ Try before peeking.
 </p>
 ```
 
-Read aloud: *"so far, comma, name — if there is one — and then a period."*
+Read each new piece aloud:
+
+| Line | Read aloud as |
+|---|---|
+| `{habitsLoggedToday === 1 ? 'habit' : 'habits'}` | *"If exactly one, the word is 'habit'; otherwise 'habits'."* |
+| `{userName.trim() !== '' ? \`, ${userName}\` : ''}` | *"If the trimmed name is not empty, insert a comma-space-name; otherwise insert nothing."* |
+
+Whole sentence aloud: *"You've logged 3 habits so far, Billy."* (or, with no name: *"You've logged 3 habits so far."*)
 
 The `{userName.trim() !== '' ? \`, ${userName}\` : ''}` part: when there's a non-blank name, it inserts `, Billy` (with the leading comma and space). When there isn't, it inserts an empty string. The full sentence reads naturally either way.
 
-A second valid answer uses Chapter 6's `{#if}` block (which you haven't met formally yet):
+A second valid answer uses Chapter 6's `{#if}` block — *this is a forward reference; don't worry if `{#if cond}…{/if}` looks unfamiliar, we cover it formally in Lesson 6.1*:
 
 ```svelte
 <p>
@@ -419,7 +428,7 @@ Two things you can do with an array right now:
 1. **Get the length** — `days.length` is `7`.
 2. **Read by index** — `days[0]` is `'Mon'`, `days[6]` is `'Sun'`.
 
-(There's a wrinkle in TypeScript-strict mode that `days[0]` is `string | undefined` — because the compiler doesn't trust that the array isn't empty. We'll meet that properly in Chapter 7. For now, no indexing; we'll loop instead.)
+(There's a wrinkle in TypeScript-strict mode that `days[0]` is `string | undefined` — because the compiler doesn't trust the array isn't empty. We'll meet that properly in Chapter 7. The reason it doesn't bite in this chapter: **we never index `days[i]` directly**; we loop with `{#each}`, which gives us `day` already-narrowed-to-`string` per iteration. Loops avoid the wrinkle for free.)
 
 ---
 
@@ -460,8 +469,18 @@ for (const [i, day] of days.entries()) {
 
 This logs `0: Mon`, `1: Tue`, etc. We'll meet this exactly when we need it.
 
+`for...of` fully supports `break` (stop the loop) and `continue` (skip to the next iteration) — same as the C-style `for`:
+
+```ts
+for (const day of days) {
+  if (day === 'Sat') break;        // stop at Saturday
+  if (day === 'Sun') continue;     // skip Sunday but keep going
+  console.log(day);
+}
+```
+
 The other two loops:
-- **`for (...)` C-style** — you'll see it in old code; you almost never need to write it. The exception: when you must `break` mid-loop based on the index. Even then, `for...of` + `if` + `break` reads better.
+- **`for (...)` C-style** — you'll see it in old code; you almost never need to write it.
 - **`while (...)`** — useful when you don't know how many iterations you'll need (waiting for a condition). Rare in component code.
 
 ---
@@ -480,30 +499,32 @@ The other two loops:
 
 Read aloud: *"for each day in the days list, render a list-item containing the day."*
 
-The variants you'll meet:
+The variants you'll meet — **prefer the keyed form whenever items have a stable identity** (an `id` field). It's what we'll use 95% of the time:
 
 ```svelte
-{#each items as item}             <!-- just the value -->
-{#each items as item, i}          <!-- value and index -->
-{#each items as item (item.id)}   <!-- keyed each — we'll meet this Chapter 7 -->
+{#each items as item (item.id)}    <!-- keyed — preferred when items have an id -->
+
+{#each items as item}              <!-- unkeyed — only when items are simple primitives -->
+{#each items as item, i}           <!-- unkeyed with index — same caveat -->
+{#each items as item, i (item.id)} <!-- keyed + index — combine both -->
+
 {#each items as item}
   <p>...</p>
 {:else}
-  <p>No items.</p>                <!-- the empty-state slot -->
+  <p>No items.</p>                 <!-- the empty-state slot -->
 {/each}
 ```
 
-The `{:else}` slot is the empty-state pattern Chapter 6 will formally name.
+The `{:else}` slot is the empty-state pattern Chapter 6 will formally name. The `(item.id)` keyed form lets Svelte track which DOM node belongs to which item across mutations — critical when items can be added, removed, or reordered (Ch 7 explains why in detail).
 
 ---
 
 ## Lesson 5.4 — Today's date, briefly
 
-We need to know which day is today. JavaScript has a built-in `Date` object:
+We need to know which day is today. JavaScript has a built-in `Date` object. `new Date()` gives you "now"; `.getDay()` returns the day-of-week as a number:
 
 ```ts
-const today: Date = new Date();
-const dayIndex: number = today.getDay();
+const dayIndex: number = new Date().getDay();
 ```
 
 `getDay()` returns:
@@ -652,7 +673,14 @@ A few new things appeared. Read each new line aloud:
 
 Save (`Cmd+S` / `Ctrl+S`). Look at the page. You should see a row of seven pill-shaped tags, with today's pill highlighted in blue.
 
-> **A small caveat:** `todayIndex` is computed once when the page loads. If you leave Streak open across midnight, the strip won't refresh until you reload. Real apps fix this with a periodic check or a server `load` (Chapter 40). For now, refresh works.
+> **A small caveat:** `todayIndex` is computed once when the page loads. If you leave Streak open across midnight, the strip won't refresh until you reload. We'd fix this in Chapter 16 with a `$derived` value that re-runs on each render, or in Chapter 40 with a server `load` that gets the date fresh per request:
+>
+> ```ts
+> // Preview of Ch 16 — once you have $derived, the strip auto-refreshes:
+> const todayIndex: number = $derived(getMondayBasedDayIndex());
+> ```
+>
+> For now (Ch 5), refresh works and the limitation is named.
 
 ---
 
@@ -721,6 +749,8 @@ Four paragraphs:
 - *Question 4: 100 ✓*
 
 The `i + 1` makes the display 1-based even though `i` starts at 0. Senior habit: when displaying counts to humans, start at 1. When indexing for code, use 0.
+
+(The `✓` and `✗` are Unicode characters. To type them, paste from this page or use your OS character picker — macOS: `Ctrl+Cmd+Space`; Windows: `Win+.`; or copy-paste from anywhere on the web.)
 </details>
 
 ---
@@ -848,9 +878,11 @@ Three observations:
 
 ## Lesson 6.2 — Wiring it into Streak
 
-We want a different page when `habitsLoggedToday === 0`. The simplest version:
+We want a different page when `habitsLoggedToday === 0`. Open `src/routes/+page.svelte` and replace the markup section (everything *after* the `</script>` tag and *before* the `<style>` tag) with this — the script block, the day strip, and the name input above it stay exactly as they are:
 
 ```svelte
+<!-- inside src/routes/+page.svelte, replacing the markup section only -->
+
 {#if habitsLoggedToday === 0}
   <div class="empty-state">
     <h2>No habits yet</h2>
@@ -875,6 +907,8 @@ We want a different page when `habitsLoggedToday === 0`. The simplest version:
   </button>
 {/if}
 ```
+
+The block above is a *fragment* — it slots into the existing file. The `<script lang="ts">` block from earlier chapters (with `habitsLoggedToday`, `logHabit`, `unlogHabit`, `resetHabits`, `userName`) and the day strip + name input markup stay where they were. We are wrapping only the existing populated layout in `{#if} / {:else} / {/if}`.
 
 Read aloud the new wiring:
 
@@ -923,7 +957,7 @@ Add to the `<style>` block:
 
 Save. The empty state now reads as a *deliberate* card, not an accident.
 
-That CSS is mediocre. We'll polish in Part VIII. The lesson here is *that we wrote CSS at all* — the empty state should look *intentional* even when it's the first thing a user sees.
+That CSS is deliberately ordinary — dashed borders and grey text are the *placeholder* aesthetic, not a design system. The point of the lesson is *that we wrote CSS at all*: the empty state should look *intentional* (a card with padding, a bordered region, a clear hierarchy) even when it's the first thing a user sees. We'll redo the visual design properly in Part VIII once `<Card>`, design tokens, and dark mode exist; today it's about the *behavior* — three states, one component, no broken-looking initial render.
 
 ---
 
@@ -931,7 +965,7 @@ That CSS is mediocre. We'll polish in Part VIII. The lesson here is *that we wro
 
 Time for the chapter's deliberate bug. We'll do it twice — once to *see* the bug bypass the UI guard, once to confirm the fix.
 
-**Step 1 — open the dev console.** Press `F12` (or `Cmd+Option+I` on macOS) in your browser. Click the **Console** tab.
+**Step 1 — open the dev tools.** Press `F12` (or `Cmd+Option+I` on macOS, `Ctrl+Shift+I` on Linux) in your browser. *Dev tools* is the panel that appears with multiple tabs (**Elements**, **Console**, **Network**, **Sources**, **Application**); the **Console** tab is for typing JavaScript at the page; the **Elements** tab (called **Inspector** in Firefox) is for editing the live HTML. Click the **Console** tab for now — we'll switch to **Elements** in step 3.
 
 **Step 2 — break the function.** Open `unlogHabit` and remove the guard:
 
@@ -995,7 +1029,7 @@ If any of those is hesitant, reread the relevant chapter. Don't move on yet. Flu
 
 > *"Add a 'Clear all' button that returns the user to the empty state. It should only be available when the count is greater than zero (the same precondition as Reset). Use the existing pattern."*
 
-This isn't *new*; this is the same `resetHabits` you wrote in Chapter 2 with a different button label. The exercise is in *recognising* that you already have the function, and just adding a second button bound to the same handler.
+This isn't *new*; this is the same `resetHabits` you wrote in Chapter 2 with a different button label. The exercise is *recognising* you already have the function — and that the senior move is often to *not* write more code. The skill being practiced is restraint: spot the existing primitive, reuse it, ship a smaller diff.
 
 <details>
 <summary>Worked answer</summary>
@@ -1015,7 +1049,24 @@ If your version replaced the *Reset* button with *Clear all*, that's fine. If yo
 
 ---
 
-## Lesson 6.7 — End of Part I — what you can now read in the wild
+## Lesson 6.7 — Recurring concepts from earlier chapters
+
+Chapter 6 leaned on essentially everything from Part I — that's intentional. Concretely:
+
+- **`$state(...)`** (Ch 1) — `habitsLoggedToday`.
+- **Functions returning `void`** (Ch 1) — `logHabit`, `unlogHabit`, `resetHabits`.
+- **`+=`, `-=`, `===`** (Ch 1).
+- **Early-return guards** (Ch 2) — `if (habitsLoggedToday <= 0) return;`.
+- **`disabled={cond}`** (Ch 3) — UI-side guard.
+- **Boolean operators / falsy** (Ch 3) — short-circuit understanding underlies every `disabled` expression.
+- **`bind:value`, ternary** (Ch 4) — the input wiring.
+- **`{#each}`, `class:`, scoped `<style>`** (Ch 5) — the day strip still renders.
+
+Sit with that. *Every* primitive you've learned is in this single page, working together. That's not coincidence — that's how senior code feels.
+
+---
+
+## Lesson 6.8 — End of Part I — what you can now read in the wild
 
 After Part I, you can:
 
@@ -1030,23 +1081,6 @@ You also have the disposition that distinguishes engineers from people who took 
 - You ask *"is this the safe thing or just the working thing?"*.
 - You read code aloud to check it makes sense.
 - You believe defensive coding (`disabled` AND a guard) is normal, not paranoid.
-
----
-
-## Lesson 6.8 — Recurring concepts from earlier chapters
-
-Chapter 6 leaned on essentially everything from Part I — that's intentional. Concretely:
-
-- **`$state(...)`** (Ch 1) — `habitsLoggedToday`.
-- **Functions returning `void`** (Ch 1) — `logHabit`, `unlogHabit`, `resetHabits`.
-- **`+=`, `-=`, `===`** (Ch 1).
-- **Early-return guards** (Ch 2) — `if (habitsLoggedToday <= 0) return;`.
-- **`disabled={cond}`** (Ch 3) — UI-side guard.
-- **Boolean operators / falsy** (Ch 3) — short-circuit understanding underlies every `disabled` expression.
-- **`bind:value`, ternary** (Ch 4) — the input wiring.
-- **`{#each}`, `class:`, scoped `<style>`** (Ch 5) — the day strip still renders.
-
-Sit with that. *Every* primitive you've learned is in this single page, working together. That's not coincidence — that's how senior code feels.
 
 ---
 

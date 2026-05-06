@@ -37,10 +37,12 @@ Open yours now:
 - **Windows** — Press the Windows key, type *Terminal*, press Enter. If you have *Windows Terminal* installed, use that; if not, *PowerShell* will do.
 - **Linux** — You know where it is.
 
-You should see something like this:
+You should see something like this — the exact text depends on your OS:
 
 ```
-billy@laptop ~ %
+billy@laptop ~ %                       (macOS, zsh)
+billy@laptop:~$                        (Linux, bash)
+PS C:\Users\billy>                     (Windows, PowerShell)
 ```
 
 That blinking cursor at the end is your **prompt**. It's the terminal saying *"I'm ready — type something."* The text before the `%` (or `$`, or `>`) tells you who you are and where you are. We'll meet that *where* in a moment.
@@ -122,6 +124,8 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 This is a one-time per-user setting; it tells Windows you're allowed to run installer scripts. Senior habit on Windows: do it once on a fresh machine, never think about it again.
 
+If your machine is locked down by IT (work laptops with policy-enforced execution restrictions), the script form may still refuse. The fallback: download the `pnpm` standalone executable from `https://pnpm.io/installation#using-a-standalone-script` and place it in a folder on your `PATH`. No script execution required.
+
 After it finishes, **close your terminal completely and open a fresh one.** This is important — the new terminal will know where `pnpm` lives; the old one won't.
 
 Verify it works:
@@ -161,14 +165,30 @@ pnpm dlx sv create streak
 >
 > **scaffold** *(verb)* — to generate the empty starting structure of a project. Like a builder framing a house before they put walls on it.
 
-The CLI will ask you a few questions, then show one big screen of optional **add-ons** as checkboxes. Answer exactly as below. (Wording may vary slightly between versions; match the *meaning*.)
+The CLI will ask you a few questions in some order, then show one big screen of optional **add-ons** as checkboxes. (Wording and order may vary slightly between versions; answer each as in the table — the order isn't important.)
 
 | Question | Your answer |
 |---|---|
 | Which template? | **SvelteKit minimal** (the empty one — *not* the demo) |
 | Type checking? | **Yes, TypeScript** |
-| Add-ons (one screen, multi-select with space) | Tick **prettier**, **eslint**, **vitest**, **playwright**. Leave the rest. |
 | Package manager? | **pnpm** |
+| Add-ons (one screen, multi-select; space-bar to tick, Enter when done) | See below |
+
+The add-ons screen shows roughly these options. Tick / leave per the table:
+
+| Add-on | Tick? | What it is |
+|---|---|---|
+| `prettier` | ✅ tick | Code formatter — keeps everyone's whitespace consistent |
+| `eslint` | ✅ tick | Lint rules — catches `let`-that-should-be-`const` and similar |
+| `vitest` | ✅ tick | Unit test runner — Ch 58 onward |
+| `playwright` | ✅ tick | End-to-end browser tests — Ch 60 |
+| `tailwindcss` | ❌ leave | Utility CSS framework — we use scoped `<style>` instead |
+| `drizzle` | ❌ leave | Database ORM — we add this manually in Ch 39 |
+| `lucia` | ❌ leave | Auth library — we build our own auth in Part VII for the lesson |
+| `sveltekit-adapter` | ✅ tick (auto) | Picks the right deploy adapter — usually `adapter-auto` initially |
+| `paraglide` | ❌ leave | Internationalization — out of scope for this book |
+| `mdsvex` | ❌ leave | Markdown-in-Svelte — not needed for Streak |
+| `storybook` | ❌ leave | Component playground — out of scope |
 
 When it finishes, it tells you to do this:
 
@@ -301,6 +321,8 @@ Read aloud: *"the Svelte config: use the auto adapter, preprocess with Vite, exp
 
 The behaviour is identical to the `.js` version; we now have a typed config. Bible rule held.
 
+> **If `pnpm dev` errors on the `.ts` config**: SvelteKit reads `svelte.config.ts` via Vite's loader, which handles TypeScript natively as of May 2026. If you see `Cannot find module './svelte.config.ts'` or similar, your scaffolded `package.json` is older than expected — add `"type": "module"` if missing, and ensure you've run `pnpm install`. If still broken, fall back to keeping `svelte.config.js` with a JSDoc type annotation and revisit once you've updated your toolchain.
+
 (There's also `vite.config.ts` and `tsconfig.json`. Both stay as they are — Vite's config is already `.ts`, and `.json` is fine for `tsconfig.json` and `package.json` per Bible rule #2.)
 
 ---
@@ -334,6 +356,8 @@ Select everything in `src/routes/+page.svelte` and delete it. Then paste exactly
 
 Save the file with `Cmd+S` (macOS) or `Ctrl+S` (Windows/Linux). Now look at your browser at `http://localhost:5173/` — **without refreshing it.** You should see the new page appear automatically.
 
+(Don't worry if some lines don't make sense yet. We read each one out loud, in English, in Lesson 1.6 — that's where the meaning lands.)
+
 > **hot reload** *(noun)* — when the dev server notices you saved a file and updates the browser without you having to refresh. The first time you see it, it feels like magic. After a week, you can't live without it. SvelteKit (via Vite) does this for free.
 
 Click the **Log a habit** button. The number rises. The word switches between *habit* (after the first click) and *habits* (every other count). You've shipped a working, reactive page.
@@ -353,7 +377,7 @@ Read each line below out loud, in English, before you read the explanation that 
 | `<!-- src/routes/+page.svelte -->` | *"This is the home page of the site."* (HTML comment — for our eyes only.) |
 | `<script lang="ts">` | *"Begin a script block written in TypeScript."* |
 | `let habitsLoggedToday = $state(0);` | *"Let the count of habits logged today be reactive state, starting at zero."* |
-| `function logHabit(): void {` | *"Define a function called logHabit; it returns nothing."* |
+| `function logHabit(): void {` | *"Define a function called logHabit; the `: void` part means it returns nothing."* |
 | `habitsLoggedToday += 1;` | *"Increase the count by one."* |
 | `}` | *"End of the function."* |
 | `</script>` | *"End of the script block."* |
@@ -386,7 +410,7 @@ You just saw a lot of new words. Here's each one with a one-sentence definition.
 >
 > **`$state(...)`** — a *rune* (a special Svelte thing). It marks the value as *reactive*. When you change a `$state` value, every place that reads it on the page updates automatically.
 >
-> **rune** — a special Svelte 5 keyword that starts with `$`. Runes are how you tell Svelte *"this isn't ordinary code — please do something special with it."* You'll meet `$state`, `$derived`, `$effect`, `$props`, `$bindable`, `$inspect` in this book.
+> **rune** — a special Svelte 5 keyword that starts with `$`. Runes are how you tell Svelte *"this isn't ordinary code — please do something special with it."* You'll meet `$state`, `$state.raw`, `$derived`, `$derived.by`, `$effect`, `$effect.pre`, `$props`, `$bindable`, `$inspect`, and `$inspect.trace` in this book.
 >
 > **reactive** — the property of a value that, when changed, causes anything watching it to update. The whole reason we use Svelte instead of writing pages by hand.
 >
@@ -550,7 +574,7 @@ When you're done, your `+page.svelte` should be roughly the shape we started wit
 </button>
 ```
 
-If your version looks different in small ways (a different function name, a different button label) but it works — that's fine. The point is the shape: a second `let`-free function (we kept the same `let habitsLoggedToday`), a second `function` declaration, a second `<button>`. Two of each, mirrored.
+If your version looks different in small ways (a different function name, a different button label) but it works — that's fine. The point is the shape: a second function (no new `let` needed since we reuse `habitsLoggedToday`), a second `function` declaration, a second `<button>`. Two of each, mirrored.
 </details>
 
 ---
@@ -687,7 +711,7 @@ Six new things in two lines. Let's name them.
 >
 > **`<=`** — *less than or equal to*.
 >
-> **`!==`** — *strict inequality*. The opposite of `===`. Same rule applies: never `!=`, always `!==`.
+> **`!==`** — *strict inequality*. The opposite of `===`. Same rule applies: never `!=`, always `!==`. *(We don't use `!==` directly in this chapter, but you'll see it everywhere from Ch 3 onward — `if (user !== null) ...`, `filter((h) => h.id !== removedId)` — and the rule is identical to `===`.)*
 >
 > **block** — the `{...}` part. The lines inside the braces only run if the condition is true.
 
@@ -806,13 +830,15 @@ Update your file to Version B:
 </script>
 ```
 
-(Notice the blank line after the `if`-block. That's a small senior habit too — visually separates the guard from the work.)
+**The blank line after the guard.** Notice the empty line between `}` and `habitsLoggedToday -= 1;`. That's a small senior style choice with the same weight as the early-return itself: it visually separates *"check the precondition"* from *"do the work."* As guards stack up (Lesson 2.4 shows three at once), the blank lines are what keep them readable. From now on, every guard clause in this book is followed by a blank line before the function's body resumes.
 
 ---
 
 ## Lesson 2.4 — Read this code
 
 Three versions of the same function. Read each out loud, then rank them from easiest-to-read to hardest. There are no tricks; one of them is genuinely the best, one is mediocre, one is bad.
+
+> **These are thought-experiment snippets — don't paste them into Streak.** They use a `User` type and an `actuallyDelete` function we haven't declared. You'll get cascading "Cannot find name" errors. Read them on the page; mentally rank them; then move on.
 
 ### Version 1
 
@@ -880,7 +906,7 @@ function unlogHabit(): void {
 }
 ```
 
-Save. Now click *Log a habit* once — count is `1`. Click *Undo* once — count is `0`. Click *Undo* again. What happens?
+Save (`Cmd+S` / `Ctrl+S`). Now click *Log a habit* once — count is `1`. Click *Undo* once — count is `0`. Click *Undo* again. What happens?
 
 The count goes to `-1`. Click *Undo* a third time — `-2`. The bug is back.
 
@@ -959,6 +985,8 @@ Try it before you peek.
 A small thing to notice: `resetHabits` and `unlogHabit` have the *same* guard clause — `if (habitsLoggedToday <= 0) return;`. That repetition is not a problem yet; we'd only extract a shared helper if a third function needed it (the *Rule of Three* — a senior habit we'll meet formally later).
 
 Right now, the duplication tells the truth: *"both functions need the same precondition, and that precondition is one line."* Premature abstraction is worse than honest duplication.
+
+(For `resetHabits` specifically, the guard's payoff is small — `habitsLoggedToday = 0` when `habitsLoggedToday` is already `0` is a no-op anyway. The guard's there for *consistency*, not necessity. Senior habit: when two functions handle the same precondition, the shape of the function should *look* the same too. Visual symmetry is part of how a future reader scans a codebase quickly.)
 </details>
 
 ---
@@ -1053,7 +1081,7 @@ In TypeScript, you can be explicit about the type:
 let canSubmit: boolean = $state(true);
 ```
 
-But you usually don't need to — TypeScript figures out from `true` that the type is `boolean` automatically. We use explicit annotations when they aid readability or when TypeScript can't infer (we'll see those cases later).
+…but you usually don't need to — TypeScript figures out from `true` that the type is `boolean` automatically. The annotation above is shown for clarity; in real code we'd write `let canSubmit = $state(true);` and let inference do the work. We use explicit annotations when they aid readability across a function boundary, or when TypeScript can't infer (we'll see those cases later).
 
 ---
 
@@ -1146,9 +1174,17 @@ if (user !== null && user.name === 'Billy') {
 }
 ```
 
-If `user` is `null`, the first half is `false`, so JavaScript never evaluates `user.name`. Which is good — accessing `.name` on `null` would crash. The `&&` *guards* the second half. This is a pattern you'll see in essentially every codebase.
+If `user` is `null`, the first half is `false`, so JavaScript never evaluates `user.name`. Which is good — accessing `.name` on `null` would crash. The `&&` *guards* the second half.
 
-We won't lean on this trick in Chapter 3 because we have a better tool (`?.` — optional chaining) coming in Chapter 4. But you should recognise it when you read it.
+This is a pattern you'll see in essentially every codebase, and you should recognise it when you read it. Our preferred form (Chapter 4) uses `?.` — *optional chaining* — which expresses the same intent more directly:
+
+```ts
+if (user?.name === 'Billy') {
+  // ...
+}
+```
+
+`?.` is the modern equivalent. The `&&` form is the older idiom; both compile, both work. We use `?.` from Chapter 4 onward, but reading both is a senior skill.
 
 ---
 
@@ -1247,6 +1283,7 @@ For now, **inline is fine.** Senior habit: don't reach for an abstraction before
 Here's a piece of code you'll see in someone else's project. It looks innocent. It's been the source of real production bugs.
 
 ```ts
+// Imagine somewhere up here: const user: { name: string | null } = ...;
 const displayName = user.name || 'Anonymous';
 ```
 
@@ -1274,6 +1311,11 @@ For Chapter 3, you only need to know:
 - Chapter 4 fixes this with `??`.
 
 Senior engineers reach for `??` reflexively whenever they want a *default for missing*. The reason that habit exists is because they've all had the `||` foot-gun shoot them at least once.
+
+> **`||` between two booleans is a different beast and *is* the right tool.** `disabled={!isOnline || hasUnsavedChanges}` (Snippet C below) reads as *"disabled when offline OR has unsaved changes"* — exactly what `||` was designed for. The foot-gun is *only* the default-for-missing usage (`name || 'Anonymous'`). Type-shaped rule of thumb:
+>
+> - `||` between booleans = correct.
+> - `||` for missing-value defaults = wrong; use `??`.
 
 > **falsy** *(adjective)* — a value that JavaScript treats as `false` in a boolean context. Specifically: `false`, `0`, `''`, `null`, `undefined`, `NaN`, and `-0`. Everything else is **truthy**.
 
@@ -1418,7 +1460,7 @@ You also have a feel for *defensive coding* — writing guards against states th
 | `boolean` | A type whose values are `true` or `false`. |
 | `true` / `false` | The two boolean literals. |
 | `&&` | Logical AND; both sides must be true. |
-| `\|\|` | Logical OR; either side may be true. |
+| `&#124;&#124;` (the OR operator) | Logical OR; either side may be true. |
 | `!` | Logical NOT; flips the boolean. |
 | short-circuit evaluation | Stopping early when the answer is determined. |
 | `disabled` (HTML attribute) | Marks a button or input as unclickable. |
