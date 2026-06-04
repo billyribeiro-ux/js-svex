@@ -2274,6 +2274,8 @@ DATABASE_URL=$UNPOOLED_URL pnpm db:migrate
 
 > **connection pooler** *(noun)* — a process that maintains a pool of long-lived connections to Postgres and lets short-lived clients (serverless functions) borrow them. Without one, serverless apps hit Postgres's `max_connections` limit fast.
 
+The pooler earns its keep here, but file away one thing for later: it abstracts *which* backend serves a connection. The day you add a read replica for scale (Lesson 65.5a), that same abstraction will happily serve a read off a stale replica milliseconds after a write — and the code will look completely finished while doing it. Single primary today; the consistency reckoning comes when you split reads off.
+
 ---
 
 ## Lesson 62.4 — Custom domain and DNS
@@ -3882,7 +3884,7 @@ Back-of-envelope sizing. *"At 100k users with 30 habits each, where does Streak 
 **Database:**
 - Pooled URL allows ~500 concurrent connections.
 - 150 in-flight × ~3 queries/request = 450 in-use connections at p99 peak. **Margin is thin; connection-pool exhaustion is the next failure mode.**
-- Mitigation: read-only replica for `/api/v1/habits GET` traffic (high read volume; doesn't need primary).
+- Mitigation: read-only replica for `/api/v1/habits GET` traffic (high read volume; doesn't need primary). **But a replica is stale by milliseconds-to-seconds — see Lesson 65.5a before you ship it, or a user will watch their own write vanish.**
 
 **External services:**
 - Stripe: rate-limited at 100 RPS by default. Streak's billing actions are <1 RPS. **No issue.**
@@ -3890,9 +3892,175 @@ Back-of-envelope sizing. *"At 100k users with 30 habits each, where does Streak 
 
 **The summary** (drop into ADR-005 or a `docs/scaling.md`):
 
-> *At 100k users, the first three problems are (1) audit_log size — partition by month at 10 GB; (2) DB connection pool at 80% utilisation peaks — add a read replica for the API; (3) Resend pricing — move to paid tier and batch reminders. Storage and per-request latency are not a concern. Vercel scales horizontally; we don't hit a function-runtime ceiling at this size.*
+> *At 100k users, the first three problems are (1) audit_log size — partition by month at 10 GB; (2) DB connection pool at 80% utilisation peaks — add a read replica for the API (which buys a read-after-write consistency requirement, not just capacity — Lesson 65.5a); (3) Resend pricing — move to paid tier and batch reminders. Storage and per-request latency are not a concern. Vercel scales horizontally; we don't hit a function-runtime ceiling at this size.*
 
 > **back-of-envelope** *(idiom)* — quick capacity math done from rough numbers, in the head or on a napkin. The senior pre-flight before optimising for problems that aren't real yet.
+
+---
+
+## Lesson 65.5a — When the read replica lies: read-after-write consistency
+
+> *Today's job: take the "add a read replica" line from the capacity math and make it **correct**. A replica makes reads cheap; it also makes them **stale**. Visible win: you toggle a habit, the page re-reads from a lagging replica, the checkmark flips back to undone — then you fix it so it never does.*
+
+The capacity plan ended with a tidy one-liner: *"add a read replica for the API."* That sentence hides the most expensive class of bug in distributed systems, and it's exactly what Rule 21 was written for — it **compiles, the tests pass, and it looks finished.**
+
+Stated plainly, the trap that catches senior engineers too:
+
+> **Proxy code can look finished while the real issue sits in geo consistency.**
+
+You wire the pooler, point read traffic at the replica, and every line reviews clean. Nothing in the *code* is wrong. The bug lives in the *gap in time* between the primary accepting a write and the replica catching up.
+
+### The failure, in Streak's own UI
+
+Walk the habit toggle on the stable stack with a replica behind the pooler:
+
+| t (ms) | Where | What happens |
+|---|---|---|
+| 0 | primary (`iad1`) | `UPDATE` commits — `done_today = true`. Atomic, correct (Rule 11). |
+| 5 | browser | Page re-reads the habit list. |
+| 5 | replica | Read is routed here by the pooler. Replica is 40 ms behind: still `done_today = false`. |
+| 5 | browser | The checkmark the user *just tapped* **flips back to empty.** |
+| 45 | replica | Catches up — too late; the user already saw it regress. |
+
+The user did everything right. The primary did everything right. The replica did everything right. The *architecture* is wrong, because nobody told the read path it must not regress a write the same user just made.
+
+> **replication lag** *(noun)* — the delay between a write committing on the primary and that change being visible on a replica. Usually milliseconds; under load or across regions, seconds. Never zero.
+> **read-your-writes** *(consistency guarantee)* — a user always sees the effect of *their own* writes, even if other users see them a beat later. The weakest guarantee that still feels correct.
+
+### Why the pooler hides it
+
+The pooled `DATABASE_URL` from Lesson 62.3 is the accomplice. Abstracting *which* backend serves a connection is the whole point of a pooler — but that same abstraction means your read code has **no idea** whether it just talked to the primary or a replica. Looks finished; isn't. The cure is to make the read/write split *explicit and deliberate*, per request — not a thing the proxy decides for you behind a curtain.
+
+### The three fixes, ranked
+
+1. **Read-your-writes via sticky primary (the default).** After any write, route *that user's* reads to the primary for a short window. Cheap, correct for the common case; you forfeit the replica's benefit only briefly and only for the one user who just wrote.
+2. **Bounded staleness (where lag is acceptable).** Reads that don't follow a write take the replica and tolerate, say, ≤ 1 s of lag. Document the bound — it's a product decision, not an accident.
+3. **Causal / LSN wait (advanced).** Capture the write's log position (LSN) and make the read *wait* until the replica reaches it. Strongest guarantee, most plumbing; reach for it only when the sticky window isn't precise enough.
+
+For Streak, #1 is the right altitude. Here it is.
+
+### The implementation
+
+Split the single client into a writer and a reader:
+
+```ts
+// src/lib/db/client.ts
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+import { DATABASE_URL, DATABASE_REPLICA_URL } from '$env/static/private';
+import * as schema from './schema';
+
+// Rule 13: timeouts on every external client. A hung DB must fail fast,
+// not pin a serverless invocation open until maxDuration.
+const opts = { connect_timeout: 10, idle_timeout: 20 } as const;
+
+// Every write goes here.
+export const dbPrimary = drizzle(postgres(DATABASE_URL, opts), { schema });
+
+// Reads *may* go here. Falls back to the primary URL when no replica is
+// configured (local dev, preview), so behaviour is identical everywhere.
+export const dbReplica = drizzle(
+  postgres(DATABASE_REPLICA_URL ?? DATABASE_URL, opts),
+  { schema },
+);
+
+// Back-compat: existing call sites that import `db` keep hitting the primary.
+// Reads that opt into the replica use `readDb(event)` instead (below).
+export const db = dbPrimary;
+```
+
+Then the per-request chooser — the whole consistency story in two functions:
+
+```ts
+// src/lib/db/route.ts
+import type { RequestEvent } from '@sveltejs/kit';
+import { dbPrimary, dbReplica } from './client';
+
+const FRESH_COOKIE = 'rw_fresh';
+const STICKY_MS = 5_000; // generous cover for worst-case lag; tune to your p99
+
+// Call after any write: pin *this* user's subsequent reads to the primary
+// until the window closes — long enough for the replica to catch up.
+export function pinPrimaryAfterWrite(event: RequestEvent): void {
+  event.cookies.set(FRESH_COOKIE, String(Date.now() + STICKY_MS), {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'lax',
+    maxAge: Math.ceil(STICKY_MS / 1000),
+  });
+}
+
+// Pick the connection for a read. Primary while the window is open (so the
+// writer sees their own write); replica otherwise (so we keep the scale win).
+export function readDb(event: RequestEvent) {
+  const until = Number(event.cookies.get(FRESH_COOKIE) ?? 0);
+  return Date.now() < until ? dbPrimary : dbReplica;
+}
+```
+
+Read aloud:
+
+| Line | Read aloud as |
+|---|---|
+| `readDb(event)` | *"Give me the connection this read should use — primary if the user just wrote, replica otherwise."* |
+| `pinPrimaryAfterWrite(event)` | *"This user just wrote; route their reads to the primary for the next few seconds."* |
+| `Date.now() < until` | *"Are we still inside the freshness window?"* |
+| `sameSite: 'lax'` | *"The cookie rides along on top-level navigations — exactly the reads that follow a write."* |
+
+Wire it into the page's load and action:
+
+```ts
+// src/routes/(app)/dashboard/+page.server.ts
+import { error } from '@sveltejs/kit';
+import { and, eq, sql } from 'drizzle-orm';
+import { dbPrimary } from '$lib/db/client';
+import { pinPrimaryAfterWrite, readDb } from '$lib/db/route';
+import { habits } from '$lib/db/schema';
+import type { Actions, PageServerLoad } from './$types';
+
+export const load: PageServerLoad = async (event) => {
+  const user = event.locals.user;
+  if (!user) error(401, 'not authenticated');
+  // A read — but it respects the freshness window, so a just-toggled habit
+  // is served from the primary, not a lagging replica.
+  const list = await readDb(event)
+    .select()
+    .from(habits)
+    .where(eq(habits.userId, user.id));
+  return { habits: list };
+};
+
+export const actions: Actions = {
+  toggle: async (event) => {
+    const user = event.locals.user;
+    if (!user) error(401, 'not authenticated');
+    const data = await event.request.formData();
+    const id = String(data.get('id'));
+    // Writes always hit the primary (Rule 11: atomic UPDATE, owner-scoped).
+    await dbPrimary
+      .update(habits)
+      .set({ doneToday: sql`NOT ${habits.doneToday}` })
+      .where(and(eq(habits.id, id), eq(habits.userId, user.id)));
+    pinPrimaryAfterWrite(event); // open the read-your-writes window
+    return { success: true };
+  },
+};
+```
+
+### Prove it (Rule 21)
+
+You cannot unit-test your way to confidence here — the bug only exists *in time*. Manufacture the lag and watch:
+
+1. **Make the replica visibly slow.** In dev, point `DATABASE_REPLICA_URL` at the same DB but wrap `dbReplica` reads in an artificial `await new Promise((r) => setTimeout(r, 1500))`, *or* (closer to real) use a Neon/Supabase replica and hammer it so lag climbs.
+2. **Disable the fix.** Comment out `pinPrimaryAfterWrite(event)`. Toggle a habit. Watch the checkmark flip back when the load re-reads the stale replica. That flip is the bug, reproduced on demand.
+3. **Re-enable the fix.** Toggle again. The read now comes from the primary inside the 5 s window; the checkmark stays. *Visible win.*
+4. Remove the artificial delay. Ship.
+
+### Where it ties back
+
+- **Rule 11** gets the write right *on the primary*. This lesson gets the read right *across the replica*. They are two halves of one guarantee; one without the other still ships a visible bug.
+- **Appendix A's `withOverride`** is the same idea one layer up — read-your-writes *in the browser*. Server and client both owe the user the sight of their own write; the server reconciles, the client paints instantly.
+- **Update the ADR.** When you add the replica (next lesson's format), the consequences section must record the consistency requirement, not just the capacity gain — otherwise the next engineer re-introduces the flip the first time they add a "fast" replica read.
 
 ---
 
@@ -4465,11 +4633,17 @@ Welcome to the trade.
 
 # Appendix A — Remote Functions, the experimental future
 
-> *Optional chapter. Experimental as of May 5, 2026 — APIs may change. Don't bet a production app on it yet, but know it exists.*
+> *Optional chapter. Still experimental as of June 4, 2026 — gated behind `kit.experimental.remoteFunctions`, and the shape has already moved several times (it changed again across the June 2026 releases, up to SvelteKit 2.61.0). Don't bet a production app on it yet, but know it exists and recognise the **current** shape, not last month's.*
 
 The book's spine — `+page.server.ts` + `load` + `actions` + `+server.ts` — is the stable, idiomatic story every senior engineer in May 2026 already knows. **Remote Functions** are where SvelteKit is heading: a unified, type-safe primitive for client→server calls that collapses load + action + REST into one shape.
 
 This appendix gives you enough to *recognise* remote functions in the wild and rewrite *one* feature using them, so you understand the trade-off if you adopt them in your own app a year from now.
+
+> **What changed between the May 2026 cut of this book and June 4, 2026.** Two *breaking* changes landed in the June releases and instantly date every older tutorial:
+> - **`.run()` is gone (2.61.0).** You no longer call `query(...).run()`. You `await` a query *directly* — in markup, and equally in event handlers, async callbacks, and module scope. Every `.run()` you see in an older snippet is now a deletion.
+> - **`enhance` callbacks receive the form instance (2.61.0).** The callback argument used to be a `{ form, data, submit }` object; it is now a copy of the form remote-function instance itself (everything except `.enhance`), and that instance exposes a programmatic `submit()` that resolves to a boolean.
+>
+> Smaller June additions worth knowing: `form.submit()` returns a validity boolean; remote `submit`/`hidden` fields accept booleans and numbers directly; `query.live` is async-iterable; `query.batch` is stable for the N+1 case; and dev mode now *warns* when a form's validation issues go unread (an incomplete-UX smell). The throughline: this is still the fastest-moving corner of SvelteKit — pin a version and re-verify on every minor bump.
 
 ---
 
@@ -4496,17 +4670,20 @@ The flag pair is required because remote functions use top-level `await` in mark
 
 ---
 
-## A.2 — The five primitives
+## A.2 — The primitives (June 2026)
 
-> **Pinned to SvelteKit 2.5x with `kit.experimental.remoteFunctions: true`** (May 5, 2026). Verify each signature against the live docs before adoption — the API has shifted between minor releases more than once. In particular, `query.live`'s async-generator pattern and the `command` shape have moved.
+> **Pinned to SvelteKit 2.61.0 with `kit.experimental.remoteFunctions: true`** (June 4, 2026). Verify each signature against the live docs before adoption — this is the single most volatile corner of the framework.
 
-`$app/server` exports:
+`$app/server` exports six building blocks:
 
-- **`query(schema?, fn)`** — read-only server function. Cached per argument, deduplicated within a render. Has `.refresh()`, `.set(data)` for client-side cache invalidation.
-- **`query.batch(schema, fn)`** — solves the N+1 problem. Server receives an array of args; returns a function mapping each to a result. Calls within a macrotask are batched.
-- **`query.live(schema, fn)`** — async generator returning a stream. Auto-reconnects on disconnect. Use for real-time features. (Async-generator pattern is the form pinned here; the docs warn it may shift.)
-- **`form(schema, fn)`** — replaces a form action. Returns a spreadable object you put on `<form {...myForm}>` plus typed `fields` accessors for `<input {...myForm.fields.name.as('text')}>`.
-- **`command(schema, fn)`** — imperative mutation, called from event handlers. No automatic page revalidation; you trigger refreshes manually.
+- **`query(schema?, fn)`** — read-only server function. You **`await` it directly** wherever you need the data: `{#each await getHabits() as h}` in markup, or `const list = await getHabits()` in a handler (the old `.run()` is gone). Cached per argument and deduplicated within a render. Methods on the returned object: `.refresh()` (re-fetch from the server), `.set(data)` (overwrite the client cache with a value you already have — e.g. from a mutation's return), and `.withOverride(fn)` (an **optimistic** local override that auto-rolls-back if the mutation fails).
+- **`query.batch(schema, fn)`** — the N+1 killer. The server receives the *array* of args collected within a macrotask and returns a lookup function `(arg) => result`. Each call site still `await`s a single value; the round-trips collapse to one.
+- **`query.live(fn)`** — pass an **async generator**; every `yield` pushes a new value to all subscribers. `await` it like a query, plus `.connected` (is the stream live?) and `.reconnect()`. Auto-reconnects on drop. This is the real-time primitive.
+- **`form(schema, fn)`** — replaces a form action. Spread it onto `<form {...addHabit}>`; build inputs from typed accessors `addHabit.fields.name.as('text')` (and `.as('submit', 'value')` for multi-button forms). Read/write values with `.value()` / `.set({...})`, validate with `.validate()`, and customise submission with `.enhance(async (form) => { if (await form.submit()) … })` — note the callback now receives the **form instance**.
+- **`command(schema, fn)`** — imperative mutation called straight from an event handler (`await toggleHabit(id)`). No automatic revalidation; you drive the re-read with the **single-flight** `.updates(...)` pattern so the mutation and the refresh share one round-trip.
+- **`prerender(schema?, fn, { inputs })`** — like `query`, but resolved at *build* time for the listed `inputs`. Static data, zero per-request cost; the right tool for content that doesn't change between deploys.
+
+> **single-flight update** *(noun)* — telling a mutation, in the same request, which queries to re-read, so the browser doesn't fire the write and *then* a second request to refresh. `await toggleHabit(id).updates(getHabits())` mutates and re-reads in one flight. Pair it with `.withOverride(...)` for an instant optimistic paint that the server reconciles or rolls back.
 
 ---
 
@@ -4516,73 +4693,91 @@ Take Streak's home-page habit list (currently `+page.server.ts` `load` + form ac
 
 ```ts
 // src/routes/(app)/dashboard/habits.remote.ts
-import { query, form, getRequestEvent } from '$app/server';
+import { query, form, command, getRequestEvent } from '$app/server';
+import { error } from '@sveltejs/kit';
 import * as v from 'valibot';
 import { db } from '$lib/db/client';
 import { habits } from '$lib/db/schema';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { addHabitForUser } from '$lib/habits-server';
 
+// One place to read auth. `error()` short-circuits with a real HTTP status
+// instead of a thrown string the client can't classify (Rule 17 — no silent
+// failures; the caller gets a 401, not a generic 500).
+function requireUser() {
+  const { locals } = getRequestEvent();
+  if (!locals.user) error(401, 'not authenticated');
+  return locals.user;
+}
+
 export const getHabits = query(async () => {
-  const event = getRequestEvent();
-  const user = event.locals.user;
-  if (!user) return [];
+  const user = requireUser();
   return db.select().from(habits).where(eq(habits.userId, user.id));
 });
 
 export const addHabit = form(
   v.object({ name: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(100)) }),
   async ({ name }) => {
-    const event = getRequestEvent();
-    const user = event.locals.user;
-    if (!user) throw new Error('not authed');
+    const user = requireUser();
     await addHabitForUser(user.id, name);
-    // fire-and-forget; refresh is best-effort. The `void` operator silences
-    // `no-floating-promises` and signals the intent to reviewers — *we know
-    // this is a Promise; we deliberately don't await it.*
-    void getHabits().refresh();
+    // Re-read in the *same* flight. Awaited, not fire-and-forget: the form
+    // resolves only once the fresh list is back, so the UI never paints stale.
+    await getHabits().refresh();
   },
 );
 
-export const deleteHabit = form(
-  v.object({ id: v.string() }),
-  async ({ id }) => {
-    const event = getRequestEvent();
-    const user = event.locals.user;
-    if (!user) throw new Error('not authed');
-    await db.delete(habits).where(and(eq(habits.id, id), eq(habits.userId, user.id)));
-    // fire-and-forget; refresh is best-effort.
-    void getHabits().refresh();
-  },
-);
+export const toggleHabit = command(v.string(), async (id) => {
+  const user = requireUser();
+  // Atomic UPDATE … (Rule 11): flip the flag in the database, never
+  // SELECT-then-write. The `and(...)` scopes it to the owner — a user can't
+  // toggle someone else's habit even if they forge the id.
+  await db
+    .update(habits)
+    .set({ doneToday: sql`NOT ${habits.doneToday}` })
+    .where(and(eq(habits.id, id), eq(habits.userId, user.id)));
+});
 ```
 
 In the page:
 
 ```svelte
 <script lang="ts">
-  import { getHabits, addHabit, deleteHabit } from './habits.remote';
+  import { getHabits, addHabit, toggleHabit } from './habits.remote';
 </script>
 
 <h1>Today</h1>
 
-<form {...addHabit}>
-  <input {...addHabit.fields.name.as('text')} placeholder="Add a habit..." />
+<form
+  {...addHabit.enhance(async (form) => {
+    if (await form.submit()) form.element.reset();
+  })}
+>
+  <input {...addHabit.fields.name.as('text')} placeholder="Add a habit…" />
   <button type="submit">Add</button>
 </form>
 
 <ul>
   {#each await getHabits() as habit (habit.id)}
     <li>
-      {habit.name}
-      <form {...deleteHabit}>
-        <input {...deleteHabit.fields.id.as('hidden')} value={habit.id} />
-        <button type="submit" aria-label="Remove {habit.name}">×</button>
-      </form>
+      <button
+        type="button"
+        onclick={() =>
+          toggleHabit(habit.id).updates(
+            getHabits().withOverride((list) =>
+              list.map((h) =>
+                h.id === habit.id ? { ...h, doneToday: !h.doneToday } : h,
+              ),
+            ),
+          )}
+      >
+        {habit.doneToday ? '✓' : '○'} {habit.name}
+      </button>
     </li>
   {/each}
 </ul>
 ```
+
+The toggle is the part worth studying. `toggleHabit(habit.id)` is the command; `.updates(getHabits()...)` tells SvelteKit to re-read the list in the same round-trip; `.withOverride(...)` paints the flip *immediately* on the client and auto-rolls-back if the command throws. That `withOverride` is **read-your-writes on the client** — the in-browser twin of the read-after-write problem you solve on the server in Lesson 65.5a. Same shape, two layers: show the user their own write instantly, reconcile with the truth a beat later.
 
 Compared to the stable story, you save:
 - The separate `+page.server.ts`.
@@ -4593,12 +4788,12 @@ Compared to the stable story, you save:
 You gain:
 - A clearer *unit of work* per server function.
 - Built-in deduplication of repeated `getHabits()` calls.
-- Type-safe `.refresh()` / `.set()` cache primitives.
+- Type-safe `.refresh()` / `.set()` / `.withOverride()` cache primitives — optimistic UI for free.
+- Single-flight mutations (`.updates(...)`) that re-read in the same round-trip.
 
 You lose:
-- The progressive-enhancement *guarantee* (forms still work, but the implementation is different and the maturity story is younger).
-- The ability to pin to specific Stripe / API versions in your team's existing review patterns.
-- A year of stability — APIs may shift in 5.x and 6.x.
+- The progressive-enhancement *guarantee* (forms still work, but the implementation is younger).
+- A year of stability — and this is not hypothetical: `.run()` was removed and the `enhance` callback shape changed in the June 2026 releases alone. Adopting means budgeting for a refactor on minor bumps.
 
 ---
 
@@ -4614,7 +4809,8 @@ The senior judgment call: spend an *innovation token* (Ch 65) on remote function
 
 ## A.5 — Further reading
 
-- Official SvelteKit Remote Functions docs (live, evolving).
+- Official SvelteKit Remote Functions docs (live, evolving): `svelte.dev/docs/kit/remote-functions`.
+- The monthly **"What's new in Svelte"** posts (`svelte.dev/blog`) — the June 2026 edition is where the `.run()` removal and the `enhance`-callback change were announced. Read the one for the month you adopt.
 - Rich Harris's RFC threads on GitHub.
 - The migration guide once it stabilises.
 
