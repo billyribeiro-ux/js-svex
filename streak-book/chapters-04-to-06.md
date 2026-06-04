@@ -517,6 +517,14 @@ The variants you'll meet — **prefer the keyed form whenever items have a stabl
 
 The `{:else}` slot is the empty-state pattern Chapter 6 will formally name. The `(item.id)` keyed form lets Svelte track which DOM node belongs to which item across mutations — critical when items can be added, removed, or reordered (Ch 7 explains why in detail).
 
+> **The level-7 keying rule — decided once, so you never re-litigate it in review.** Key by a value that is **unique *and* stable** for the life of the list. Everything else follows:
+>
+> - **Objects with an `id`** → always `(item.id)`. Identity survives reorder, insert, and delete; this is the 95% case.
+> - **Primitives that can repeat** — a `number[]` of `scores`, or a `string[]` of habit names where two rows can both be `"Untitled habit"` — → **leave unkeyed.** Keying by the value itself (`(score)`, `(name)`) hands Svelte two identical keys the instant a duplicate appears, and it throws `each_key_duplicate` *("keyed each block has duplicate key")* at runtime. Here, unkeyed isn't the lazy choice — it's the *correct* one.
+> - **Primitives guaranteed unique** — the `days` array — → unkeyed is fine. The list never mutates, so there's nothing for a key to track; adding `(day)` buys you literally nothing.
+>
+> **Heads-up for when you wire up CI lint (Ch 60+):** linters such as `eslint-plugin-svelte` (its `require-each-key` rule) — and most "fix-my-Svelte" autofixers — flag *every* unkeyed `{#each}` with *"Each block should have a key."* That rule is a blunt instrument: it can't see that your array holds duplicate-able primitives. The senior move when it fires on one of the lists above is **not** to bend the code to silence the tool — you'd be trading a clean lint report for a runtime crash. It's to recognise the false positive, keep the code correct, and leave a one-line comment (or a scoped inline disable) saying *why*. Rule 21 in miniature: the linter is necessary, not sufficient — you still own the runtime behaviour it can't see.
+
 ---
 
 ## Lesson 5.4 — Today's date, briefly
