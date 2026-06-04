@@ -691,41 +691,59 @@ The number bounces toward its target. `display.current` is the live value; `disp
 
 ## Lesson 52.4 — `prefers-reduced-motion`
 
+Some users get motion sick from animation; the OS exposes their preference and we respect it. Svelte 5 ships the reactive read for you — **`prefersReducedMotion` from `svelte/motion`**:
+
+```svelte
+<script lang="ts">
+  import { fly } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
+</script>
+
+{#each items as item (item.id)}
+  <li transition:fly={prefersReducedMotion.current ? { duration: 0 } : { y: 10, duration: 200 }}>
+    {item.name}
+  </li>
+{/each}
+```
+
+Read aloud:
+
+| Expression | Read aloud as |
+|---|---|
+| `import { prefersReducedMotion } from 'svelte/motion'` | *"Bring in Svelte's reactive read of the OS reduce-motion setting."* |
+| `prefersReducedMotion.current` | *"True if the user has asked their OS to reduce motion — read reactively, right now."* |
+| `? { duration: 0 }` | *"If so, animate over zero milliseconds — i.e. don't."* |
+| `: { y: 10, duration: 200 }` | *"Otherwise, the normal 200 ms fly."* |
+
+`prefersReducedMotion` is a `MediaQuery` instance: `.current` is a reactive boolean that flips the moment the user changes the OS setting, with no listener wiring on your side. One import, one property, WCAG-grade. Senior habit.
+
+### Under the hood — a reusable pattern
+
+It's worth seeing what `.current` is *doing*, because the same shape solves a dozen other "reactive read of a browser API" problems. Hand-rolled, it's a module-scope rune backed by a `matchMedia` listener:
+
 ```ts
-// src/lib/motion.svelte.ts
+// src/lib/motion.svelte.ts — illustrative; prefer the built-in above in real code
 import { browser } from '$app/environment';
 
 let _reduced = $state(browser ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false);
+
 if (browser) {
-  window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', (e) => {
-    _reduced = e.matches;
+  window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', (event) => {
+    _reduced = event.matches;
   });
 }
+
 export const prefersReducedMotion = {
-  get value(): boolean {
+  get current(): boolean {
     return _reduced;
   },
 };
 ```
 
-Two things worth flagging:
+Two things this teaches, even though you'll reach for the built-in in real code:
 
 - **`import { browser } from '$app/environment'`** — matches the senior pattern from Ch 38; preferred over hand-rolled `typeof window` checks because it's tree-shaken at build time and avoids the temptation to reach for `window` accidentally inside the SSR branch.
-- **Module-scope `$state` and Ch 29's SSR-singleton rule.** Ch 29 banned per-request mutable state at module scope on the server (one bucket would be shared across every request). This `_reduced` is fine because: (a) on the server, `browser` is `false`, the listener never runs, and `_reduced` is the constant `false` for everyone; (b) in the browser, this module is loaded once per tab, set once via `addEventListener`, and the "singleton" is bounded by browser lifetime, not request lifetime. Safe.
-
-In components:
-
-```svelte
-<script lang="ts">
-  import { prefersReducedMotion } from '$lib/motion.svelte';
-</script>
-
-{#each items as item (item.id)}
-  <li transition:fly={prefersReducedMotion.value ? { duration: 0 } : { y: 10, duration: 200 }}>{item.name}</li>
-{/each}
-```
-
-Senior habit. WCAG-grade.
+- **Module-scope `$state` and Ch 29's SSR-singleton rule.** Ch 29 banned per-request mutable state at module scope on the server (one bucket would be shared across every request). This `_reduced` is fine because: (a) on the server, `browser` is `false`, the listener never runs, and `_reduced` is the constant `false` for everyone; (b) in the browser, this module is loaded once per tab, set once via `addEventListener`, and the "singleton" is bounded by tab lifetime, not request lifetime. The real `svelte/motion` export *is* this exact reasoning, written by the Svelte team — which is why it exposes `.current` to match the `MediaQuery` interface, and why we mirror that name above instead of inventing our own.
 
 ---
 
