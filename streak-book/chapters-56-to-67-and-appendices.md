@@ -6,7 +6,7 @@
 
 # Chapter 56 — Error boundaries, `handleError`, the failure budget
 
-> *Today's job:* an unexpected error from anywhere in the app — server, client, root layout, deep child component — produces a user-facing apology page with an error ID, a structured log entry the on-call engineer can grep, and PII redacted before anything leaves the process. *Visible win:* trigger a deliberate `throw new Error('boom')` from inside a `load`; see the polite page; copy the error ID; grep it out of the log file.
+> *Today's job:* an unexpected error from anywhere in the app — server, client, root layout, deep child component — produces a user-facing apology page with an error ID, a structured log entry the on-call engineer can grep, and PII redacted before anything leaves the process. Then you go upstream of the apology: **timeouts, retries with backoff+jitter, a circuit breaker, and graceful degradation** so most failures never reach it — and an **error-budget policy** that says what to do when they do. *Visible win:* trigger a deliberate `throw new Error('boom')` from inside a `load`; see the polite page; copy the error ID; grep it out of the log file.
 
 You've already met `error()` for *expected* errors (Chapter 33–34). This chapter is the second half of the story: *unexpected* errors. The ones a programmer mistake, a bad cast, or a flaky third-party API caused. They get caught by `handleError` and rendered through `+error.svelte`, but with a **generic** message — never the raw stack trace, never the database error string with PII inside it.
 
@@ -216,11 +216,170 @@ Restore the load function.
 
 ---
 
+## Lesson 56.7a — Timeouts and retries: recovering from flaky
+
+`handleError` is the *last* line of defence — it makes a failure graceful. The earlier lines try to make the failure *not happen*. Most production errors aren't bugs; they're a third party being briefly flaky. Two primitives absorb the bulk of them, and both rest on a rule the book has stated but not yet built: **every external call has a timeout** (Rule 13).
+
+```ts
+// src/lib/resilience/fetch-json.ts
+export async function fetchJson<T>(url: string, init: RequestInit = {}, timeoutMs = 5_000): Promise<T> {
+  // Without a timeout, retries and circuit breakers are useless — you can't
+  // recover from a call that never returns, and a hung fetch pins a serverless
+  // invocation open until maxDuration.
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as T;
+}
+```
+
+Now retry the flaky call — correctly. Recall the anti-pattern the Chapter 65 code review flags: `while (true) { try { await send(); break; } catch {} }` — an unbounded, instant, hammering loop that turns one slow dependency into a self-inflicted outage. The senior version is bounded, backed off, jittered, and applied *only to idempotent work*:
+
+```ts
+// src/lib/resilience/retry.ts
+export type RetryOptions = {
+  attempts?: number; // total tries, default 4
+  baseMs?: number; // first backoff, default 200
+  capMs?: number; // max backoff, default 5000
+  retryable?: (err: unknown) => boolean; // default: retry everything
+};
+
+export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+  const attempts = options.attempts ?? 4;
+  const baseMs = options.baseMs ?? 200;
+  const capMs = options.capMs ?? 5_000;
+  const retryable = options.retryable ?? (() => true);
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt === attempts - 1 || !retryable(err)) break;
+      const backoff = Math.min(capMs, baseMs * 2 ** attempt);
+      const delay = Math.random() * backoff; // full jitter
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
+```
+
+Two ideas carry the whole lesson:
+
+- **Backoff + full jitter.** Exponential backoff (`200 ms, 400 ms, 800 ms…`) stops you from hammering; *full jitter* (a random delay in `[0, backoff]`) stops every client from retrying in the same instant when a dependency recovers — the **thundering herd** that knocks it straight back down.
+- **Idempotent-only.** A retry re-runs the call, and re-running a non-idempotent write double-charges, double-sends, double-flips (the exact bug from Lesson 65.5a and Chapter 64). Retry reads, `PUT`/`DELETE`, and keyed/outbox writes freely; never a bare `command` that flips or charges. Retry and idempotency are a matched pair — neither is safe alone.
+
+Use them together, and gate retries on *transient* failures only:
+
+```ts
+const rates = await withRetry(
+  () => fetchJson<Rates>('https://api.example.com/rates', {}, 3_000),
+  { attempts: 4, retryable: (e) => e instanceof Error && !e.message.startsWith('HTTP 4') },
+);
+```
+
+The `retryable` predicate is the senior touch: retry `5xx`/timeouts (transient), never `4xx` (your bug — retrying a bad request just wastes everyone's time).
+
+> **exponential backoff with jitter** *(noun)* — retry delays that double each attempt, randomised within the window. Backoff avoids hammering; jitter avoids the synchronised retry storm when a dependency recovers.
+
+---
+
+## Lesson 56.7b — Circuit breakers and graceful degradation
+
+Retries handle a *blip*. A dependency that's properly *down* is different: every request retries, every retry times out, and your serverless functions pile up waiting — the failure spreads from Stripe into *your* app (saturation, the fourth golden signal). A **circuit breaker** stops the spread by failing fast once a dependency looks dead:
+
+```ts
+// src/lib/resilience/circuit-breaker.ts
+type State = 'closed' | 'open' | 'half-open';
+
+export class CircuitBreaker {
+  #state: State = 'closed';
+  #failures = 0;
+  #openedAt = 0;
+
+  constructor(
+    private readonly threshold = 5,
+    private readonly cooldownMs = 30_000,
+  ) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.#state === 'open') {
+      if (Date.now() - this.#openedAt < this.cooldownMs) {
+        throw new Error('circuit open'); // fail fast — don't touch the sick dependency
+      }
+      this.#state = 'half-open'; // let one probe through
+    }
+    try {
+      const result = await fn();
+      this.#state = 'closed';
+      this.#failures = 0;
+      return result;
+    } catch (err) {
+      this.#failures += 1;
+      if (this.#failures >= this.threshold) {
+        this.#state = 'open';
+        this.#openedAt = Date.now();
+      }
+      throw err;
+    }
+  }
+}
+```
+
+Three states: **closed** (normal), **open** (too many failures — reject instantly for a cooldown, sparing both systems), **half-open** (after the cooldown, let one probe through to test recovery). Wrap the dependency once, breaker *outside*, retry *inside*:
+
+```ts
+const stripeBreaker = new CircuitBreaker(5, 30_000);
+const session = await stripeBreaker.run(() => withRetry(() => createCheckout(/* … */)));
+```
+
+Retry the blips; if they don't clear, the breaker opens and stops trying entirely. (Serverless caveat, same as metrics and rate limits: instance-local breaker state resets per cold start — a fleet-wide breaker needs shared Redis/DB state; the state machine is identical.)
+
+Failing fast is only half the answer — *then what does the user see?* This is **graceful degradation** at the backend: the server-side twin of the `<svelte:boundary>` you use in the UI, and of the degraded-mode posture from Lesson 65.5a. When a *non-critical* dependency is down, serve a fallback, not an error:
+
+```ts
+async function getRecommendations(userId: string): Promise<Habit[]> {
+  try {
+    return await recsBreaker.run(() => fetchJson<Habit[]>(recsUrl(userId)));
+  } catch {
+    return DEFAULT_HABITS; // the app still works; recs are just generic for now
+  }
+}
+```
+
+The discipline is to decide *per dependency* whether it's load-bearing: Stripe down → block *upgrades*, keep the rest of the app fully usable; recommendations down → show defaults; database down → that one you can't paper over. Naming which failures degrade and which page is the same posture call as the geo lesson's *"writes fail fast, reads degrade to the replica."*
+
+> **circuit breaker** *(noun)* — a wrapper that trips open after repeated failures and fails fast for a cooldown, sparing a sick dependency and your own capacity. **graceful degradation** — serving a reduced-but-working experience when a non-critical dependency fails, instead of a hard error.
+
+---
+
 ## Lesson 56.8 — Failure budgets, named
 
 A **failure budget** is the maximum acceptable error rate over a time window. If your budget is *0.1% of requests can fail per month*, and you have 1M requests, you can tolerate 1000 failures before declaring an incident. This is the SRE concept. Streak isn't at scale yet, but the vocabulary lands here so the observability chapter (Ch 63) can build on it.
 
 > **failure budget** *(noun)* — the threshold of failures you tolerate without action. Burn it, and you stop shipping features and fix reliability.
+
+### From budget to policy
+
+A budget is only useful if *spending it triggers an action*. That's the **error-budget policy** — a rule agreed *before* the incident so nobody argues during one:
+
+- **Budget healthy** → ship freely, take risks; this is what the budget is *for*.
+- **Budget burning fast** (the multi-window burn-rate alert from Lesson 63.7 fires) → page, mitigate, roll back.
+- **Budget exhausted for the window** → **feature freeze**: the team stops shipping features and spends the cycle on reliability until the window resets.
+
+That's what gives "reliability" teeth instead of vibes, and the whole chain is one line: `handleError` mints the incident → the structured log + metric feed the SLI → the SLI burns the error budget → the burn-rate alert fires → the policy says *ship* or *freeze*. Chapter 63 builds the measurement; this is the policy that consumes it.
+
+### Close the loop: the error ID is the thread
+
+One wiring detail turns three pillars into a single click: the `errorId` from Lesson 56.1 should *be* the request id (and trace id) from Chapter 63, not a fresh unrelated UUID. Mint it once in `handle`, stash it on `event.locals`, and have `handleError` reuse it:
+
+```ts
+// in handleError, instead of a fresh UUID:
+const errorId = event.locals.requestId ?? crypto.randomUUID();
+```
+
+Now *"Error ID `f3a1`"* on the apology page → the on-call's `grep f3a1` → the full distributed trace is one lookup. The user, the log, and the trace all speak the same id.
 
 ---
 
@@ -348,11 +507,16 @@ After Chapter 56 you can:
 | Term | Definition |
 |---|---|
 | `handleError` | Hook for unexpected errors; never throws. |
-| error ID | UUID minted per incident, returned to user + logged. |
+| error ID | UUID minted per incident, returned to user + logged; ideally the request/trace id. |
 | redaction | Stripping PII before logging. |
 | `<svelte:boundary>` | Svelte 5 element that catches render-time errors locally. |
 | `failed` snippet | The fallback UI inside a boundary. |
 | failure budget | Maximum tolerable error rate over a window. |
+| error-budget policy | The pre-agreed action when the budget burns: page, then feature-freeze. |
+| backoff + jitter | Doubling, randomised retry delays; avoids hammering and the herd. |
+| thundering herd | Synchronised retries that re-down a just-recovered dependency. |
+| circuit breaker | Trips open after repeated failures; fails fast for a cooldown. |
+| graceful degradation | A reduced-but-working experience when a non-critical dependency fails. |
 
 ---
 
@@ -363,6 +527,9 @@ After Chapter 56 you can:
 - [ ] You wrapped the habit list in a `<svelte:boundary>`.
 - [ ] `+error.svelte` renders inside the layout chrome.
 - [ ] You can articulate why `error.message` should never be returned verbatim to the user.
+- [ ] Every external call has a timeout, and flaky ones retry with backoff + jitter — *only when idempotent*.
+- [ ] A down dependency trips a circuit breaker and degrades gracefully instead of cascading.
+- [ ] You can state Streak's error-budget policy (page → feature-freeze) and how the error ID threads to the trace.
 
 ---
 
