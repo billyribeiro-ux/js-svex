@@ -4061,7 +4061,7 @@ Wire it into the page's load and action:
 ```ts
 // src/routes/(app)/dashboard/+page.server.ts
 import { error } from '@sveltejs/kit';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { dbPrimary } from '$lib/db/client';
 import { pinPrimaryAfterWrite, readDb } from '$lib/db/route';
 import { habits } from '$lib/db/schema';
@@ -4085,10 +4085,12 @@ export const actions: Actions = {
     if (!user) error(401, 'not authenticated');
     const data = await event.request.formData();
     const id = String(data.get('id'));
-    // Writes always hit the primary (Rule 11: atomic UPDATE, owner-scoped).
+    const done = data.get('done') === 'true'; // explicit desired state, not a flip
+    // Writes always hit the primary (Rule 11: atomic, owner-scoped; Rule 12:
+    // idempotent — a retry writes the same value, so double-submits can't race).
     await dbPrimary
       .update(habits)
-      .set({ doneToday: sql`NOT ${habits.doneToday}` })
+      .set({ doneToday: done })
       .where(and(eq(habits.id, id), eq(habits.userId, user.id)));
     pinPrimaryAfterWrite(event); // open the read-your-writes window
     return { success: true };
@@ -4117,7 +4119,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 };
 ```
 
-Now the per-action call is belt-and-braces, not load-bearing — and remote `command`s, which POST, are covered for free (including Appendix A's `toggleHabit`). The rule of thumb: when correctness depends on *remembering*, move it to a choke-point where forgetting is impossible.
+Now the per-action call is belt-and-braces, not load-bearing — and remote `command`s, which POST, are covered for free (including Appendix A's `setHabitDone`). The rule of thumb: when correctness depends on *remembering*, move it to a choke-point where forgetting is impossible.
 
 ### Prove it (Rule 21)
 
@@ -4223,6 +4225,59 @@ What you buy: precision (the replica is used the *instant* it's safe, not a flat
 ### Mind the pooler mode
 
 One infrastructure detail decides which of these even work: the pooler's **mode**. The serverless-friendly setting is `pool_mode = transaction` (PgBouncer) — a connection is lent per *transaction*, not per *session* — and it quietly disables everything session-scoped: server-side prepared statements, `SET`, advisory locks, and `LISTEN`/`NOTIFY`. The good news: every probe in this lesson is a single self-contained `SELECT` (`pg_last_wal_replay_lsn()`, the lag query), so they're safe under transaction pooling. The trap: a `query.live` (Appendix A) built on `LISTEN`/`NOTIFY` will *not* survive a transaction pooler — it needs a held session, so point that one path at the unpooled (direct) URL or a session-mode pool. Know your pool mode before you design the realtime path; finding out in production is the expensive way.
+
+### The write must be idempotent too
+
+Read-your-writes makes the *read* honest. But look again at the write — the obvious toggle is `SET done_today = NOT done_today`, and that's a second latent bug wearing the same disguise: it *derives new state from old state it had to read first.* On a flaky mobile network the client retries, the `UPDATE` runs twice, and the habit flips back. Two tabs fire at once and they race. The value compiles, demos clean, and corrupts under exactly the conditions a replica exists to handle — scale and retries.
+
+The fix is the same instinct as read-your-writes: **don't depend on state you can be wrong about.** Send the *explicit desired state*, not an instruction to flip:
+
+```ts
+.set({ doneToday: done })   // idempotent — not: sql`NOT ${habits.doneToday}`
+```
+
+Now applying the write once or five times lands the same value, so at-least-once delivery is safe and concurrent submits can't interleave into garbage (Rule 12). For effects you *can't* re-assert — charging a card, sending an email — idempotency needs a key instead of an explicit value; that pattern is in Appendix A (*"Idempotent commands, authorized refreshes, and live cleanup"*). The throughline: **Rule 11 makes one write atomic, idempotency makes a repeated write safe, and read-your-writes makes the following read honest — three guarantees, one correct mutation.**
+
+### The flow, drawn
+
+The whole mechanism on one diagram — the cookie is the thread that ties a write to the next read:
+
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant H as hooks.server.ts
+  participant P as Primary (iad1)
+  participant R as Replica
+  B->>H: POST toggle (done=true)
+  H->>P: UPDATE … SET done_today = true
+  P-->>H: ok
+  H-->>B: 200 + Set-Cookie rw_fresh=now+5s
+  Note over B,R: within the 5s window
+  B->>H: GET dashboard (sends rw_fresh)
+  H->>P: readDb → primary (window open)
+  P-->>B: done_today = true ✓
+  Note over B,R: after the window
+  B->>H: GET dashboard (cookie expired)
+  H->>R: readDb → replica (scale win)
+  R-->>B: done_today = true (replica caught up)
+```
+
+### The invariant, stated (and the clock-skew caveat)
+
+Strip the lesson to one sentence you can paste into a code comment and check in review:
+
+> **Invariant:** a session reads the primary for every request within `STICKY_MS` of its last write; therefore it never observes a value older than its own most recent write.
+
+Stating it surfaces the assumption underneath: the window is *wall-clock* time, set on one serverless instance and checked on another. Across instances and regions, clocks skew — usually milliseconds, occasionally seconds. Two consequences, a sentence each: the *effective* window is `STICKY_MS − skew`, so keep `STICKY_MS` comfortably above both replication lag *and* your fleet's skew; and the moment you'd compare absolute timestamps from two machines you're trusting NTP — which is precisely why the LSN tier, comparing positions in a single log, is the skew-free one.
+
+### When the primary is down (degraded mode)
+
+Read-your-writes is a *consistency* story; availability is the other axis (back to PACELC). Decide the failure posture *before* the incident, not during it:
+
+- **Primary down → writes fail fast.** Rule 13's timeouts make "fail fast" real instead of a 30 s hang. There's no safe write without the primary, so surface the error — never queue it silently and pretend it landed.
+- **Primary down → reads may degrade to the replica.** Stale-but-up usually beats consistent-but-down for a read path — but that's a *product* call, so make it on purpose: a read-only banner beats a white screen. The one thing you don't do is fail reads just because writes failed.
+
+Naming the posture turns a 3 a.m. scramble into a runbook line.
 
 ### Where it ties back
 
@@ -4891,10 +4946,10 @@ The flag pair is required because remote functions use top-level `await` in mark
 - **`query.batch(schema, fn)`** — the N+1 killer. The server receives the *array* of args collected within a macrotask and returns a lookup function `(arg) => result`. Each call site still `await`s a single value; the round-trips collapse to one.
 - **`query.live(fn)`** — pass an **async generator**; every `yield` pushes a new value to all subscribers. `await` it like a query, plus `.connected` (is the stream live?) and `.reconnect()`. Auto-reconnects on drop. This is the real-time primitive.
 - **`form(schema, fn)`** — replaces a form action. Spread it onto `<form {...addHabit}>`; build inputs from typed accessors `addHabit.fields.name.as('text')` (and `.as('submit', 'value')` for multi-button forms). Read/write values with `.value()` / `.set({...})`, validate with `.validate()`, and customise submission with `.enhance(async (form) => { if (await form.submit()) … })` — note the callback now receives the **form instance**.
-- **`command(schema, fn)`** — imperative mutation called straight from an event handler (`await toggleHabit(id)`). No automatic revalidation; you drive the re-read with the **single-flight** `.updates(...)` pattern so the mutation and the refresh share one round-trip.
+- **`command(schema, fn)`** — imperative mutation called straight from an event handler (`await setHabitDone({ id, done })`). No automatic revalidation; you drive the re-read with the **single-flight** `.updates(...)` pattern so the mutation and the refresh share one round-trip.
 - **`prerender(schema?, fn, { inputs })`** — like `query`, but resolved at *build* time for the listed `inputs`. Static data, zero per-request cost; the right tool for content that doesn't change between deploys.
 
-> **single-flight update** *(noun)* — telling a mutation, in the same request, which queries to re-read, so the browser doesn't fire the write and *then* a second request to refresh. `await toggleHabit(id).updates(getHabits())` mutates and re-reads in one flight. Pair it with `.withOverride(...)` for an instant optimistic paint that the server reconciles or rolls back.
+> **single-flight update** *(noun)* — telling a mutation, in the same request, which queries to re-read, so the browser doesn't fire the write and *then* a second request to refresh. `await setHabitDone({ id, done }).updates(getHabits())` mutates and re-reads in one flight. Pair it with `.withOverride(...)` for an instant optimistic paint that the server reconciles or rolls back.
 
 ---
 
@@ -4909,7 +4964,7 @@ import { error } from '@sveltejs/kit';
 import * as v from 'valibot';
 import { db } from '$lib/db/client';
 import { habits } from '$lib/db/schema';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { addHabitForUser } from '$lib/habits-server';
 
 // One place to read auth. `error()` short-circuits with a real HTTP status
@@ -4937,23 +4992,29 @@ export const addHabit = form(
   },
 );
 
-export const toggleHabit = command(v.string(), async (id) => {
-  const user = requireUser();
-  // Atomic UPDATE … (Rule 11): flip the flag in the database, never
-  // SELECT-then-write. The `and(...)` scopes it to the owner — a user can't
-  // toggle someone else's habit even if they forge the id.
-  await db
-    .update(habits)
-    .set({ doneToday: sql`NOT ${habits.doneToday}` })
-    .where(and(eq(habits.id, id), eq(habits.userId, user.id)));
-});
+// Idempotent by construction (Rule 11 + Rule 12): the client sends the
+// *explicit desired state*, not "flip whatever's there". A network retry or a
+// double-tap converges to the same row — there's no read-modify-write to race,
+// and no `SET done = NOT done` whose basis a concurrent toggle could clobber.
+// The `and(...)` scopes it to the owner — a user can't write someone else's
+// habit even if they forge the id.
+export const setHabitDone = command(
+  v.object({ id: v.string(), done: v.boolean() }),
+  async ({ id, done }) => {
+    const user = requireUser();
+    await db
+      .update(habits)
+      .set({ doneToday: done })
+      .where(and(eq(habits.id, id), eq(habits.userId, user.id)));
+  },
+);
 ```
 
 In the page:
 
 ```svelte
 <script lang="ts">
-  import { getHabits, addHabit, toggleHabit } from './habits.remote';
+  import { getHabits, addHabit, setHabitDone } from './habits.remote';
 </script>
 
 <h1>Today</h1>
@@ -4973,7 +5034,7 @@ In the page:
       <button
         type="button"
         onclick={() =>
-          toggleHabit(habit.id).updates(
+          setHabitDone({ id: habit.id, done: !habit.doneToday }).updates(
             getHabits().withOverride((list) =>
               list.map((h) =>
                 h.id === habit.id ? { ...h, doneToday: !h.doneToday } : h,
@@ -4988,7 +5049,7 @@ In the page:
 </ul>
 ```
 
-The toggle is the part worth studying. `toggleHabit(habit.id)` is the command; `.updates(getHabits()...)` tells SvelteKit to re-read the list in the same round-trip; `.withOverride(...)` paints the flip *immediately* on the client and auto-rolls-back if the command throws. That `withOverride` is **read-your-writes on the client** — the in-browser twin of the read-after-write problem you solve on the server in Lesson 65.5a. Same shape, two layers: show the user their own write instantly, reconcile with the truth a beat later.
+The toggle is the part worth studying. `setHabitDone({ id, done })` is the command — and notice it sends the **explicit next state**, not "flip it". That's deliberate: a blind flip is a read-modify-write, so a retry or a double-tap double-flips and two tabs race (the full argument is in Lesson 65.5a, *"The write must be idempotent too"*). `.updates(getHabits()...)` re-reads the list in the same round-trip; `.withOverride(...)` paints the change *immediately* on the client and auto-rolls-back if the command throws. That `withOverride` is **read-your-writes on the client** — the in-browser twin of the read-after-write problem you solve on the server in Lesson 65.5a. Same shape, two layers: show the user their own write instantly, reconcile with the truth a beat later.
 
 Compared to the stable story, you save:
 - The separate `+page.server.ts`.
@@ -5170,6 +5231,68 @@ export const getFaq = prerender(async () => {
 ```
 
 `await getFaq()` in markup reads like any query, but in production there's no round-trip — it was baked in. For parameterised static data (a blog post per slug), pass a schema and an `inputs` list so SvelteKit knows which arguments to bake at build.
+
+### Idempotent commands, authorized refreshes, and live cleanup
+
+Three habits separate a toy command from a production one.
+
+**Idempotency for external effects (Rule 12).** `setHabitDone` is idempotent because it writes an explicit state. But a command that *charges a card* or *sends an email* can't lean on that — the effect isn't a database value you can re-assert, it's an irreversible action. Make the client mint a key once per intent and gate the effect on a unique insert:
+
+```ts
+export const buyFreeze = command(
+  v.object({ key: v.pipe(v.string(), v.uuid()) }),
+  async ({ key }) => {
+    const user = requireUser();
+    const inserted = await db
+      .insert(processedCommands)
+      .values({ key, userId: user.id })
+      .onConflictDoNothing()
+      .returning({ key: processedCommands.key });
+    if (inserted.length === 0) return; // replay — the effect already happened
+    await grantFreeze(user.id);         // the irreversible part runs at most once
+  },
+);
+```
+
+The unique `key` is the dedup gate: a retried request finds the row taken, inserts nothing, and skips the effect. Exactly-once, even though the network only ever promises at-least-once.
+
+**Authorize the refreshes a client can request.** `.updates(...)` lets the *client* ask the server to refresh queries in the same flight — which means a hostile client can ask it to refresh expensive ones, repeatedly. The server-side `requested(query, limit)` is the allow-list: it honours requested refreshes only for queries you name, and only up to `limit`.
+
+```ts
+import { command, requested } from '$app/server';
+
+export const addHabitLive = command(
+  v.object({ name: v.pipe(v.string(), v.trim(), v.minLength(1)) }),
+  async ({ name }) => {
+    const user = requireUser();
+    await addHabitForUser(user.id, name);
+    // Honour the client's requested refreshes — but only for getHabits, and at
+    // most one. The client cannot make us refresh arbitrary or costly queries.
+    await requested(getHabits, 1).refreshAll();
+  },
+);
+```
+
+**Clean up live queries.** A `query.live` generator holds resources — a `LISTEN` connection, a timer. When the last subscriber disconnects, SvelteKit calls `.return()` on the generator, so a `try/finally` is where you release them. Skip it and every dropped tab leaks a connection:
+
+```ts
+export const completedToday = query.live(async function* () {
+  // const channel = await openNotifyChannel();
+  try {
+    while (true) {
+      const rows = await db.execute<{ n: number }>(
+        sql`SELECT count(*)::int AS n FROM habits WHERE done_today = true`,
+      );
+      yield rows.at(0)?.n ?? 0;
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+    }
+  } finally {
+    // await channel.close(); // runs on disconnect — no per-tab leak
+  }
+});
+```
+
+These three are the gap between "works in the demo" and "survives a retrying mobile client on a flaky network" — which is the only environment that actually ships.
 
 ### Testing remote functions
 
