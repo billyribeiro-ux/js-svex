@@ -3931,6 +3931,10 @@ The user did everything right. The primary did everything right. The replica did
 
 The pooled `DATABASE_URL` from Lesson 62.3 is the accomplice. Abstracting *which* backend serves a connection is the whole point of a pooler — but that same abstraction means your read code has **no idea** whether it just talked to the primary or a replica. Looks finished; isn't. The cure is to make the read/write split *explicit and deliberate*, per request — not a thing the proxy decides for you behind a curtain.
 
+### Name the theory (PACELC)
+
+This isn't a SvelteKit quirk; it's a law with a name. CAP says that when the network **P**artitions, you must choose **A**vailability *or* **C**onsistency. PACELC adds the half that bites on every ordinary day when there's *no* partition: **E**lse, you trade **L**atency for **C**onsistency. A read replica is a standing PACELC bet — you bought latency (cheap, nearby reads) by spending consistency (the replica lags). Naming it keeps you honest: the three fixes below aren't bug-patches, they're you *re-buying* exactly as much consistency as the UX needs, exactly where it needs it, and nowhere else.
+
 ### The three fixes, ranked
 
 1. **Read-your-writes via sticky primary (the default).** After any write, route *that user's* reads to the primary for a short window. Cheap, correct for the common case; you forfeit the replica's benefit only briefly and only for the one user who just wrote.
@@ -4014,6 +4018,43 @@ Read aloud:
 | `pinPrimaryAfterWrite(event)` | *"This user just wrote; route their reads to the primary for the next few seconds."* |
 | `Date.now() < until` | *"Are we still inside the freshness window?"* |
 | `sameSite: 'lax'` | *"The cookie rides along on top-level navigations — exactly the reads that follow a write."* |
+
+### Make the rule testable
+
+The flip is a *timing* bug, so an end-to-end test of it needs a clock and a database. But the *decision* — "are we still inside the window?" — is pure. Pull it out so it can be unit-tested in microseconds, with no I/O:
+
+```ts
+// src/lib/db/freshness.ts
+// Pure decision, no I/O — unit-testable without a database or SvelteKit.
+export function shouldUsePrimary(nowMs: number, freshUntilMs: number): boolean {
+  return nowMs < freshUntilMs;
+}
+```
+
+`readDb` calls it instead of inlining the comparison:
+
+```ts
+return shouldUsePrimary(Date.now(), until) ? dbPrimary : dbReplica;
+```
+
+Now the rule has a fast, deterministic test, and the slow "inject lag and watch" run below is reserved for the *wiring* a unit test can't reach:
+
+```ts
+// src/lib/db/freshness.test.ts
+import { describe, expect, it } from 'vitest';
+import { shouldUsePrimary } from './freshness';
+
+describe('shouldUsePrimary', () => {
+  it('reads the primary inside the freshness window', () => {
+    expect(shouldUsePrimary(1_000, 5_000)).toBe(true);
+  });
+  it('falls back to the replica once the window has closed', () => {
+    expect(shouldUsePrimary(5_000, 5_000)).toBe(false);
+  });
+});
+```
+
+Separating the pure rule from the cookie plumbing is the same instinct as Rule 11's atomic write: make the part that *must* be correct small enough to prove correct.
 
 Wire it into the page's load and action:
 
@@ -4140,6 +4181,48 @@ Sticky-primary is the right default, not a silver bullet. Name its limits before
 - **Logged-out and shared reads always take the replica.** Public pages set no cookie, so they read the replica and may lag. Correct — they aren't anybody's *own* writes — but don't put a freshly-written, not-yet-replicated value on one and act surprised.
 - **Sustained lag > the window re-opens the bug.** If the replica trails more than `STICKY_MS`, the window closes before it catches up and the flip returns. That's no longer silent, though — it's the alert above. The mitigation is mechanical: widen the window or route reads back to the primary until lag recovers.
 - **The window is a cost.** Every write parks that user on the primary for 5 s, so a write-heavy user gets little replica benefit. Fine for Streak (writes are rare and bursty); measure it before assuming it for a write-heavy workload.
+
+### The exact tier: LSN-wait (when sticky isn't enough)
+
+Sticky-primary trades a little precision for a lot of simplicity — a flat 5 s window, whether the replica caught up in 30 ms or is still behind at 6 s. When you need *exactly* read-your-writes — no window to outrun, and correctness that can cross devices — wait on the write's **log position** instead. Postgres exposes it: stamp `pg_current_wal_lsn()` after the write, and read from the replica only once `pg_last_wal_replay_lsn()` has passed it.
+
+```ts
+// src/lib/db/causal.ts
+import type { RequestEvent } from '@sveltejs/kit';
+import { sql } from 'drizzle-orm';
+import { dbPrimary, dbReplica } from './client';
+
+const LSN_COOKIE = 'rw_lsn';
+
+// After a write: stamp the primary's current WAL position on the session.
+// Carry it in a cookie (per-browser) or a response header (cross-device API).
+export async function stampWriteLsn(event: RequestEvent): Promise<void> {
+  const rows = await dbPrimary.execute<{ lsn: string }>(
+    sql`SELECT pg_current_wal_lsn()::text AS lsn`,
+  );
+  const lsn = rows.at(0)?.lsn;
+  if (lsn) {
+    event.cookies.set(LSN_COOKIE, lsn, { path: '/', httpOnly: true, sameSite: 'lax', maxAge: 30 });
+  }
+}
+
+// On read: use the replica only once it has replayed *past* the user's last
+// write. Exact read-your-writes — no fixed time window to tune or outrun.
+export async function readDbCausal(event: RequestEvent) {
+  const lsn = event.cookies.get(LSN_COOKIE);
+  if (!lsn) return dbReplica;
+  const rows = await dbReplica.execute<{ caught_up: boolean }>(
+    sql`SELECT pg_wal_lsn_diff(pg_last_wal_replay_lsn(), ${lsn}::pg_lsn) >= 0 AS caught_up`,
+  );
+  return rows.at(0)?.caught_up ? dbReplica : dbPrimary;
+}
+```
+
+What you buy: precision (the replica is used the *instant* it's safe, not a flat 5 s later) and cross-device correctness *if the LSN travels with the request* — a cookie keeps it per-browser; a header or token carries it between devices. What you pay: an extra round-trip to check `caught_up`, and a read that falls back to the primary whenever the replica is behind. For Streak, sticky-primary is enough; reach for this when *"I changed it on my phone, why is my laptop stale?"* becomes a real ticket.
+
+### Mind the pooler mode
+
+One infrastructure detail decides which of these even work: the pooler's **mode**. The serverless-friendly setting is `pool_mode = transaction` (PgBouncer) — a connection is lent per *transaction*, not per *session* — and it quietly disables everything session-scoped: server-side prepared statements, `SET`, advisory locks, and `LISTEN`/`NOTIFY`. The good news: every probe in this lesson is a single self-contained `SELECT` (`pg_last_wal_replay_lsn()`, the lag query), so they're safe under transaction pooling. The trap: a `query.live` (Appendix A) built on `LISTEN`/`NOTIFY` will *not* survive a transaction pooler — it needs a held session, so point that one path at the unpooled (direct) URL or a session-mode pool. Know your pool mode before you design the realtime path; finding out in production is the expensive way.
 
 ### Where it ties back
 
@@ -5007,6 +5090,86 @@ A live query is a **function you call** to get the subscription resource — the
 ```
 
 That `completedToday()` call — not a bare `completedToday` — is exactly the kind of slip the type-checker catches instantly (`Property 'connected' does not exist on type 'RemoteLiveQueryFunction'`), which is the segue to the last point. It auto-reconnects on drop; `.reconnect()` is there if you want a manual retry button.
+
+### Every remote function is a public endpoint
+
+The convenience hides a sharp edge: each remote function compiles to a real, callable HTTP endpoint. An attacker doesn't go through your component — they `POST` to the generated URL with any payload they like. So two things are non-negotiable on the *server* side of every function:
+
+1. **Validate the argument.** The Standard Schema (valibot/zod) you pass isn't decoration — it's the only thing between the endpoint and malformed input. A function with no schema accepts anything.
+2. **Authorize inside the function.** `getRequestEvent().locals.user` is the gate; never assume the caller is who the UI implies. The `requireUser()` helper from A.3 belongs at the top of *every* mutating function.
+
+Put differently: remote functions move the *call* into your component, but the *trust boundary* stays exactly where it always was — at the server. Treat them like the public API they are.
+
+### Validation and surfacing errors
+
+Field validation has two layers. The schema rejects structurally bad input automatically. For checks only the server can do — uniqueness, ownership, "you don't have enough hotcakes" — throw a typed issue with `invalid()` and the handler's second `issue` parameter:
+
+```ts
+// src/routes/(app)/dashboard/habits-extra.remote.ts
+import { form, getRequestEvent } from '$app/server';
+import { error, invalid } from '@sveltejs/kit';
+import * as v from 'valibot';
+import { and, eq } from 'drizzle-orm';
+import { db } from '$lib/db/client';
+import { habits } from '$lib/db/schema';
+
+function requireUser() {
+  const { locals } = getRequestEvent();
+  if (!locals.user) error(401, 'Unauthorized');
+  return locals.user;
+}
+
+export const renameHabit = form(
+  v.object({
+    id: v.string(),
+    name: v.pipe(v.string(), v.trim(), v.minLength(1, 'Name required'), v.maxLength(100)),
+  }),
+  async ({ id, name }, issue) => {
+    const user = requireUser();
+    // A server-only check the client schema can't do: uniqueness.
+    const clash = await db
+      .select()
+      .from(habits)
+      .where(and(eq(habits.userId, user.id), eq(habits.name, name)));
+    if (clash.length > 0) {
+      invalid(issue.name('You already have a habit with that name'));
+    }
+    await db
+      .update(habits)
+      .set({ name })
+      .where(and(eq(habits.id, id), eq(habits.userId, user.id)));
+  },
+);
+```
+
+`invalid()` is imported from `@sveltejs/kit`, **not** `$app/server` — a real gotcha, and exactly the kind the type-checker catches in one line. It stops the submission and routes the message to the matching field. The form renders per-field issues with `fields.x.issues()` and form-wide ones with `fields.allIssues()`:
+
+```svelte
+<form {...renameHabit}>
+  <input {...renameHabit.fields.name.as('text')} value={name} />
+  {#each renameHabit.fields.name.issues() as issue}
+    <p class="error">{issue.message}</p>
+  {/each}
+  <button type="submit">Save</button>
+</form>
+```
+
+The split that matters: `error(...)` is for *exceptional* failures (unauthorized, not-found) and surfaces at an error boundary; `invalid(...)` is for *expected* validation outcomes and surfaces next to the input. Reaching for `error()` where you meant `invalid()` turns a routine "name taken" into a scary error page. (And note the issues `{#each}` is unkeyed — issues are short-lived objects with no stable id, the documented Lesson 5.3 exception.)
+
+### `prerender`: data fixed at build time
+
+When the answer doesn't change between deploys — marketing copy, an FAQ, a docs index — `prerender` resolves it once at build and serves it with zero per-request work:
+
+```ts
+export const getFaq = prerender(async () => {
+  return [
+    { q: 'What is a streak?', a: 'Consecutive days you completed a habit.' },
+    { q: 'Do freezes reset it?', a: 'No — a freeze preserves the streak for one missed day.' },
+  ];
+});
+```
+
+`await getFaq()` in markup reads like any query, but in production there's no round-trip — it was baked in. For parameterised static data (a blog post per slug), pass a schema and an `inputs` list so SvelteKit knows which arguments to bake at build.
 
 ### Testing remote functions
 
