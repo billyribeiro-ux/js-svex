@@ -3937,6 +3937,14 @@ The pooled `DATABASE_URL` from Lesson 62.3 is the accomplice. Abstracting *which
 2. **Bounded staleness (where lag is acceptable).** Reads that don't follow a write take the replica and tolerate, say, ≤ 1 s of lag. Document the bound — it's a product decision, not an accident.
 3. **Causal / LSN wait (advanced).** Capture the write's log position (LSN) and make the read *wait* until the replica reaches it. Strongest guarantee, most plumbing; reach for it only when the sticky window isn't precise enough.
 
+Side by side, so you can defend the choice in review:
+
+| Fix | Guarantee it buys | Cost | Complexity | Reach for it when |
+|---|---|---|---|---|
+| **Sticky primary** | read-your-writes, per session | brief primary load, only for the user who just wrote | low — one cookie | the default; any read that can follow the user's own write (toggle, add, rename) |
+| **Bounded staleness** | eventual, lag ≤ *N* | none — full replica scale | low — just don't pin | reads that never follow *your* write: public pages, other users' data, timer-refreshed dashboards |
+| **LSN wait** | read-your-writes, exact & cross-device | the read blocks until the replica catches up | high — capture + compare log positions | the sticky window is too coarse, or correctness must survive a second device |
+
 For Streak, #1 is the right altitude. Here it is.
 
 ### The implementation
@@ -4047,6 +4055,29 @@ export const actions: Actions = {
 };
 ```
 
+### Remove the footgun: make the safe path the default
+
+That action works, but it leans on a human remembering to call `pinPrimaryAfterWrite` on *every* write — a new action, a remote `command`, a webhook that mutates a row. Miss it once and the stale read silently returns. A principal engineer doesn't trust the human; they make the safe thing automatic. Pin on *any* successful non-GET, once, in `hooks.server.ts`:
+
+```ts
+// src/hooks.server.ts
+import type { Handle } from '@sveltejs/kit';
+import { pinPrimaryAfterWrite } from '$lib/db/route';
+
+// Make the safe path the default: any non-GET that succeeds opens the
+// read-your-writes window automatically, so an individual handler can never
+// forget to call pinPrimaryAfterWrite and silently re-introduce the stale read.
+export const handle: Handle = async ({ event, resolve }) => {
+  const response = await resolve(event);
+  if (event.request.method !== 'GET' && response.ok) {
+    pinPrimaryAfterWrite(event);
+  }
+  return response;
+};
+```
+
+Now the per-action call is belt-and-braces, not load-bearing — and remote `command`s, which POST, are covered for free (including Appendix A's `toggleHabit`). The rule of thumb: when correctness depends on *remembering*, move it to a choke-point where forgetting is impossible.
+
 ### Prove it (Rule 21)
 
 You cannot unit-test your way to confidence here — the bug only exists *in time*. Manufacture the lag and watch:
@@ -4056,11 +4087,108 @@ You cannot unit-test your way to confidence here — the bug only exists *in tim
 3. **Re-enable the fix.** Toggle again. The read now comes from the primary inside the 5 s window; the checkmark stays. *Visible win.*
 4. Remove the artificial delay. Ship.
 
+### Catch it in prod, not just in dev
+
+Dev proves the fix works; production tells you when the *assumption underneath it* — "lag stays under the 5 s window" — stops holding. Sticky-primary is only correct while `replication_lag < STICKY_MS`. So measure the lag and alert the instant it crosses the window. Add a gauge (Rule 14: one bounded series) fed by a cheap probe:
+
+```ts
+// src/lib/db/replication.ts
+import { Gauge } from 'prom-client';
+import { sql } from 'drizzle-orm';
+import { dbReplica } from './client';
+
+// Rule 14: bounded labels. One series, no per-request cardinality.
+export const replicationLagSeconds = new Gauge({
+  name: 'db_replication_lag_seconds',
+  help: 'Seconds the read replica trails the primary (0 on the primary itself).',
+});
+
+// Cheap probe: ask the replica how far behind it has replayed. Run it from the
+// metrics scrape or a 30 s cron — never per request. On the primary,
+// pg_last_xact_replay_timestamp() is NULL, which we report as 0.
+export async function measureReplicationLag(): Promise<number> {
+  const rows = await dbReplica.execute<{ lag: number | null }>(
+    sql`SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::float8 AS lag`,
+  );
+  const lag = rows.at(0)?.lag ?? 0;
+  replicationLagSeconds.set(lag);
+  return lag;
+}
+```
+
+The alert then *derives its threshold from the fix's own constant* — that's the bit that makes it senior, not decorative:
+
+```yaml
+# The sticky window is STICKY_MS = 5 s. The moment the replica trails further
+# than that, read-your-writes is no longer guaranteed — page, don't email.
+- alert: ReplicationLagExceedsStickyWindow
+  expr: db_replication_lag_seconds > 5
+  for: 1m
+  labels: { severity: page }
+  annotations:
+    summary: "Replica lag {{ $value }}s exceeds the 5s read-your-writes window"
+    runbook: "Widen STICKY_MS, or shed replica reads back to primary until lag recovers."
+```
+
+This is the four-golden-signals discipline from Ch 63 pointed at a *correctness* signal, not just latency: the metric that fires is the one whose breach silently breaks a guarantee.
+
+### The fix has its own edges
+
+Sticky-primary is the right default, not a silver bullet. Name its limits before a reviewer — or an incident — does:
+
+- **It's per-browser.** Write on your phone, read on your laptop a second later, and the laptop can still see stale data — the cookie that proves "you just wrote" lives on the phone. That's *acceptable* by definition (read-your-writes is a per-session promise), but say it out loud; if you need cross-device freshness, that's the LSN-wait row of the table, not this one.
+- **Logged-out and shared reads always take the replica.** Public pages set no cookie, so they read the replica and may lag. Correct — they aren't anybody's *own* writes — but don't put a freshly-written, not-yet-replicated value on one and act surprised.
+- **Sustained lag > the window re-opens the bug.** If the replica trails more than `STICKY_MS`, the window closes before it catches up and the flip returns. That's no longer silent, though — it's the alert above. The mitigation is mechanical: widen the window or route reads back to the primary until lag recovers.
+- **The window is a cost.** Every write parks that user on the primary for 5 s, so a write-heavy user gets little replica benefit. Fine for Streak (writes are rare and bursty); measure it before assuming it for a write-heavy workload.
+
 ### Where it ties back
 
 - **Rule 11** gets the write right *on the primary*. This lesson gets the read right *across the replica*. They are two halves of one guarantee; one without the other still ships a visible bug.
 - **Appendix A's `withOverride`** is the same idea one layer up — read-your-writes *in the browser*. Server and client both owe the user the sight of their own write; the server reconciles, the client paints instantly.
-- **Update the ADR.** When you add the replica (next lesson's format), the consequences section must record the consistency requirement, not just the capacity gain — otherwise the next engineer re-introduces the flip the first time they add a "fast" replica read.
+- **Record the decision (ADR-006, below).** When you add the replica, the consequences section must capture the *consistency requirement*, not just the capacity gain — otherwise the next engineer re-introduces the flip the first time they add a "fast" replica read.
+
+### The decision, recorded (ADR-006)
+
+The replica constrains every future read, so it earns an ADR (Lesson 65.6 has the format). The consequences section is the load-bearing part — it's what stops the regression a year from now:
+
+```markdown
+# ADR-006: Read replica for API reads, with read-your-writes via sticky primary
+
+- **Status:** Accepted
+- **Date:** 2026-06-04
+- **Deciders:** @billy, @reviewer
+
+## Context
+At ~100k users the connection pool peaks near exhaustion (Lesson 65.5). The
+`/api/v1/habits` GET path is high-volume and read-only. A read replica relieves
+the primary — but it is asynchronously replicated, so a naive replica read can
+serve a value older than the requester's own just-committed write.
+
+## Decision
+Add one read replica. Route reads through `readDb(event)`: the primary for a
+5 s window after any write by that session (a cookie set in `hooks.server.ts`
+on every successful non-GET), the replica otherwise. Writes always target the
+primary.
+
+## Alternatives considered
+1. **Replica for all reads, no pinning.** Rejected — re-introduces the
+   read-after-write flip in the core toggle/add UX.
+2. **LSN-wait on every read.** Rejected for now — cross-device correctness we
+   don't yet need, paid for with reads that block on replica catch-up.
+3. **No replica, scale the primary vertically.** Rejected — doesn't bound the
+   connection ceiling capacity planning flagged as the first failure mode.
+
+## Consequences
+- **Enables:** replica-scale reads without surrendering read-your-writes in the UX.
+- **Constrains:** correctness now *depends* on `replication_lag < STICKY_MS`.
+  Monitored via `db_replication_lag_seconds`; paged via
+  `ReplicationLagExceedsStickyWindow`. Revisit `STICKY_MS` if p99 lag climbs.
+- **Out of scope:** cross-device freshness — revisit with LSN-wait only if a
+  real multi-device "I just changed this" complaint lands.
+
+## References
+- Lesson 65.5a (read-after-write consistency); Ch 63 (golden signals).
+```
 
 ---
 
@@ -4797,7 +4925,99 @@ You lose:
 
 ---
 
-## A.4 — When to adopt
+## A.4 — Beyond the basics: migration, batch, live, testing
+
+### The migration map
+
+If you already think in the stable story, you already think in remote functions — they rename pieces you know:
+
+| Stable story | Remote function | Note |
+|---|---|---|
+| `load` in `+page.server.ts` | `query()` | `await` it directly in markup; deduped per render |
+| `actions` (a `<form>`) | `form()` | spread it; build inputs from `fields.x.as(...)` |
+| imperative `POST` to `+server.ts` + `fetch` | `command()` | `await` it from an event handler |
+| `+server.ts` `GET` (read JSON) | `query()` | one function serves the component; no hand-written endpoint |
+| `load` for content fixed at build | `prerender()` | resolved at build for the listed `inputs` |
+| polling / SSE / websocket read | `query.live()` | an async generator; auto-reconnects |
+| `invalidate()` / manual refetch | `.refresh()` or mutation `.updates(...)` | single-flight |
+| optimistic-store gymnastics | `.withOverride(fn)` | auto-rolls-back on failure |
+
+Read the table the other way to *un*-adopt: every remote function has a stable equivalent, so a migration is reversible row by row — which is itself an argument for trying it on one feature.
+
+### Batch: one query for a list (killing the N+1)
+
+The naïve "show each habit's streak" fires one query per habit — 30 habits, 30 round-trips, the **N+1**. `query.batch` collects every call made within a macrotask, hands the server one array, and lets it answer them with a single query:
+
+```ts
+// src/routes/(app)/dashboard/streaks.remote.ts
+import { query } from '$app/server';
+import * as v from 'valibot';
+import { inArray } from 'drizzle-orm';
+import { db } from '$lib/db/client';
+import { streaks } from '$lib/db/schema';
+
+export const getStreak = query.batch(v.string(), async (habitIds: string[]) => {
+  const rows = await db.select().from(streaks).where(inArray(streaks.habitId, habitIds));
+  const byHabit = new Map(rows.map((row) => [row.habitId, row.count]));
+  // Return a resolver: SvelteKit calls it once per original argument.
+  return (habitId: string) => byHabit.get(habitId) ?? 0;
+});
+```
+
+The call site looks exactly like an unbatched query — one `await`, one value — which is the whole point:
+
+```svelte
+{#each habits as habit (habit.id)}
+  <li>{habit.name} — {await getStreak(habit.id)} day streak</li>
+{/each}
+```
+
+Thirty `getStreak(...)` calls collapse to one `SELECT … WHERE habit_id = ANY($1)`. The N+1 is gone, and the call site never learns batching exists.
+
+### Live: server-pushed data, no client polling
+
+`query.live` takes an **async generator**; each `yield` pushes a new value to every subscriber, and the client writes no polling code at all:
+
+```ts
+// src/routes/(app)/dashboard/presence.remote.ts
+import { query } from '$app/server';
+import { sql } from 'drizzle-orm';
+import { db } from '$lib/db/client';
+
+export const completedToday = query.live(async function* () {
+  while (true) {
+    const rows = await db.execute<{ n: number }>(
+      sql`SELECT count(*)::int AS n FROM habits WHERE done_today = true`,
+    );
+    yield rows.at(0)?.n ?? 0;
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+});
+```
+
+A live query is a **function you call** to get the subscription resource — then `await` it for the value and read `.connected` for the stream's health:
+
+```svelte
+<script lang="ts">
+  import { completedToday } from './presence.remote';
+  const today = completedToday();
+</script>
+
+<p>{await today} done today · {today.connected ? 'live' : 'reconnecting…'}</p>
+```
+
+That `completedToday()` call — not a bare `completedToday` — is exactly the kind of slip the type-checker catches instantly (`Property 'connected' does not exist on type 'RemoteLiveQueryFunction'`), which is the segue to the last point. It auto-reconnects on drop; `.reconnect()` is there if you want a manual retry button.
+
+### Testing remote functions
+
+Remote functions are *just server functions*, so test them at two altitudes:
+
+- **Unit-test the logic, not the wrapper.** Factor the body into a plain async function (`async function streaksFor(ids: string[]) { … }`) and unit-test *that* against a test database. The `query.batch(...)` wrapper is SvelteKit's concern, not yours — don't mock `$app/server`.
+- **End-to-end test the wiring.** Use Playwright (Ch 60's harness) to drive the real form/command through a running server — the only layer that honestly exercises `enhance`, `.updates()`, and the HTTP round-trip. A green unit test *plus* a green Playwright run is the runtime evidence Rule 21 demands; a mocked `RequestEvent` is the lie it warns against.
+
+---
+
+## A.5 — When to adopt
 
 **Adopt now** for: side projects; greenfield apps you control end-to-end; teams comfortable with experimental APIs and willing to refactor on minor releases.
 
@@ -4807,7 +5027,7 @@ The senior judgment call: spend an *innovation token* (Ch 65) on remote function
 
 ---
 
-## A.5 — Further reading
+## A.6 — Further reading
 
 - Official SvelteKit Remote Functions docs (live, evolving): `svelte.dev/docs/kit/remote-functions`.
 - The monthly **"What's new in Svelte"** posts (`svelte.dev/blog`) — the June 2026 edition is where the `.run()` removal and the `enhance`-callback change were announced. Read the one for the month you adopt.
