@@ -3123,7 +3123,7 @@ After Chapter 63 you can:
 
 # Chapter 64 — Public REST API, emails, cron
 
-> *Today's job:* Streak has a versioned public REST API at `/api/v1/*` documented in OpenAPI; signups send a real verification email via Resend; a daily cron job sends streak-reminders. *Visible win:* `curl -H "Authorization: Bearer pat_..." https://streak.example.com/api/v1/habits` returns JSON; signing up triggers a real email; tomorrow at 09:00 UTC, cron fires.
+> *Today's job:* Streak has a versioned, **rate-limited** public REST API at `/api/v1/*` documented in OpenAPI; a signature-verified **webhook receiver** ingests provider events exactly-once; signups send a verification email via Resend through a **transactional outbox**; a daily cron job (with an overlap guard) sends streak-reminders. *Visible win:* `curl -H "Authorization: Bearer pat_..." https://streak.example.com/api/v1/habits` returns JSON; a replayed webhook is a no-op; a failed email is retried, never lost; tomorrow at 09:00 UTC, cron fires exactly once.
 
 This is the operational tail of Streak — the last set of capabilities before the principal-engineer chapter and graduation.
 
@@ -3425,6 +3425,60 @@ curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
 
 ---
 
+## Lesson 64.4a — Rate limiting
+
+A public API with no rate limit is a free DDoS amplifier and a runaway-bill machine. Limit per-PAT, return `429` with the standard headers, and — the part people get wrong on serverless — keep the counter in **shared state**.
+
+```ts
+// src/lib/api/rate-limit.ts
+import { sql } from 'drizzle-orm';
+import { dbPrimary } from '$lib/db/client';
+
+export type RateLimitResult = { ok: boolean; limit: number; remaining: number; resetSec: number };
+
+// Fixed-window limiter in shared DB state. In-memory counters would undercount
+// across serverless instances (the same trap as metrics in Lesson 63.5a) — the
+// limit must live somewhere all instances share. One atomic statement, no race.
+export async function rateLimit(key: string, limit: number, windowSec: number): Promise<RateLimitResult> {
+  const rows = await dbPrimary.execute<{ count: number; reset_sec: number }>(sql`
+    INSERT INTO rate_limits (key, window_start, count)
+    VALUES (${key}, now(), 1)
+    ON CONFLICT (key) DO UPDATE SET
+      count = CASE WHEN rate_limits.window_start < now() - make_interval(secs => ${windowSec})
+                   THEN 1 ELSE rate_limits.count + 1 END,
+      window_start = CASE WHEN rate_limits.window_start < now() - make_interval(secs => ${windowSec})
+                          THEN now() ELSE rate_limits.window_start END
+    RETURNING count, CEIL(EXTRACT(EPOCH FROM (window_start + make_interval(secs => ${windowSec})) - now()))::int AS reset_sec
+  `);
+  const count = rows.at(0)?.count ?? 1;
+  const resetSec = rows.at(0)?.reset_sec ?? windowSec;
+  return { ok: count <= limit, limit, remaining: Math.max(0, limit - count), resetSec };
+}
+```
+
+At the top of each `/api/v1/*` handler, after auth:
+
+```ts
+const rl = await rateLimit(`pat:${userId}`, 100, 60); // 100 req/min/token
+if (!rl.ok) {
+  return new Response('Too Many Requests', {
+    status: 429,
+    headers: {
+      'retry-after': String(rl.resetSec),
+      'ratelimit-limit': String(rl.limit),
+      'ratelimit-remaining': String(rl.remaining),
+      'ratelimit-reset': String(rl.resetSec),
+    },
+  });
+}
+```
+
+Three senior points. **(1)** The counter is in Postgres, not a module-level `Map` — a `Map` is per-instance and resets on every cold start, so on serverless the "limit" leaks across the fleet (the Lesson 63.5a trap, wearing a different hat). **(2)** The increment-and-check is *one atomic statement*, so two concurrent requests can't both read `99` and both pass. **(3)** Ship `Retry-After` and `RateLimit-*` headers so well-behaved clients back off instead of hammering. For very high QPS, swap Postgres for Redis (`INCR` + `EXPIRE`); the shape is identical.
+
+> **rate limiting** *(noun)* — capping requests per client per window. On serverless it must use shared state (DB/Redis), never in-process counters, or the limit is per-instance and meaningless.
+
+---
+
 ## Lesson 64.5 — OpenAPI spec
 
 `docs/openapi.yaml` (excerpt):
@@ -3561,6 +3615,70 @@ Allowlist explicitly. Wildcards are fine in dev; never in prod.
 
 ---
 
+## Lesson 64.6a — Receiving webhooks
+
+Your API is outbound; webhooks are the inbound mirror — Stripe, GitHub, Resend calling *you*. Three things separate a correct receiver from a quiet disaster.
+
+```ts
+// src/routes/api/webhooks/stripe/+server.ts
+import type { RequestHandler } from './$types';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { STRIPE_WEBHOOK_SECRET } from '$env/static/private';
+import { db } from '$lib/db/client';
+import { webhookEvents } from '$lib/db/schema';
+
+function verify(rawBody: string, sigHeader: string | null, secret: string): boolean {
+  if (sigHeader === null) return false;
+  // Stripe's header is "t=<unix>,v1=<hex hmac>".
+  const parts = new Map(
+    sigHeader.split(',').map((p) => {
+      const [k, val] = p.split('=', 2);
+      return [k, val ?? ''] as const;
+    }),
+  );
+  const t = parts.get('t');
+  const v1 = parts.get('v1');
+  if (t === undefined || v1 === undefined) return false;
+  // Replay window: reject signatures older than 5 minutes.
+  if (Math.abs(Date.now() / 1000 - Number(t)) > 300) return false;
+  const expected = createHmac('sha256', secret).update(`${t}.${rawBody}`).digest('hex');
+  const a = Buffer.from(expected);
+  const b = Buffer.from(v1);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+export const POST: RequestHandler = async ({ request }) => {
+  // The raw-body trap: verify against the EXACT bytes received. `request.json()`
+  // then re-stringify will not reproduce the signed payload — read text first.
+  const raw = await request.text();
+  if (!verify(raw, request.headers.get('stripe-signature'), STRIPE_WEBHOOK_SECRET)) {
+    return new Response('bad signature', { status: 400 });
+  }
+  const event = JSON.parse(raw) as { id: string; type: string };
+
+  // Idempotent processing: providers retry, and the same event arrives twice
+  // routinely. The unique insert on the event id is the gate — a duplicate no-ops.
+  const inserted = await db
+    .insert(webhookEvents)
+    .values({ id: event.id, type: event.type })
+    .onConflictDoNothing()
+    .returning({ id: webhookEvents.id });
+  if (inserted.length === 0) return new Response('ok (duplicate)', { status: 200 });
+
+  // ... handle event.type, or enqueue heavy work to the outbox ...
+
+  return new Response('ok', { status: 200 });
+};
+```
+
+1. **Verify the signature against the raw body.** This is the subtle one. The provider signs the *exact bytes* it sent; `await request.json()` and re-serialise, and key order and whitespace differ, so a valid signature never matches. Read `request.text()` first, verify, *then* `JSON.parse`. (The number of "fixes" that amount to *disabling verification* because of this trap is alarming.)
+2. **Process idempotently.** The contract is **at-least-once**, never exactly-once. The unique insert on the event id dedups; a duplicate is a `200` no-op so the provider stops retrying.
+3. **Acknowledge fast.** Return `2xx` within the provider's timeout (Stripe ~20 s; aim for < 1 s) or it retries — and after enough failures, *disables your endpoint*. Verify, dedup, enqueue, return `200`. Heavy work belongs in the outbox worker, not this handler. And don't assume order: events can arrive out of sequence, so reconcile from the event's own data rather than trusting a `created`-before-`updated` arrival.
+
+> **the raw-body trap** — verifying a webhook signature against re-serialised JSON instead of the bytes received; it silently rejects every valid event. Read the raw body, verify, then parse.
+
+---
+
 ## Lesson 64.7 — Resend for email
 
 ```bash
@@ -3645,6 +3763,67 @@ Call sites pass the recipient explicitly so the dedupe row records who the email
 
 Senior pattern: emails to external providers are *external side effects* — Bible rule #12 applies.
 
+### The bug in insert-then-send
+
+Now look hard at `sendOnce` — it inserts the dedupe row, *then* sends. Trace the unhappy path: the insert commits, then `fn()` throws (Resend 500, a timeout, the function gets killed mid-flight). The row now says "sent," but nothing was. The retry calls `sendOnce` again, sees the row, returns early — and **the email is lost, permanently.** That isn't a double-send; it's the opposite, *at-most-once* where you wanted exactly-once. It's the same **dual-write** hazard as the read-modify-write toggle in Lesson 65.5a: two effects (a DB row and a provider call) that can't commit atomically together.
+
+You can't get true exactly-once across two systems, so choose the failure you can tolerate and engineer for it — and for email, a rare *duplicate* beats a silent *loss*. The robust pattern is the **transactional outbox**: record the *intent* in your DB (ideally in the same transaction as the business write), then let a worker deliver it with retries and a **provider idempotency key**.
+
+```ts
+// src/lib/mail/outbox.ts
+import { and, eq, lt, sql } from 'drizzle-orm';
+import { dbPrimary } from '$lib/db/client';
+import { emailOutbox } from '$lib/db/schema';
+
+type EmailPayload = { subject: string; html: string };
+
+// Record intent — durable even if delivery later fails.
+export async function enqueueEmail(
+  recipient: string,
+  kind: string,
+  idempotencyKey: string,
+  payload: EmailPayload,
+): Promise<void> {
+  await dbPrimary
+    .insert(emailOutbox)
+    .values({ recipient, kind, idempotencyKey, payload })
+    .onConflictDoNothing(); // same key = already enqueued
+}
+
+// A worker (the cron of the next lesson) drains pending rows. `deliver` MUST
+// forward the row's idempotencyKey to the provider (Resend/SES/Stripe accept
+// one), so a retry after a "timeout but actually sent" does not double-send.
+export async function drainOutbox(
+  deliver: (idempotencyKey: string, to: string, payload: EmailPayload) => Promise<void>,
+): Promise<void> {
+  const pending = await dbPrimary
+    .select()
+    .from(emailOutbox)
+    .where(and(eq(emailOutbox.status, 'pending'), lt(emailOutbox.attempts, 5)))
+    .limit(100);
+
+  for (const row of pending) {
+    try {
+      await deliver(row.idempotencyKey, row.recipient, row.payload as EmailPayload);
+      await dbPrimary
+        .update(emailOutbox)
+        .set({ status: 'sent', sentAt: new Date() })
+        .where(eq(emailOutbox.id, row.id));
+    } catch {
+      // Leave pending, bump attempts; a later drain retries with the SAME key.
+      await dbPrimary
+        .update(emailOutbox)
+        .set({ attempts: sql`${emailOutbox.attempts} + 1` })
+        .where(eq(emailOutbox.id, row.id));
+    }
+  }
+}
+```
+
+The trade you've now made explicit: **at-least-once delivery with provider-side dedup**, which is exactly-once as the *recipient* sees it, and never a lost message. Mark `sent` only after the provider accepts. `sendOnce` is fine for a best-effort reminder; reach for the outbox the moment a *lost* message is worse than a *duplicate* one (verification, receipts, anything a user waits on).
+
+> **transactional outbox** *(noun)* — recording an intended external effect as a DB row in the same transaction as the business write, then delivering it asynchronously with retries and a provider idempotency key. The standard fix for the dual-write problem.
+
 ---
 
 ## Lesson 64.9 — Cron via `vercel.json`
@@ -3689,6 +3868,38 @@ export const GET: RequestHandler = async ({ request }) => {
 ```
 
 The `Authorization` check is critical — without it, anyone hitting `/api/cron/daily-reminders` would trigger your cron. Bible rule #12 again: idempotency, dedupe, auth.
+
+### Overlap and missed runs
+
+The auth check doesn't cover two failure modes. **Overlap:** a slow run is still going when the next fires (or the provider double-delivers), so two invocations send the same reminders. **Missed run:** the provider hiccups and skips a tick entirely. Guard the first with a per-period *claim* — the unique insert is the lock:
+
+```ts
+// src/lib/cron/claim.ts
+import { dbPrimary } from '$lib/db/client';
+import { cronRuns } from '$lib/db/schema';
+
+// Claim a run for a period (e.g. "2026-06-07"). The unique insert is the lock:
+// exactly one invocation wins, so an overlapping or duplicated fire no-ops.
+export async function claimCronRun(job: string, period: string): Promise<boolean> {
+  const inserted = await dbPrimary
+    .insert(cronRuns)
+    .values({ job, period })
+    .onConflictDoNothing()
+    .returning({ job: cronRuns.job });
+  return inserted.length > 0; // true = you own this run
+}
+```
+
+At the top of the handler:
+
+```ts
+const period = new Date().toISOString().slice(0, 10); // one run per UTC day
+if (!(await claimCronRun('daily-reminders', period))) {
+  return new Response('already ran', { status: 200 });
+}
+```
+
+Now a double-fire is a no-op, and because each email also flows through the outbox's idempotency key, even a claim that races with a retry can't double-send. For *missed* runs, the same `period` key makes a catch-up safe: a manual re-trigger — or the next tick noticing yesterday's period is unclaimed — runs without fear. Idempotency is what turns "just run it again" into a safe operational reflex instead of a 2 a.m. gamble.
 
 > **CRON_SECRET** — random string set in Vercel env vars; Vercel uses it to authenticate cron invocations.
 
@@ -3819,6 +4030,10 @@ After Chapter 64 you can:
 | RFC 7807 | Standard JSON shape for API error responses. |
 | OpenAPI | Spec format for documenting REST APIs (formerly Swagger). |
 | CORS | Cross-Origin Resource Sharing; browser policy for cross-domain requests. |
+| rate limiting | Per-client request cap; on serverless it must use shared state. |
+| the raw-body trap | Verifying a webhook signature against re-serialised JSON, not the raw bytes. |
+| transactional outbox | Record an external-effect intent as a DB row; deliver async with retries + a provider idempotency key. |
+| dual-write problem | Two effects (DB + external call) that can't commit atomically; the root of lost/duplicated effects. |
 | `vercel.json` crons | Vercel's scheduled-handler config. |
 | email idempotency | Track sends to prevent duplicates on retry. |
 
@@ -3827,10 +4042,12 @@ After Chapter 64 you can:
 ## End-of-chapter checkpoint
 
 - [ ] `/api/v1/habits` GET + POST work with PAT auth.
+- [ ] Each `/api/v1/*` handler is rate-limited with shared-state counters and returns `429` + `Retry-After`.
+- [ ] The webhook receiver verifies the signature against the raw body, dedups by event id, and acks fast.
 - [ ] `docs/openapi.yaml` exists and the contract test is green.
 - [ ] Real verification email arrives in your inbox after signup.
-- [ ] Daily-reminders cron handler exists and is auth-gated.
-- [ ] `email_send_log` dedupes a manually-replayed cron.
+- [ ] Daily-reminders cron is auth-gated *and* claims its run per period (no overlap/double-send).
+- [ ] You can explain why insert-then-send loses messages, and what the outbox does instead.
 
 ---
 
