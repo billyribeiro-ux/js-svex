@@ -2631,6 +2631,18 @@ A senior dashboard has at least one panel for each. A senior alert fires when *a
 
 > **p99 latency** — the 99th-percentile latency. *"99% of requests complete in under X ms."* The median (`p50`) lies about user experience; `p99` tells the truth.
 
+### From signals to SLOs: where alert thresholds actually come from
+
+The four signals tell you *what* to measure; they don't tell you *when it's bad enough to wake someone.* That number isn't a vibe — it's derived, through the chain **SLI → SLO → error budget**:
+
+- **SLI** (indicator): a precise ratio of good events to total. *"Proportion of requests served in < 500 ms,"* or *"proportion of requests that aren't 5xx."*
+- **SLO** (objective): the target for that SLI over a window. *"99.9% of requests succeed over 28 days."* This is a **product decision** — the *acceptable* failure rate, chosen on purpose, not assumed to be zero.
+- **Error budget**: `1 − SLO`. At 99.9% you may fail **0.1%** of requests over 28 days. That budget is a *quantity you spend* — on risky deploys, experiments, plain bad luck. Spend it all and the policy bites: stop shipping features, fix reliability, until you're back under.
+
+The error budget is the line that makes everything downstream non-arbitrary: alerts fire on *budget burn* (Lesson 63.7), capacity is provisioned to *protect the budget*, and "is it broken enough to page?" has a number instead of an argument. A `p99 > 2s` threshold with no SLO behind it is a guess in a trench coat.
+
+> **SLO** *(noun)* — a target reliability level for an SLI over a window (e.g. 99.9% success over 28 days). **error budget** — `1 − SLO`; the failures you're *allowed*, treated as a spendable resource.
+
 ---
 
 ## Lesson 63.4 — Prometheus metrics with bounded labels
@@ -2763,6 +2775,54 @@ scrape_configs:
 
 ---
 
+## Lesson 63.5a — When `/metrics` lies: metrics in serverless
+
+Everything in 63.4–63.5 is correct on a long-lived server. On Vercel's serverless runtime it's quietly, dangerously wrong — and it's this chapter's own version of the *"compiles, demos, lies in prod"* trap the scaling chapter warns about.
+
+Here's the failure. `prom-client` counters live **in the memory of one process**. Serverless spins up many short-lived instances; each gets its own registry and counts only the requests *it* handled. Prometheus scrapes one URL, which lands on *one* instance (or a cold one with zero counts). Your `streak_requests_total` isn't the total — it's a random fraction of it. The dashboard still looks plausible, which is the worst part: you trust a number that's off by the instance count.
+
+The fix inverts the flow: **push, don't get scraped.** Each instance ships its metrics to a collector on a short interval, and the collector aggregates across all of them. OpenTelemetry's metrics SDK does exactly this — a `PeriodicExportingMetricReader` flushing to an OTLP endpoint:
+
+```ts
+// src/lib/obs/instrumentation.metrics.ts
+import { metrics } from '@opentelemetry/api';
+import { MeterProvider, PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
+import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
+
+// Each instance flushes every 15 s to a collector, which aggregates across all
+// the short-lived instances. One scrape of one instance would see a fraction.
+const reader = new PeriodicExportingMetricReader({
+  exporter: new OTLPMetricExporter({ url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT }),
+  exportIntervalMillis: 15_000,
+});
+const provider = new MeterProvider({ readers: [reader] });
+metrics.setGlobalMeterProvider(provider);
+```
+
+Define instruments against the OTel API instead of a local registry — same bounded-label discipline (Rule 14 is still *your* job; OTel won't stop a cardinality bomb), different transport:
+
+```ts
+// src/lib/obs/metrics.ts
+import { metrics } from '@opentelemetry/api';
+
+const meter = metrics.getMeter('streak');
+
+export const requestCounter = meter.createCounter('streak_requests_total', {
+  description: 'Total HTTP requests',
+});
+
+export function recordRequest(method: string, route: string, status: number, durationS: number): void {
+  const statusClass = `${Math.floor(status / 100)}xx`;
+  requestCounter.add(1, { method, route, status_class: statusClass });
+}
+```
+
+When to keep scrape vs push: a single long-lived container (Fly, Render, a VM) *is* a stable process, so scrape is fine. The moment you're on per-request serverless instances, push is the only honest option. The tell that you've already been bitten: request counts that are suspiciously low and don't match your CDN's request log.
+
+> **the serverless metrics trap** — in-process counters plus scrape, under ephemeral instances, undercount — the scrape hits one instance's partial registry. Push via OTLP and aggregate in the collector.
+
+---
+
 ## Lesson 63.6 — OpenTelemetry tracing
 
 In May 2026, SvelteKit ships **experimental tracing** that auto-instruments `handle`, `load`, actions, and remote functions. Enable in `svelte.config.ts`:
@@ -2810,6 +2870,34 @@ Now every request produces a *trace* — a tree of spans showing how time was sp
 
 Sample at 10% in production to keep cost reasonable. Senior heuristic: 100% sampling for first month after launch (you need the data); ramp down once dashboards are stable.
 
+### Connect the three pillars
+
+Logs, metrics, and traces are only powerful *together*, and the connective tissue is the trace id. Stamp it on every log line and a metric alert → a slow trace → the exact logs for that request becomes one click instead of a timestamp-guessing game:
+
+```ts
+// src/lib/obs/trace-context.ts
+import { trace } from '@opentelemetry/api';
+
+// Returns {} when there's no active span (e.g. a cron tick outside a request),
+// so it's always safe to spread into a log object.
+export function traceFields(): { trace_id: string; span_id: string } | Record<string, never> {
+  const span = trace.getActiveSpan();
+  if (!span) return {};
+  const { traceId, spanId } = span.spanContext();
+  return { trace_id: traceId, span_id: spanId };
+}
+```
+
+Spread it into the request-scoped logger from Lesson 63.2:
+
+```ts
+const log = logger.child({ requestId, ...traceFields() });
+```
+
+Now every log line carries `trace_id`, and the jump goes both ways: from a noisy log to its full trace, and from a slow trace to its logs. The third link — metric → trace — is the **exemplar**: OTel can attach a sample `trace_id` to a histogram bucket, so you click the p99 spike on the latency panel and land on a trace that *was* that slow. Three pillars, one id threading them.
+
+> **exemplar** *(noun)* — a sample trace id attached to a metric data point, turning *"p99 is 2 s"* into *"here is a 2 s request to open."*
+
 ---
 
 ## Lesson 63.7 — Alerts — when to wake someone up
@@ -2827,6 +2915,54 @@ Three *non-paging* alerts (open a ticket, don't wake anyone):
 1. **Successful signups < expected weekly average × 0.5** — funnel problem.
 2. **Webhook processing lag > 5 min** — Stripe is OK; we're behind.
 3. **Cert expiring in < 7 days** — renew it.
+
+### Burn-rate alerts: the non-flaky way
+
+*"5xx > 1% for 5 minutes"* has two failure modes: it pages *late* for a slow burn (1.1% for an hour quietly eats your month's budget) and pages *flakily* for a brief blip. The SRE fix is **multi-window, multi-burn-rate** alerting: page on how *fast* you're spending the error budget (Lesson 63.3), confirmed across a long *and* a short window so a recovered spike doesn't fire.
+
+*Burn rate* is budget-spend speed: rate 1 exhausts the 28-day budget in exactly 28 days; rate 14.4 exhausts it in ~2 days. Two tiers, each needing **both** windows hot (the short window stops a healed incident from paging):
+
+```yaml
+# Fast burn — budget gone in ~2 days. Page now.
+- alert: ErrorBudgetFastBurn
+  expr: |
+    sum(rate(streak_requests_total{status_class="5xx"}[1h])) / sum(rate(streak_requests_total[1h])) > 14.4 * 0.001
+    and
+    sum(rate(streak_requests_total{status_class="5xx"}[5m])) / sum(rate(streak_requests_total[5m])) > 14.4 * 0.001
+  for: 2m
+  labels: { severity: page }
+  annotations:
+    summary: "Burning the 28-day error budget 14.4x too fast"
+    runbook: "https://runbooks.streak.example.com/error-budget-fast-burn"
+
+# Slow burn — budget gone in ~5 days. Ticket, don't wake anyone.
+- alert: ErrorBudgetSlowBurn
+  expr: |
+    sum(rate(streak_requests_total{status_class="5xx"}[6h])) / sum(rate(streak_requests_total[6h])) > 6 * 0.001
+  for: 15m
+  labels: { severity: ticket }
+  annotations:
+    summary: "Burning the 28-day error budget 6x too fast"
+    runbook: "https://runbooks.streak.example.com/error-budget-slow-burn"
+```
+
+The `0.001` is `1 − SLO` for a 99.9% target — the alert math is *derived from the SLO*, exactly as the scaling chapter's replica alert derived its threshold from `STICKY_MS`. Change the SLO and every threshold moves with it; there are no magic numbers to hand-tune.
+
+### Every paging alert links to a runbook
+
+Notice the `runbook:` annotation on each alert — that's not decoration, it's a rule: **a paging alert with no runbook is a bug.** At 3 a.m. the on-call needs the first three steps, not archaeology. A runbook is four lines:
+
+```markdown
+# Runbook: ErrorBudgetFastBurn
+- **Means:** 5xx rate is burning the 28-day budget 14.4× too fast.
+- **Check first:** Grafana "5xx by route" → which route? Then open the slowest
+  trace for it (the `trace_id` is on every log line — Lesson 63.6).
+- **Likely causes:** a bad deploy (roll back), a dependency down (Stripe/DB), a
+  migration mid-flight.
+- **Mitigate before you diagnose:** roll back the last deploy first. Budget first.
+```
+
+> **burn rate** *(noun)* — the speed at which an incident spends the error budget; rate *n* exhausts the window's budget in `window / n`. Multi-window burn-rate alerts page on speed, not a static threshold.
 
 > **alert fatigue** — when on-call ignores alerts because too many fire. The death of an observability culture. *Alerts must be rare and meaningful.*
 
@@ -2964,15 +3100,22 @@ After Chapter 63 you can:
 | cardinality explosion | Unbounded growth in unique time series due to high-cardinality labels. |
 | trace | Tree of timed spans across one request. |
 | OpenTelemetry (OTel) | Vendor-neutral standard for traces / metrics / logs. |
+| SLI / SLO | Indicator (a good/total ratio) and its target over a window. |
+| error budget | `1 − SLO`; the failures you're allowed, spent like a resource. |
+| burn rate | Speed of error-budget spend; basis for multi-window alerts. |
+| exemplar | A sample trace id on a metric point, linking metric → trace. |
+| serverless metrics trap | In-process counters + scrape undercount across ephemeral instances; push via OTLP instead. |
 | alert fatigue | When too many alerts make on-call ignore real ones. |
 
 ---
 
 ## End-of-chapter checkpoint
 
-- [ ] Logs are JSON, structured, with request IDs.
-- [ ] `/_metrics` serves Prometheus format, gated by token.
+- [ ] Logs are JSON, structured, with request IDs *and* `trace_id`.
+- [ ] You can state Streak's SLO and compute its error budget.
+- [ ] `/_metrics` serves Prometheus format, gated by token — *or* you push via OTLP if you're on serverless (and you know which, and why).
 - [ ] OpenTelemetry traces export to your chosen backend.
+- [ ] Alerts are multi-window burn-rate, SLO-derived, and each paging one links to a runbook.
 - [ ] You debugged the planted log dump.
 - [ ] You can articulate the four golden signals out loud.
 
